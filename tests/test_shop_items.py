@@ -206,11 +206,11 @@ class SellDoesNotDumpNonOreItemsTests(unittest.TestCase):
     def test_worker_sells_only_ore_when_ore_and_voucher_both_present(self):
         state = minimal_state()
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
-        worker = make_role(10010, 10, 10, "worker", backpack=["stone", "WallFixer"], back_pack_capability=100)
+        worker = make_role(10010, 10, 10, "worker", backpack=["copper", "WallFixer"], back_pack_capability=100)
         state.team_our.roles.append(worker)
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
-        self.assertEqual(commands[10010], {"action": "sell", "name": "stone", "num": 1})
+        self.assertEqual(commands[10010], {"action": "sell", "name": "copper", "num": 1})
 
 
 class PioneerParticipatesInJobsTests(unittest.TestCase):

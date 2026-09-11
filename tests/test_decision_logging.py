@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,7 +8,7 @@ from unittest.mock import patch
 
 from src.agent import GameServer
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.decision_log import build_report, snapshot
+from src.agent.decision_log import CONSOLE_MARKER, build_report, emit_console_report, snapshot
 from test_shop_items import minimal_state, make_role
 
 
@@ -86,3 +88,27 @@ class DecisionLoggingTests(unittest.TestCase):
         count = len(state.decision_events)
         strategy.decide(state)
         self.assertEqual(len(state.decision_events), count)
+
+    def test_console_record_contains_strategy_summary_and_role_reasons(self):
+        state = minimal_state(gold_num=75)
+        state.team_our.roles.append(make_role(1, 1, 1, 'pioneer', back_pack_capability=40))
+        before = snapshot(state)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        report = build_report(state, commands, {}, before, None, 7, 1.2, '白天')
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            emit_console_report(report)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record['marker'], CONSOLE_MARKER)
+        self.assertEqual(record['summary']['gold'], 75)
+        self.assertEqual(record['roles'][0]['id'], 1)
+        self.assertTrue(record['roles'][0]['reasons'])
+
+    def test_server_emits_console_strategy_record(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.client.post('/', json={'roundNo': 1})
+        records = [json.loads(line) for line in output.getvalue().splitlines()
+                   if 'STRATEGY_DECISION' in line]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['roundNo'], 1)

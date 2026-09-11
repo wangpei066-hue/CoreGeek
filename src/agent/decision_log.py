@@ -3,6 +3,10 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
 import json
+import sys
+
+
+CONSOLE_MARKER = "STRATEGY_DECISION"
 
 
 def trace(state, role_id, code, message, **details):
@@ -122,3 +126,34 @@ def write_report(log_dir, report):
                          (".txt", render_text(report))):
         with (log_dir / (stem + suffix)).open("x", encoding="utf-8") as stream:
             stream.write(text)
+
+
+def emit_console_report(report):
+    """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
+
+    本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
+    任务原文、背包明细或重复路径事件刷满平台输出。
+    """
+    role_reports = []
+    for role in report["roles"]:
+        reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
+                   for event in role["events"]]
+        role_reports.append({
+            "id": role["role_id"], "type": role["role_type"],
+            "pos": role["position"], "status": role["status"],
+            "health": role["health"], "backpackCounts": role["backpack"],
+            "commandKey": role["command_key"], "command": role["command"],
+            "reasons": reasons, "pendingBuild": role["pending_build"],
+            "itemJob": role["item_job"],
+        })
+    record = {
+        "marker": CONSOLE_MARKER, "sequence": report["sequence"],
+        "roundNo": report["round"], "phase": report["phase"],
+        "summary": report["summary"], "roles": role_reports,
+        "globalEvents": [event for event in report["events"] if event["role_id"] is None],
+        "previousFeedback": report["previous_feedback"],
+        "systemErrors": report["system_errors"],
+        "observedChanges": report["observed_changes"],
+        "decisionMs": report["decision_ms"],
+    }
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)

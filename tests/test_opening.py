@@ -19,25 +19,26 @@ def opening_state():
 
 
 class OpeningTests(unittest.TestCase):
-    def test_initial_workers_build_weapons_without_spending_on_items(self):
+    def test_initial_workers_gather_wall_material_before_weapons(self):
         state = opening_state()
         commands = V1Strategy(BasicActionValidator()).decide(state)
         for role_id in (1, 2):
-            self.assertEqual(commands[role_id]['action'], 'build')
-            self.assertNotEqual(commands[role_id]['name'], 'wall')
+            self.assertEqual(commands[role_id]['action'], 'move')
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '围墙' for e in state.decision_events))
         self.assertNotEqual(commands[1]['targetPos'], commands[2]['targetPos'])
         self.assertEqual(state.team_our.gold_num, 75)
 
     def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
         ring = wall_ring(state, state.team_our.roles[0])
-        self.assertEqual(len(ring), 10)
+        self.assertEqual(len(ring), 15)
         self.assertTrue(all(x >= 11 for x, y in ring))
         self.assertTrue(all(x == 13 for x, y in ring[:6]))
         self.assertIn((13, 12), ring)
 
-    def test_failed_weapon_position_is_not_counted_as_completed(self):
+    def test_failed_wall_position_is_not_counted_as_completed(self):
         state = opening_state()
+        state.team_our.roles[2].backpack = ['stone'] * 4
         strategy = V1Strategy(BasicActionValidator())
         first = strategy.decide(state)
         state.round_no = 1
@@ -49,14 +50,16 @@ class OpeningTests(unittest.TestCase):
                             for c in second.values() if c['action'] == 'build'))
         phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
         self.assertEqual(phase['weapons'], 0)
-        self.assertEqual(phase['phase'], '武器')
+        self.assertEqual(phase['phase'], '围墙')
+        self.assertEqual(phase['walls_completed'], 0)
+        self.assertTrue(failed)
 
     def test_right_base_faces_left_after_switching_sides(self):
         state = opening_state()
         base = state.team_our.roles[0]
         base.pos = Pos(30, 8)
         line = wall_ring(state, base)
-        self.assertEqual(len(line), 10)
+        self.assertEqual(len(line), 15)
         self.assertTrue(all(x <= 30 for x, y in line))
         self.assertTrue(all(x == 28 for x, y in line[:6]))
 
@@ -108,11 +111,13 @@ class OpeningTests(unittest.TestCase):
                     role.backpack.append('stone')
                 elif cmd['action'] == 'build':
                     if cmd['name'] == 'wall':
-                        self.assertEqual(sum(r.role_type in ('gatling', 'railgun', 'rocket') for r in state.team_our.roles), 3)
+                        self.assertEqual(sum(r.role_type in ('gatling', 'railgun', 'rocket') for r in state.team_our.roles), 0)
                         role.backpack.remove('stone')
                         wall_built = True
                     else:
-                        self.assertFalse(wall_built)
+                        self.assertTrue(wall_built)
+                        self.assertEqual({(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'},
+                                         set(wall_ring(state, state.team_our.roles[0])))
                         state.team_our.gold_num -= 25
                     pos = cmd['targetPos'][0]
                     state.team_our.roles.append(make_role(100+len(state.team_our.roles), pos['x'], pos['y'], cmd['name'], level=1, attack_range=10))

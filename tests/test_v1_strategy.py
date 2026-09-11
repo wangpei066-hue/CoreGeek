@@ -147,12 +147,13 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010], {"action": "collect", "targetPos": [{"x": 11, "y": 10}]})
 
     def test_worker_sells_when_adjacent_to_vendor_with_backpack(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
         worker = make_role(10010, 10, 10, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        self.assertEqual(commands[10010], {"action": "sell", "name": "stone", "num": 2})
+        # 保留少量施工石头，出售不用于建墙的矿石。
+        self.assertEqual(commands[10010], {"action": "sell", "name": "iron", "num": 1})
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night

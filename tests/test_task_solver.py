@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -37,6 +38,8 @@ class TaskSolverTests(unittest.TestCase):
         return self.post()
 
     def sandbox(self, command):
+        if not shutil.which('sh'):
+            self.skipTest('需要 POSIX sh；请在 Linux 比赛运行环境补跑沙盒集成测试')
         result = subprocess.run(['sh', '-c', command], cwd=self.root, capture_output=True, text=True, timeout=12)
         self.assertEqual(result.returncode, 0, result.stderr)
         return '[exitCode:0]\n' + result.stdout

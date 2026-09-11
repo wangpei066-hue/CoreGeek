@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -52,6 +53,7 @@ class PioneerTaskTests(unittest.TestCase):
         data['teamOur']['roles'][0]['health'] = 0
         self.assertNotIn(10011, self.decide(data))
 
+    @unittest.skipUnless(shutil.which('sh'), '需要 POSIX sh 执行平台沙盒命令')
     def test_platform_command_output_and_feedback(self):
         with tempfile.TemporaryDirectory() as root, contextlib.redirect_stderr(io.StringIO()) as stderr:
             server = GameServer(Path(root))
@@ -70,7 +72,8 @@ class PioneerTaskTests(unittest.TestCase):
             self.assertEqual(record['phaseTaskChunk'], data['phaseTask'])
             data.update(roundNo=12, lastCmdResult='[exitCode:0]\n' + result.stdout)
             self.assertEqual(client.post('/', json=data).status_code, 200)
-            records = [json.loads(line) for line in stderr.getvalue().splitlines()]
+            records = [record for line in stderr.getvalue().splitlines()
+                       if (record := json.loads(line)).get('marker') == 'PIONEER_TASK']
             self.assertEqual(records[1]['pioneers'][0]['previousCommand'], {'action': 'acceptTask'})
             self.assertTrue(records[1]['pioneers'][0]['lastActionLegal'])
             self.assertIn('PIONEER_TASK', records[2]['lastCmdResult'])

@@ -12,7 +12,7 @@ from .protocol import MatchState
 from .task_logging import task_diagnostics
 from .task_solver import PioneerTaskSolver
 from .brain import V1Strategy, BasicActionValidator, is_day_round
-from .decision_log import snapshot, build_report, write_report
+from .decision_log import snapshot, build_report, write_report, emit_console_report
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -31,6 +31,7 @@ def load_build_memory(state: "MatchState", state_dir: Path) -> None:
         return
     state.memory_context = data.get("memory_context")
     state.memory_round = data.get("memory_round")
+    state.policy_memory = data.get("policy_memory", {})
     state.build_retry_after = {tuple(entry[:3]): entry[3] for entry in data.get("build_retry_after", [])}
     state.failed_build_spots = {tuple(p) for p in data.get("failed_build_spots", [])}
     state.worker_build_targets = {
@@ -53,6 +54,7 @@ def save_build_memory(state: "MatchState", state_dir: Path) -> None:
         and not state.worker_build_targets
         and not state.worker_item_jobs
         and not state.last_sent_command
+        and not state.policy_memory
         and state.memory_context is None
         and not (state_dir / "build_memory.json").exists()
     ):
@@ -62,6 +64,7 @@ def save_build_memory(state: "MatchState", state_dir: Path) -> None:
     data = {
         "memory_context": state.memory_context,
         "memory_round": state.memory_round,
+        "policy_memory": state.policy_memory,
         "build_retry_after": [[*key, value] for key, value in state.build_retry_after.items()],
         "failed_build_spots": [list(pos) for pos in state.failed_build_spots],
         "worker_build_targets": {
@@ -155,6 +158,7 @@ class GameServer:
                         "白天" if is_day_round(self.match_state.round_no) else "夜晚"),
                 )
                 write_report(self.log_dir, report)
+                emit_console_report(report)
             except Exception:
                 self.app.logger.exception("decision logging failed (response unaffected)")
             self.previous_snapshot = before
