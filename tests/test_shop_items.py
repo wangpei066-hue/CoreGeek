@@ -30,7 +30,7 @@ def make_role(id, x, y, role_type, health=100, backpack=None, level=None, cooldo
 
 def minimal_state(**overrides):
     state = MatchState()
-    state.round_no = overrides.get("round_no", 10)
+    state.round_no = overrides.get("round_no", 140)
     state.map_info = overrides.get(
         "map_info",
         MapInfo(width=41, height=32, zones=[Zone(pos=Pos(20, 20), neutral_type="weaponShop")]),

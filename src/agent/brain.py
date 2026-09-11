@@ -505,55 +505,41 @@ def target_positions_for_weapon(weapon: Role, target):
 
 
 def plan_night(state: "MatchState") -> dict:
+    from .opening import assign_weapons, adjacent_path, move_on_path
     commands = {}
     if not state.team_our or not state.map_info:
         return commands
-    blocked = build_blocked_set(state)
-    reserved = set()
+    blocked, reserved = build_blocked_set(state), set()
+    assignments = assign_weapons(state)
     robots = state.robot.roles if state.robot else []
-    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES]
-    fighters = [r for r in state.team_our.roles if r.role_type in ("worker", "pioneer")]
-    used_weapons = set()
-
-    for fighter in fighters:
-        heal_cmd = decide_self_heal(fighter)
-        if heal_cmd:
-            trace(state, fighter.id, "selected", "低血量且持有药品，治疗优先", command=heal_cmd)
-            commands[fighter.id] = heal_cmd
+    for fighter in sorted(state.team_our.roles, key=lambda r: r.id):
+        if fighter.role_type not in ("worker", "pioneer"):
             continue
-
-        weapon = next(
-            (w for w in weapons if w.id not in used_weapons and chebyshev(fighter.pos, w.pos) <= 1),
-            None,
-        )
-        if weapon is not None:
+        heal = decide_self_heal(fighter)
+        if heal:
+            commands[fighter.id] = selected(state, fighter.id, heal, "低血量优先自救")
+            continue
+        weapon = assignments.get(fighter.id)
+        if weapon is None:
+            trace(state, fighter.id, "no_free_weapon", "没有可分配的独立武器")
+            continue
+        trace(state, fighter.id, "weapon_assignment", "一人一炮；冷却和移动期间也保留分配", weapon_id=weapon.id)
+        if chebyshev(fighter.pos, weapon.pos) <= 1:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
             target = pick_attack_target(weapon, robots) if ready else None
-            if target is not None:
-                trace(state, fighter.id, "selected", "操控邻接武器，按机器人类型优先级与血量选择目标", weapon_id=weapon.id, target_robot_id=target.id)
-                used_weapons.add(weapon.id)
-                commands[weapon.id] = {
-                    "action": "attack",
-                    "controllerId": str(fighter.id),
-                    "targetPos": target_positions_for_weapon(weapon, target),
-                }
-                continue
-
-        if weapon is not None:
-            trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
-                  "火箭仍在冷却" if not ready else "该武器射程内没有机器人", weapon_id=weapon.id)
-        free_weapons = [w for w in weapons if w.id not in used_weapons]
-        if not free_weapons:
-            trace(state, fighter.id, "no_free_weapon", "没有武器或武器已被其他角色使用")
-        if free_weapons:
-            nearest_weapon = min(free_weapons, key=lambda w: chebyshev(fighter.pos, w.pos))
-            step = traced_move(state, fighter.id,
-                fighter.pos, nearest_weapon.pos, blocked | reserved, state.map_info.width, state.map_info.height
-            )
-            if step:
-                reserved.add((step.x, step.y))
-                commands[fighter.id] = {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+            if target:
+                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
+                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
+                                       "targetPos": target_positions_for_weapon(weapon, target)}
+            else:
+                trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
+                      "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
+        else:
+            cmd = move_on_path(state, fighter, adjacent_path(fighter, weapon.pos, blocked | reserved, state), reserved, "前往独立分配的武器")
+            if cmd:
+                commands[fighter.id] = cmd
     return commands
+
 
 
 class BasicActionValidator(ActionValidator):
@@ -610,6 +596,9 @@ class V1Strategy(Strategy):
         if not state.team_our or not state.map_info:
             trace(state, None, "missing_state", "缺少队伍或地图快照，不能生成指令")
             commands = {}
+        elif isinstance(state.round_no, int) and 0 <= state.round_no < DAY_ROUNDS and own_station(state):
+            from .opening import plan_opening
+            commands = plan_opening(state)
         elif is_day_round(state.round_no):
             commands = plan_day(state)
         else:

@@ -92,6 +92,10 @@ def render_text(report):
     lines = [f"回合 {report['round']} | {report['phase']} | 金币 {summary['gold']} | "
              f"武器 {summary['weapons']} | 围墙 {summary['walls']} | 机器人 {summary['robots']}",
              f"策略耗时 {report['decision_ms']} ms；{report['phase_basis']}"]
+    for event in report["events"]:
+        if event["role_id"] is None:
+            lines.append(event["message"] + " " + json.dumps(
+                {k: v for k, v in event.items() if k not in ("role_id", "code", "message")}, ensure_ascii=False))
     for base in summary["bases"]:
         lines.append(f"基地 {base['id']}：血量 {base['health']}，等级 {base['level']}")
     for role in report["roles"]:

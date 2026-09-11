@@ -324,6 +324,7 @@ class BuyMedicineTests(unittest.TestCase):
 
     def test_pioneer_buys_medicine_while_passing_shop_on_day(self):
         state = self._state_with_shop()
+        state.round_no = 140
         pioneer = make_role(10011, 10, 10, "pioneer", backpack=[], back_pack_capability=40)
         state.team_our.roles = [state.team_our.roles[0], pioneer]
         strategy = V1Strategy(BasicActionValidator())
