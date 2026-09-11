@@ -1,8 +1,30 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
 .venv/
+venv/
+
+# IDE
+.idea/
+.cursor/
+*.iml
+.editorconfig
+.vscode/
+
+# Runtime
 logs/
 state/
+results/
+*.log
+
+# Environment
 .env
 .env.*
 !.env.example
+
+# OS
+.DS_Store
+Thumbs.db
