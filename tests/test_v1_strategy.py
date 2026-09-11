@@ -96,15 +96,16 @@ class PathfindingTests(unittest.TestCase):
 class DayNightTests(unittest.TestCase):
     def test_first_day_round_is_day(self):
         self.assertTrue(is_day_round(0))
-        self.assertTrue(is_day_round(69))
+        self.assertTrue(is_day_round(1))
+        self.assertTrue(is_day_round(70))
 
     def test_night_round_after_day(self):
-        self.assertFalse(is_day_round(70))
-        self.assertFalse(is_day_round(129))
+        self.assertFalse(is_day_round(71))
+        self.assertFalse(is_day_round(130))
 
     def test_second_day_cycle(self):
-        self.assertTrue(is_day_round(130))
-        self.assertFalse(is_day_round(200))
+        self.assertTrue(is_day_round(131))
+        self.assertFalse(is_day_round(201))
 
     def test_none_round_defaults_to_day(self):
         self.assertTrue(is_day_round(None))
@@ -242,8 +243,25 @@ class V1StrategyNightTests(unittest.TestCase):
         self.validator = BasicActionValidator()
         self.strategy = V1Strategy(self.validator)
 
-    def test_fighter_operates_adjacent_weapon_and_attacks(self):
-        state = minimal_state(round_no=75)  # night
+    def test_night_pairs_each_fighter_to_a_weapon(self):
+        state = minimal_state(round_no=75)
+        weapons = [
+            make_role(10020, 20, 20, "gatling", attack_range=4, level=1),
+            make_role(10030, 22, 20, "railgun", attack_range=6, level=1),
+            make_role(10040, 24, 20, "rocket", attack_range=10, level=1, cooldown=0),
+        ]
+        fighters = [
+            make_role(10010, 5, 5, "worker", back_pack_capability=100),
+            make_role(10011, 6, 5, "pioneer", back_pack_capability=40),
+            make_role(10012, 7, 5, "worker", back_pack_capability=100),
+        ]
+        state.team_our.roles = [state.team_our.roles[0], *weapons, *fighters]
+        commands = self.strategy.decide(state)
+        for fid in (10010, 10011, 10012):
+            self.assertEqual(commands[fid]["action"], "move")
+
+    def test_night_adjacent_fighter_fires_assigned_weapon(self):
+        state = minimal_state(round_no=75)
         gatling = make_role(10020, 9, 10, "gatling", attack_range=4, level=1)
         worker = make_role(10010, 9, 11, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], gatling, worker]
@@ -252,16 +270,6 @@ class V1StrategyNightTests(unittest.TestCase):
         self.assertIn(10020, commands)
         self.assertEqual(commands[10020]["action"], "attack")
         self.assertEqual(commands[10020]["controllerId"], "10010")
-        self.assertNotIn(10010, commands)
-
-    def test_fighter_moves_toward_weapon_when_not_adjacent(self):
-        state = minimal_state(round_no=75)
-        gatling = make_role(10020, 20, 20, "gatling", attack_range=4, level=1)
-        worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
-        state.team_our.roles = [state.team_our.roles[0], gatling, worker]
-        state.robot = RobotInfo(roles=[])
-        commands = self.strategy.decide(state)
-        self.assertEqual(commands[10010]["action"], "move")
 
     def test_rocket_on_cooldown_is_not_fired(self):
         state = minimal_state(round_no=75)
@@ -343,13 +351,14 @@ class SelfHealTests(unittest.TestCase):
     def test_self_heal_preempts_night_combat(self):
         state = minimal_state(round_no=75)
         gatling = make_role(10020, 9, 10, "gatling", attack_range=4, level=1)
+        # 已贴炮时才允许夜晚自疗；否则应先去就位
         hurt_worker = make_role(10010, 9, 11, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], gatling, hurt_worker]
         state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
         self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
-        self.assertNotIn(10020, commands)  # 治疗优先，这一回合没有人操控武器
+        self.assertNotIn(10020, commands)
 
     def test_self_heal_preempts_day_economy(self):
         state = minimal_state(round_no=5)
@@ -395,13 +404,14 @@ class BuyMedicineTests(unittest.TestCase):
         worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
         self.assertEqual(decide_buy_medicine(worker, state), {"action": "buy", "name": "Medicine", "num": 1})
 
-    def test_pioneer_buys_medicine_while_passing_shop_on_day(self):
+    def test_pioneer_moves_toward_tower_site_on_day(self):
         state = self._state_with_shop()
-        pioneer = make_role(10011, 10, 10, "pioneer", backpack=[], back_pack_capability=40)
+        state.team_our.roles[0].pos = Pos(10, 24)
+        pioneer = make_role(10011, 5, 5, "pioneer", backpack=[], back_pack_capability=40)
         state.team_our.roles = [state.team_our.roles[0], pioneer]
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
-        self.assertEqual(commands[10011], {"action": "buy", "name": "Medicine", "num": 1})
+        self.assertEqual(commands[10011]["action"], "move")
 
 
 if __name__ == "__main__":
