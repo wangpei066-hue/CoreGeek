@@ -16,7 +16,7 @@ def main():
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", line_buffering=True)
 
-    parser = argparse.ArgumentParser(description="P0 competition HTTP service")
+    parser = argparse.ArgumentParser(description="Competition HTTP service")
     parser.add_argument("port", type=int)
     args = parser.parse_args()
 

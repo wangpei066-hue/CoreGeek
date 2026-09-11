@@ -30,7 +30,7 @@ def make_role(id, x, y, role_type, health=100, backpack=None, level=None, cooldo
 
 def minimal_state(**overrides):
     state = MatchState()
-    state.round_no = overrides.get("round_no", 10)
+    state.round_no = overrides.get("round_no", 140)
     state.map_info = overrides.get(
         "map_info",
         MapInfo(width=41, height=32, zones=[Zone(pos=Pos(20, 20), neutral_type="weaponShop")]),
@@ -119,7 +119,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
 
 class ShopItemJobExecutionTests(unittest.TestCase):
     def test_moves_toward_shop_when_item_not_yet_bought(self):
-        state = minimal_state()
+        state = minimal_state(gold_num=10)
         worker = make_role(10010, 0, 0, "worker", backpack=[], back_pack_capability=100)
         state.worker_item_jobs[10010] = {"item": "WallFixer", "target": (11, 10), "kind": "wall"}
         wall = make_role(40000, 11, 10, "wall")
@@ -128,7 +128,7 @@ class ShopItemJobExecutionTests(unittest.TestCase):
         self.assertEqual(cmd["action"], "move")
 
     def test_buys_when_adjacent_to_shop_without_item(self):
-        state = minimal_state()
+        state = minimal_state(gold_num=10)
         worker = make_role(10010, 20, 21, "worker", backpack=[], back_pack_capability=100)  # 邻接 (20,20) 商店
         state.worker_item_jobs[10010] = {"item": "WallFixer", "target": (11, 10), "kind": "wall"}
         wall = make_role(40000, 11, 10, "wall")
@@ -153,7 +153,7 @@ class ShopItemJobExecutionTests(unittest.TestCase):
         state.team_our.roles.append(wall)
         cmd = decide_shop_item_job(worker, state, set(), set())
         self.assertEqual(cmd, {"action": "use", "name": "WallFixer", "targetPos": [{"x": 11, "y": 10}]})
-        self.assertNotIn(10010, state.worker_item_jobs)  # 用完即清理任务
+        self.assertTrue(state.worker_item_jobs[10010]["awaiting_use"])  # 等待下一回合确认
 
     def test_job_abandoned_when_target_building_no_longer_exists(self):
         state = minimal_state()
@@ -215,12 +215,7 @@ class MultiRoundRepairIntegrationTest(unittest.TestCase):
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
         wall = make_role(40000, 30, 30, "wall", health=100, level=1)  # 远离商店，逼出多回合移动
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
-        weapons = [
-            make_role(10020, 8, 10, "gatling", level=1),
-            make_role(10030, 9, 10, "railgun", level=1),
-            make_role(10040, 8, 11, "rocket", level=1),
-        ]
-        state.team_our.roles += [wall, worker, *weapons]
+        state.team_our.roles += [wall, worker]
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()

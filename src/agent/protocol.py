@@ -196,7 +196,7 @@ class GameState(ABC):
 
 
 class MatchState(GameState):
-    """P1：把判题器请求快照解析为结构化字段，不做跨回合持久化，不生成指令。
+    """把判题器快照解析为结构化字段，保存策略记忆；文件IO由server负责。
 
     每回合请求都是全量快照（接口文档1.1），因此 update() 直接整体重建字段，
     而不是增量合并；跨回合才需要的信息（矿点历史、任务线索、LLM 计数等）留给后续阶段。
@@ -223,10 +223,31 @@ class MatchState(GameState):
         self.failed_build_spots = set()
         self.worker_build_targets = {}
         self.worker_item_jobs = {}
+        self.decision_events = []  # 仅本回合诊断，不持久化
         self.memory_loaded = False
+        self.build_retry_after = {}
+        self.memory_context = None
+        self.memory_round = None
 
     def update(self, payload: dict) -> None:
-        self.round_no = payload.get("roundNo")
+        incoming_round = payload.get("roundNo")
+        team = payload.get("teamOur", {})
+        map_data = payload.get("mapInfo", {})
+        base = next((r.get("pos") for r in team.get("roles", []) if r.get("roleType") == "station"), None)
+        context = [team.get("teamId"), team.get("type"), map_data.get("width"), map_data.get("height"), base]
+        if team and map_data:
+            changed = self.memory_context is not None and context != self.memory_context
+            rewound = (incoming_round is not None and self.memory_round is not None
+                       and incoming_round < self.memory_round)
+            if changed or rewound:
+                self.last_sent_command.clear()
+                self.failed_build_spots.clear()
+                self.build_retry_after.clear()
+                self.worker_build_targets.clear()
+                self.worker_item_jobs.clear()
+            self.memory_context = context
+            self.memory_round = incoming_round
+        self.round_no = incoming_round
         self.map_info = MapInfo.from_dict(payload["mapInfo"]) if "mapInfo" in payload else None
         self.team_our = TeamOur.from_dict(payload["teamOur"]) if "teamOur" in payload else None
         self.team_enemy = TeamEnemy.from_dict(payload["teamEnemy"]) if "teamEnemy" in payload else None
