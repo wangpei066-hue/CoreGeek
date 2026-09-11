@@ -223,6 +223,7 @@ class MatchState(GameState):
         self.failed_build_spots = set()
         self.worker_build_targets = {}
         self.worker_item_jobs = {}
+        self.decision_events = []  # 仅本回合诊断，不持久化
         self.memory_loaded = False
         self.build_retry_after = {}
         self.memory_context = None

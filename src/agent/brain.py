@@ -7,6 +7,7 @@ from typing import Optional
 from .protocol import (
     ActionValidator, GameState, MatchState, Pos, Role, Strategy
 )
+from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 
 
@@ -62,6 +63,15 @@ def _ring_offsets(min_radius=BUILD_RING_MIN_RADIUS, max_radius=BUILD_RING_MAX_RA
 
 
 _BUILD_RING_OFFSETS = _ring_offsets()
+
+
+def traced_move(state, role_id, start, target, blocked, width, height):
+    step = move_towards(start, target, blocked, width, height)
+    code = "path_found" if step else ("already_adjacent" if chebyshev(start, target) <= 1 else "unreachable")
+    message = {"path_found": "前往目标的交互邻接格", "already_adjacent": "已在目标一格内，无需移动",
+               "unreachable": "在当前障碍物和本回合预留格约束下，目标邻接格不可达"}[code]
+    trace(state, role_id, code, message, target={"x": target.x, "y": target.y})
+    return step
 
 
 def find_zone(state: "MatchState", neutral_type: str):
@@ -150,7 +160,8 @@ def decide_buy_medicine(role: Role, state: "MatchState"):
         return None
     if len(role.backpack) >= role.back_pack_capability:
         return None
-    return {"action": "buy", "name": "Medicine", "num": 1}
+    return selected(state, role.id, {"action": "buy", "name": "Medicine", "num": 1}, '路过商店，金币与背包空间满足，补充药品')
+
 
 
 def _pending_item_job_targets(state: "MatchState") -> set:
@@ -187,6 +198,8 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
     if role.id in state.worker_item_jobs or not state.team_our:
         return
     pending_targets = _pending_item_job_targets(state)
+    trace(state, role.id, "shop_job_check", "检查维修与升级任务（预算为本回合尚未分配余额）",
+          available_gold=state.team_our.gold_num, reserved_target_count=len(pending_targets))
 
     damaged_wall = _pick_damaged_wall(state, pending_targets)
     if damaged_wall and state.team_our.gold_num >= WALL_FIXER_GOLD_COST:
@@ -201,6 +214,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
         if state.team_our.gold_num >= cost:
             state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
             return
+        trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
 
     weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets)
     if weapon:
@@ -228,6 +242,7 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
     if not job:
         return None
     if not _job_target_still_exists(state, job):
+        trace(state, role.id, "job_target_missing", "道具任务目标建筑已不存在，释放任务")
         del state.worker_item_jobs[role.id]
         return None
 
@@ -248,30 +263,34 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
     if item in role.backpack:
         if chebyshev(role.pos, target) <= 1:
             job["awaiting_use"] = True
-            return {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}
-        step = move_towards(role.pos, target, blocked | reserved, width, height)
+            return selected(state, role.id, {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}, '执行维修/升级道具任务')
+        step = traced_move(state, role.id, role.pos, target, blocked | reserved, width, height)
         if step:
             reserved.add((step.x, step.y))
-            return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+            return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
         return None
 
     if state.team_our.gold_num < item_cost(item, state):
+        trace(state, role.id, "insufficient_gold", "道具任务购买资金不足，释放任务", available_gold=state.team_our.gold_num, required_gold=item_cost(item, state), item=item)
         del state.worker_item_jobs[role.id]
         return None
     shop = find_zone(state, "weaponShop")
     if shop is None:
+        trace(state, role.id, "shop_missing", "快照中没有武器商店，释放道具任务")
         del state.worker_item_jobs[role.id]
         return None
     if chebyshev(role.pos, shop.pos) <= 1:
         if len(role.backpack) >= role.back_pack_capability:
+            trace(state, role.id, "backpack_full", "背包已满，无法购买道具")
             del state.worker_item_jobs[role.id]
             return None
-        return {"action": "buy", "name": item, "num": 1}
-    step = move_towards(role.pos, shop.pos, blocked | reserved, width, height)
+        return selected(state, role.id, {"action": "buy", "name": item, "num": 1}, '执行维修/升级道具任务')
+    step = traced_move(state, role.id, role.pos, shop.pos, blocked | reserved, width, height)
     if step:
         reserved.add((step.x, step.y))
-        return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+        return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
     return None
+
 
 
 def item_cost(name: str, state: "MatchState") -> int:
@@ -332,16 +351,17 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                         return None
                     name = "wall"
                 reserved.add((x, y))
-                return {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}
-            step = move_towards(worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
+                return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+            step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
             if step:
                 reserved.add((step.x, step.y))
-                return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+                return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
             return None
 
     weapon_count = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
     can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count + getattr(state, "planned_weapons", 0) < MAX_WEAPONS
     can_wall = "stone" in worker.backpack
+    trace(state, worker.id, "build_conditions", "本回合建造条件；满足武器条件时优先武器", available_gold=state.team_our.gold_num, weapon_count=weapon_count, planned_weapons=getattr(state, "planned_weapons", 0), can_weapon=can_weapon, stone_count=worker.backpack.count("stone"), can_wall=can_wall)
     if can_weapon:
         kind = "weapon"
     elif can_wall:
@@ -352,20 +372,22 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     pending_spots = {(x, y) for x, y, _ in state.worker_build_targets.values()}
     target = pick_build_target(state, base.pos, blocked | reserved | pending_spots, kind)
     if target is None:
+        trace(state, worker.id, "no_build_candidate", "搜索范围内无可用建造候选格（占用、越界或失败冷却）", kind=kind)
         return None
     state.worker_build_targets[worker.id] = (target.x, target.y, kind)
     reserved.add((target.x, target.y))
-    step = move_towards(worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
+    step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
     if step:
         reserved.add((step.x, step.y))
-        return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+        return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
     return None
+
 
 
 def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set):
     heal_cmd = decide_self_heal(worker)
     if heal_cmd:
-        return heal_cmd
+        return selected(state, worker.id, heal_cmd, "低血量且持有药品，治疗优先")
 
     width, height = state.map_info.width, state.map_info.height
     vendor = find_zone(state, "vendor")
@@ -373,7 +395,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
     if vendor and ore_in_backpack and chebyshev(worker.pos, vendor.pos) <= 1:
         name, num = Counter(ore_in_backpack).most_common(1)[0]
-        return {"action": "sell", "name": name, "num": num}
+        return selected(state, worker.id, {"action": "sell", "name": name, "num": num}, "已在小贩一格内，优先出售数量最多的矿石")
 
     buy_cmd = decide_buy_medicine(worker, state)
     if buy_cmd:
@@ -384,10 +406,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         return item_job_cmd
 
     if vendor and len(ore_in_backpack) >= int(worker.back_pack_capability * BACKPACK_SELL_RATIO):
-        step = move_towards(worker.pos, vendor.pos, blocked | reserved, width, height)
+        trace(state, worker.id, "sell_threshold", "矿石数量达到出售阈值，前往小贩", ore_count=len(ore_in_backpack))
+        step = traced_move(state, worker.id, worker.pos, vendor.pos, blocked | reserved, width, height)
         if step:
             reserved.add((step.x, step.y))
-            return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+            return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行经济循环：就近卖矿、达到阈值返售或采集最近矿点')
         return None
 
     build_cmd = try_build(worker, state, blocked, reserved)
@@ -400,21 +423,25 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         return item_job_cmd
 
     mine = nearest_mine(state, worker)
+    if mine is None:
+        trace(state, worker.id, "no_mine", "当前快照没有石、铁、铜矿点")
     if mine:
+        trace(state, worker.id, "mine_selected", "按切比雪夫距离选择最近矿点", mineral=mine.neutral_type, target={"x": mine.pos.x, "y": mine.pos.y})
         if chebyshev(worker.pos, mine.pos) <= 1:
-            return {"action": "collect", "targetPos": [{"x": mine.pos.x, "y": mine.pos.y}]}
-        step = move_towards(worker.pos, mine.pos, blocked | reserved, width, height)
+            return selected(state, worker.id, {"action": "collect", "targetPos": [{"x": mine.pos.x, "y": mine.pos.y}]}, "已在最近矿点一格内，执行采集")
+        step = traced_move(state, worker.id, worker.pos, mine.pos, blocked | reserved, width, height)
         if step:
             reserved.add((step.x, step.y))
-            return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+            return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行经济循环：就近卖矿、达到阈值返售或采集最近矿点')
     return None
+
 
 
 def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
     """V1暂不实现任务系统。"""
     heal_cmd = decide_self_heal(pioneer)
     if heal_cmd:
-        return heal_cmd
+        return selected(state, pioneer.id, heal_cmd, "低血量且持有药品，治疗优先")
 
     buy_cmd = decide_buy_medicine(pioneer, state)
     if buy_cmd:
@@ -425,7 +452,10 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
         return item_job_cmd
 
     maybe_start_shop_item_job(pioneer, state)
-    return decide_shop_item_job(pioneer, state, blocked, reserved)
+    cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+    if cmd is None:
+        trace(state, pioneer.id, "no_pioneer_action", "开拓者任务系统未接入；当前未产生治疗、补给或维修升级动作", available_gold=state.team_our.gold_num)
+    return cmd
 
 
 def plan_day(state: "MatchState") -> dict:
@@ -453,6 +483,7 @@ def plan_day(state: "MatchState") -> dict:
                 cost = WEAPON_GOLD_COST
                 state.planned_weapons += 1
             if cost > state.team_our.gold_num:
+                trace(state, role.id, "budget_rejected", "本回合剩余预算不足，取消指令", required_gold=cost, available_gold=state.team_our.gold_num)
                 continue
             state.team_our.gold_num -= cost
             commands[role.id] = cmd
@@ -487,6 +518,7 @@ def plan_night(state: "MatchState") -> dict:
     for fighter in fighters:
         heal_cmd = decide_self_heal(fighter)
         if heal_cmd:
+            trace(state, fighter.id, "selected", "低血量且持有药品，治疗优先", command=heal_cmd)
             commands[fighter.id] = heal_cmd
             continue
 
@@ -498,6 +530,7 @@ def plan_night(state: "MatchState") -> dict:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
             target = pick_attack_target(weapon, robots) if ready else None
             if target is not None:
+                trace(state, fighter.id, "selected", "操控邻接武器，按机器人类型优先级与血量选择目标", weapon_id=weapon.id, target_robot_id=target.id)
                 used_weapons.add(weapon.id)
                 commands[weapon.id] = {
                     "action": "attack",
@@ -506,10 +539,15 @@ def plan_night(state: "MatchState") -> dict:
                 }
                 continue
 
+        if weapon is not None:
+            trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
+                  "火箭仍在冷却" if not ready else "该武器射程内没有机器人", weapon_id=weapon.id)
         free_weapons = [w for w in weapons if w.id not in used_weapons]
+        if not free_weapons:
+            trace(state, fighter.id, "no_free_weapon", "没有武器或武器已被其他角色使用")
         if free_weapons:
             nearest_weapon = min(free_weapons, key=lambda w: chebyshev(fighter.pos, w.pos))
-            step = move_towards(
+            step = traced_move(state, fighter.id,
                 fighter.pos, nearest_weapon.pos, blocked | reserved, state.map_info.width, state.map_info.height
             )
             if step:
@@ -567,8 +605,10 @@ class V1Strategy(Strategy):
         self.validator = validator
 
     def decide(self, state: "MatchState") -> dict:
+        state.decision_events = []
         learn_from_last_round(state)
         if not state.team_our or not state.map_info:
+            trace(state, None, "missing_state", "缺少队伍或地图快照，不能生成指令")
             commands = {}
         elif is_day_round(state.round_no):
             commands = plan_day(state)
@@ -584,6 +624,7 @@ class V1Strategy(Strategy):
             try:
                 self.validator.validate(command, state)
             except ValueError as exc:
+                trace(state, next((r.id for r in state.team_our.roles if str(r.id) == str(command.get("controllerId"))), role_id) if state.team_our else role_id, "validation_rejected", "本地指令校验失败", error=str(exc), command=command)
                 logging.getLogger(__name__).warning("Dropped command for %s: %s (%r)", role_id, exc, command)
                 continue
             valid[role_id] = command

@@ -1,13 +1,16 @@
 """HTTP服务与请求处理。"""
 import itertools
 import json
+from copy import deepcopy
+from time import perf_counter
 from pathlib import Path
 from threading import Lock
 
 from flask import Flask, jsonify, request
 
 from .protocol import MatchState
-from .brain import V1Strategy, BasicActionValidator
+from .brain import V1Strategy, BasicActionValidator, is_day_round
+from .decision_log import snapshot, build_report, write_report
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -84,6 +87,7 @@ class GameServer:
         self.state_dir = root_dir / "state"
         self.request_sequence = itertools.count(1)
         self.match_state = MatchState()
+        self.previous_snapshot = None
         self.strategy = strategy or V1Strategy(BasicActionValidator())
         self.app = Flask(__name__)
         self._setup_routes()
@@ -127,7 +131,24 @@ class GameServer:
             # 策略决策
             self.load_build_memory()
             self.match_state.update(data)
+            previous_commands = deepcopy(self.match_state.last_sent_command)
+            before = snapshot(self.match_state)
+            self.match_state.decision_events = []
+            started = perf_counter()
             role_command_map = self.strategy.decide(self.match_state)
+            elapsed_ms = (perf_counter() - started) * 1000
+            # 诊断日志失败不应让合法比赛响应变成500。
+            try:
+                report = build_report(
+                    self.match_state, role_command_map, previous_commands, before,
+                    self.previous_snapshot, seq, elapsed_ms,
+                    "未知" if self.match_state.round_no is None else (
+                        "白天" if is_day_round(self.match_state.round_no) else "夜晚"),
+                )
+                write_report(self.log_dir, report)
+            except Exception:
+                self.app.logger.exception("decision logging failed (response unaffected)")
+            self.previous_snapshot = before
             self.save_build_memory()
 
             command = {"roleCommandMap": role_command_map, "prompt": "", "executeCmd": ""}
