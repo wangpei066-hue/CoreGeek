@@ -18,32 +18,47 @@
 - 围墙维修与武器/围墙/基地升级券：空闲角色（工人或开拓者，`buy`/`use`/`sell` 是全角色可用动作）机会性执行"买道具→走到目标建筑一格内→use"两段式任务，优先级为 围墙维修（血量<满血80%）> 基地升级 > 武器升级（位置稀缺只有3座）> 围墙升级（数量不限，优先级最低）；同一目标建筑不会被两个角色重复分配。该任务队列（`worker_item_jobs`）与建造记忆一起落盘到 `state/build_memory.json`。
 - 本地指令合法性校验（`BasicActionValidator`），拦截缺字段等明显非法指令；贩卖时只统计矿石类物品，不会把背包里的升级券/维修包/药品当矿石卖掉。
 
-**明确不实现（见 docs/rules_verified.md 未核实项，风险较高，留待后续版本）**：
-- 三类任务系统（推理类/长上下文类/自进化类）：`acceptTask`/`submitAnswer`/`summonTreasure` 均未接入，答案 schema 未核实——这是唯一被有意搁置的部分,其余商店/消耗品体系已在 V1 完成。
-- 眩晕法宝、范围炸弹（3×3 范围攻击/控场机器人）、机器人召唤令（花钱让对方下一夜机器人更多，纯进攻性道具）。
+**明确不实现（风险高、收益不确定，留待后续版本）**：
+- 三类任务系统（推理类/长上下文类/自进化类）：`acceptTask`/`submitAnswer`/`summonTreasure` 均未接入。原因是真实的 `taskAnswer` 格式和参数校验规则尚未通过官方反馈确认，硬写等于瞎猜，不如等实测日志反馈后再做。其余采矿/贩卖/升级等商店体系已在 V1 完成。
+- 纯进攻性道具：眩晕法宝、范围炸弹（3×3 范围攻击）、机器人召唤令（花钱让对方下一夜机器人更多）。这些对生存没有直接威胁，经济和防守两个主线功能完整后再规划。
 - `prompt`（LLM）与 `executeCmd`（沙盒）调用。
 - 角色阵亡复活后的状态衔接、换边重置。
 
-以上限制意味着 V1 是一个能打满全程、会挖矿卖矿、会建塔修塔升级、夜晚会防守的机器人，但还不会打任务系统这块最大的积分来源，也不会用眩晕/炸弹主动清场。
+以上限制意味着 V1 是一个能打满全程、会挖矿卖矿、会建塔修塔升级、夜晚会防守的机器人，但还不会打任务系统这块最大的积分来源，也不会用进攻性道具主动清场。生存和经济两个主线已验证可用，等官方对局反馈后规划升级。
 
-## 最小目录与迁移
+## 项目结构与迁移
 
 ```text
-main.py             全部运行代码：SDK入口、callback、日志、预留接口
-run.sh              接口文档启动样例（bash run.sh port）的转发脚本，转发给 python main.py
-requirements.txt    Python依赖
-README.md           启动、迁移、测试说明
-tests/              本地测试和人工请求样例（运行时不需要）
-tools/              开发期诊断脚本，如日志比对（运行时不需要）
-docs/               赛题文档和审计（运行时不需要）
-results/            验证记录（运行时不需要）
-logs/               启动时自动创建，请求与响应日志
-state/              启动时自动创建，预留状态目录
+main.py                 程序入口（简洁转发，实际逻辑在 src/agent/）
+src/agent/
+  ├── __init__.py      导出公开接口
+  ├── protocol.py      数据结构和状态定义
+  ├── grid.py          网格算法和寻路
+  ├── brain.py         策略和决策逻辑
+  └── server.py        HTTP服务器和持久化
+requirements.txt        Python 依赖（Flask, etc.）
+README.md              启动、迁移、测试说明
+.github/               GitHub Workflow 和 PR 模板
+docs/                  赛题文档和审计
+tests/                 本地测试用例（运行时不需要）
+logs/                  启动时自动创建，请求/响应日志
+state/                 启动时自动创建，跨回合学习记忆
 ```
 
-迁移运行只需复制 `main.py`、`run.sh`、`requirements.txt` 到一个可写目录，安装依赖后执行 `python main.py 6666` 或 `bash run.sh 6666`（二者等价，`run.sh` 只是按接口文档样例做的转发，判题平台具体靠哪种方式拉起程序尚未核实，两者都保留以防万一）。需要复现测试时，再复制 `tests/`；无需复制日志、状态或缓存。后续策略只修改 `callback` 及其调用的实现。
+**运行时最小依赖**：只需 `main.py`、`src/agent/`、`requirements.txt` 三个部分。迁移运行：
+1. 复制 `main.py`、`src/agent/` 目录、`requirements.txt` 到可写目录
+2. 执行 `pip install -r requirements.txt`
+3. 执行 `python main.py 6666` 启动服务
 
-直接采用 SDK 的全局 `app = Flask(__name__)` 和 `process_request()`，去掉应用工厂和独立接口文件。粘贴文本里的 `**name**`/`**main**` 应还原为 Python 的 `__name__`/`__main__`，反斜线转义下划线也应还原。SDK 的回显 callback 被保底响应替换；保留非法 JSON 400、异常恢复和不覆盖日志。监听 `0.0.0.0` 遵循接口文档要求，区别于 Flask 默认仅本机监听。
+`logs/` 和 `state/` 会在运行时自动创建。无需复制测试、文档、日志或状态。
+
+**架构说明**：代码采用标准 Python 包结构，核心逻辑分解为四个专职模块：
+- `protocol.py`：数据协议与状态定义
+- `grid.py`：网格算法（A* 寻路、碰撞检测）
+- `brain.py`：游戏策略与决策（V1Strategy）
+- `server.py`：HTTP 服务器与持久化
+
+后续优化只需修改 `src/agent/brain.py` 中的策略实现，无需改动 HTTP 层或数据解析。
 
 ## 启动与测试（PowerShell）
 
@@ -77,7 +92,7 @@ python -m unittest discover -s tests -v
 - 非法 JSON、数组、null、标量或不符合 JSON Content-Type 的请求返回 HTTP 400，且不记录为合法请求。
 - 日志或 callback 异常返回 HTTP 500 并记录异常到 stderr，服务继续处理后续请求。
 - `state/build_memory.json`：`MatchState` 的跨回合学习记忆（建造失败黑名单、待建造目标、维修/升级任务队列、上一次发送的指令）落盘于此，`callback` 每次请求前读（进程内只读一次）、处理后写；写入用临时文件+原子替换防止写坏；没有任何值得记忆的内容时（如纯连通性测试请求）不落盘，`state/` 保持空目录。
-- `main.py` 中 `GameState` 为抽象接口；`MatchState(GameState)` 实现 `update()`，将请求 JSON 解析为结构化字段（`Pos`/`Zone`/`MapInfo`/`Role`/`PlayerTask`/`TeamOur`/`TeamEnemy`/`RobotRole`/`WorldNews`/`ShopItem`/`ErrorInfo`），每回合全量重建。`Strategy` 由 `V1Strategy` 实现，`ActionValidator` 由 `BasicActionValidator` 实现，均已接入 `callback`。`TaskSession` 仍是未实现抽象接口（任务系统留待后续版本）。
+- `src/agent/protocol.py` 中 `GameState` 为抽象接口；`MatchState(GameState)` 实现 `update()` 将请求 JSON 解析为结构化字段（`Pos`/`Zone`/`MapInfo`/`Role`/`PlayerTask`/`TeamOur`/`TeamEnemy`/`RobotRole`/`WorldNews`/`ShopItem`/`ErrorInfo`），每回合全量重建。`src/agent/brain.py` 中 `Strategy` 由 `V1Strategy` 实现，`ActionValidator` 由 `BasicActionValidator` 实现，均已接入 `src/agent/server.py` 的 `GameServer`。`TaskSession` 仍是未实现抽象接口（任务系统留待后续版本）。
 - 当前使用 Flask 默认 JSON 解析，不宣称实现额外的重复键、NaN、请求大小、响应总时限等严格校验。
 - `roleCommandMap` 里只有 V1 主动决定行动的角色才会出现在 map 中，其余角色本回合不下发指令（待机）；判题器是否接受"角色不出现在 map 中"为待机尚未经真实对局验证。
 - 已通过 `tests/fixtures/sample_match_state.json`（本地构造、非官方样本）人工联通验证 V1 会针对真实结构的请求生成非空 `roleCommandMap`；尚未接入官方判题器实测决策效果。
