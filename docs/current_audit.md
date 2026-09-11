@@ -38,6 +38,7 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 2. 官方判题器/最小对局启动器、运行命令、地图及对手配置。当前无法运行官方对局，也无法确认空动作待机被接受。
 3. 官方 Python SDK 发布包/版本、依赖与提交打包要求。用户已确认 HTTP/SDK 入口；《编译运行环境说明》已由用户核对，仅确认 Python 3.11.10，依赖包版本等仍未说明，发布物和评测环境仍未独立验证。
 4. 建造区坐标、回合从 0/1 开始、换边重启/状态清理约定、实际任务答案 schema 等缺口，详见 rules_verified.md。
+5. 【2026-09-11 补充】已按接口文档开头"样例：bash run.sh port"新增 `run.sh`（转发给 `python main.py`），本地在 Windows + Git Bash 下语法检查通过且实测能正常拉起服务、响应 200；但判题平台是否真的用 `run.sh` 拉起程序、提交包目录结构要求，仍未从赛事组委会得到确认。
 
 服务可启动、本地测试可追溯；官方对局不可运行（材料缺失）。停止于 Python P0，不推进 E1–E7。第一份真实 JSON 是接入状态的下一项关键输入，但并不能替代官方判题器和完整运行/提交材料。
 
@@ -62,8 +63,6 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 - 明确未实现：三类任务系统（`acceptTask`/`submitAnswer`/`summonTreasure`）、商店消耗品/升级券购买使用、`prompt`/`executeCmd` 调用、复活/换边状态衔接——均依赖当前仍缺失或未核实的材料（任务答案 schema、可建造区精确坐标等）。
 
 新增 `tests/test_v1_strategy.py`（45 项全部通过，覆盖寻路、昼夜判定、目标优先级、日间/夜间决策、校验器）；`tests/test_state_parser.py` 中依赖旧版"固定空响应"的断言已更新为结构断言。人工用 `sample_match_state.json` 起真实 HTTP 服务验证：请求为夜晚回合（roundNo=85）时返回的 `roleCommandMap` 非空、结构合法。仍未接入官方判题器，V1 决策质量未经真实对局验证。
-<<<<<<< Updated upstream
-=======
 
 ## V1 补全：响应日志、run.sh、跨回合持久化、生存兜底（2026-09-11）
 
@@ -92,4 +91,3 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 - 系统日志：读取和工具执行输出 PIONEER_TASK JSON，含 requestId 和结果；空闲沙盒回合补充阶段诊断，避免诊断覆盖解题命令。stderr 同时记录 llmResp。平台下载可见性仍未实测。
 - 限制：文件搜索7秒，工具执行10秒；文档每页6000字符、每文档自动读取最多60000字符；工具结果最多6000字符；每任务最多12次LLM调用。超限/找不到/歧义/截断信息反馈给LLM。未知工具反馈不自动重放命令。
 - 验证：完整105项 unittest通过（含真实HTTP启动）；新增12项测试覆盖读文档→平台LLM→执行工具→平台LLM→提交、分页、路径查找与歧义、安全引用、错误答案、重启、重复回合及旧任务结果隔离。测试使用模拟LLM回复和实际本机执行生成的沙盒命令，未调用官方LLM或上传平台。
->>>>>>> Stashed changes
