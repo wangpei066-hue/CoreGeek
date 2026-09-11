@@ -15,7 +15,9 @@ from src.agent.brain import (
     BasicActionValidator,
     decide_shop_item_job,
     maybe_start_shop_item_job,
+    tower_sites,
     voucher_for,
+    wall_order,
 )
 
 
@@ -187,9 +189,19 @@ class SellDoesNotDumpNonOreItemsTests(unittest.TestCase):
 
     def test_worker_sells_only_ore_when_ore_and_voucher_both_present(self):
         state = minimal_state()
-        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
-        worker = make_role(10010, 10, 10, "worker", backpack=["stone", "WallFixer"], back_pack_capability=100)
-        state.team_our.roles.append(worker)
+        state.team_our.roles[0].pos = Pos(10, 24)
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 24), neutral_type="vendor")])
+        sites = tower_sites(state)
+        weapons = [
+            make_role(10020 + i, site.x, site.y, kind, level=1)
+            for i, (site, kind) in enumerate(zip(sites, ("gatling", "railgun", "rocket")))
+        ]
+        walls = [
+            make_role(40000 + i, p.x, p.y, "wall", level=1)
+            for i, p in enumerate(wall_order(state))
+        ]
+        worker = make_role(10010, 10, 24, "worker", backpack=["stone", "WallFixer"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], *weapons, *walls, worker]
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
         self.assertEqual(commands[10010], {"action": "sell", "name": "stone", "num": 1})
@@ -209,23 +221,28 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):
     def test_worker_repairs_wall_across_several_rounds(self):
-        """完整跑一遍：分配任务 -> 走到商店 -> 买 WallFixer -> 走到围墙 -> use 修复，全程不抛异常
-        且每一步指令都能通过本地校验。"""
+        """完整跑一遍：分配任务 -> 走到商店 -> 买 WallFixer -> 走到围墙 -> use 修复。"""
         state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].pos = Pos(10, 24)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
-        wall = make_role(40000, 30, 30, "wall", health=100, level=1)  # 远离商店，逼出多回合移动
-        worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
+        sites = tower_sites(state)
         weapons = [
-            make_role(10020, 8, 10, "gatling", level=1),
-            make_role(10030, 9, 10, "railgun", level=1),
-            make_role(10040, 8, 11, "rocket", level=1),
+            make_role(10020 + i, site.x, site.y, kind, level=1)
+            for i, (site, kind) in enumerate(zip(sites, ("gatling", "railgun", "rocket")))
         ]
-        state.team_our.roles += [wall, worker, *weapons]
+        # 蓝图围墙都建齐，另放一堵受损墙触发维修
+        blueprint_walls = [
+            make_role(40000 + i, p.x, p.y, "wall", health=1000, level=1)
+            for i, p in enumerate(wall_order(state))
+        ]
+        damaged = make_role(40999, 30, 30, "wall", health=100, level=1)
+        worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], *weapons, *blueprint_walls, damaged, worker]
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()
         actions_seen = []
-        for _ in range(200):  # 上限防止死循环；正常应在远小于此的回合数内完成
+        for _ in range(200):
             commands = strategy.decide(state)
             cmd = commands.get(10010)
             if cmd is None:
@@ -238,7 +255,6 @@ class MultiRoundRepairIntegrationTest(unittest.TestCase):
             elif cmd["action"] == "buy":
                 worker.backpack.append(cmd["name"])
             elif cmd["action"] == "use":
-                # 判题器真实效果是围墙回满血；这里只需确认流程走完，不用真的改 wall.health
                 break
         self.assertIn("buy", actions_seen)
         self.assertIn("use", actions_seen)

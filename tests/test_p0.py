@@ -1,7 +1,6 @@
 import http.client
 import json
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import sys
@@ -24,14 +23,12 @@ class P0Tests(unittest.TestCase):
         self.server.prepare_directories()
         self.client = self.server.app.test_client()
 
-    def test_valid_fixture_and_log(self):
+    def test_valid_fixture_returns_empty_commands(self):
         payload = json.loads((Path(__file__).parent / "fixtures/valid_request.json").read_text(encoding="utf-8"))
         response = self.client.post("/", json=payload)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json, EXPECTED)
-        self.assertEqual(json.loads((self.root / "logs/request_000001.json").read_text(encoding="utf-8")), payload)
         self.assertTrue((self.root / "state").is_dir())
-        self.assertEqual(list((self.root / "state").iterdir()), [])
 
     def test_invalid_then_recovery(self):
         for payload in ['{broken', 'null', '[]', '1', '"text"', '']:
@@ -39,16 +36,7 @@ class P0Tests(unittest.TestCase):
                 response = self.client.post("/", data=payload, content_type="application/json")
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(response.json, {"error": "invalid JSON object"})
-        self.assertEqual(list((self.root / "logs").iterdir()), [])
         self.assertEqual(self.client.post("/", json={}).json, EXPECTED)
-
-    def test_restart_preserves_logs(self):
-        self.client.post("/", json={"first": True})
-        new_server = GameServer(self.root)
-        other = new_server.app.test_client()
-        other.post("/", json={"second": True})
-        self.assertEqual(json.loads((self.root / "logs/request_000001.json").read_text()), {"first": True})
-        self.assertEqual(json.loads((self.root / "logs/request_000002.json").read_text()), {"second": True})
 
     def test_only_post_root(self):
         self.assertEqual(self.client.get("/").status_code, 405)
@@ -74,18 +62,20 @@ class P0Tests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 interface()
 
+    def test_round_logged_on_stdout_logger(self):
+        with self.assertLogs("src.agent.server", level="INFO") as captured:
+            self.client.post("/", json={"roundNo": 3})
+        self.assertTrue(any("round 3 ->" in line for line in captured.output))
+
     def test_real_http_process(self):
-        # Test real HTTP process via Python module invocation to handle imports
-        import main
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        # Start the service via the main module
         process = subprocess.Popen(
-            [sys.executable, "-m", "main", str(port)],
+            [sys.executable, "main3.py", str(port)],
             cwd=str(Path(__file__).parent.parent),
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
         )
         try:
             for _ in range(100):
@@ -108,8 +98,9 @@ class P0Tests(unittest.TestCase):
         finally:
             process.terminate()
             output, _ = process.communicate(timeout=5)
-            print("\nReal HTTP server output:\n" + output.decode("utf-8", errors="replace"))
-        self.assertEqual(len(list((self.root / "logs").glob("request_*.json"))), 2)
+            text = output.decode("utf-8", errors="replace")
+            print("\nReal HTTP server output:\n" + text)
+            self.assertIn("listening on 0.0.0.0:", text)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,15 @@
 """HTTP服务与请求处理。"""
 import itertools
 import json
+import logging
 from pathlib import Path
-from typing import Callable
 
 from flask import Flask, jsonify, request
 
 from .protocol import MatchState
 from .brain import V1Strategy, BasicActionValidator
+
+LOGGER = logging.getLogger(__name__)
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -87,49 +89,30 @@ class GameServer:
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
     def load_build_memory(self) -> None:
-        """从state/build_memory.json恢复跨回合学习记忆。"""
         load_build_memory(self.match_state, self.state_dir)
 
     def save_build_memory(self) -> None:
-        """落盘跨回合学习记忆，服务重启后可恢复。"""
         save_build_memory(self.match_state, self.state_dir)
 
     def _handle_request(self):
-        """处理单次游戏请求。"""
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return jsonify({"error": "invalid JSON object"}), 400
         try:
             self.prepare_directories()
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
-            while True:
-                seq = next(self.request_sequence)
-                log_path = self.log_dir / f"request_{seq:06d}.json"
-                try:
-                    with log_path.open("x", encoding="utf-8") as stream:
-                        stream.write(payload)
-                    break
-                except FileExistsError:
-                    continue
-
-            # 策略决策
             self.load_build_memory()
             self.match_state.update(data)
             role_command_map = self.strategy.decide(self.match_state)
             self.save_build_memory()
 
-            command = {"roleCommandMap": role_command_map, "prompt": "", "executeCmd": ""}
+            # Demo 风格：每回合把决策打到 stdout
+            LOGGER.info("round %s -> %s", data.get("roundNo"), role_command_map)
 
-            response_path = self.log_dir / f"response_{seq:06d}.json"
-            try:
-                with response_path.open("x", encoding="utf-8") as stream:
-                    stream.write(json.dumps(command, ensure_ascii=False, indent=2))
-            except FileExistsError:
-                pass
+            command = {"roleCommandMap": role_command_map, "prompt": "", "executeCmd": ""}
             return jsonify(command), 200
         except Exception:
-            self.app.logger.exception("request processing failed")
-            return jsonify({"error": "internal server error"}), 500
+            LOGGER.exception("decision failed")
+            return jsonify({"roleCommandMap": {}, "prompt": "", "executeCmd": ""}), 200
 
     def run(self, host: str = "0.0.0.0", port: int = 5000, debug: bool = False):
         self.app.run(host=host, port=port, debug=debug)

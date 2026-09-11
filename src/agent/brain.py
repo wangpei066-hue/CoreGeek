@@ -1,23 +1,32 @@
-"""V1策略实现：白天经济循环+夜晚武器操控战斗。"""
+"""V1策略实现：白天按 Demo 固定炮台/围墙蓝图建造，夜晚武器操控战斗。"""
 from collections import Counter
 from typing import Optional
 
 from .protocol import (
     ActionValidator, GameState, MatchState, Pos, Role, Strategy
 )
-from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
+from .grid import (
+    build_blocked_set,
+    chebyshev,
+    footprint_distance,
+    is_land_cell,
+    move_towards,
+    nearest_adjacent_free_cell,
+    station_footprint,
+)
 
 
 DAY_ROUNDS = 70
 NIGHT_ROUNDS = 60
 DAY_NIGHT_CYCLE = DAY_ROUNDS + NIGHT_ROUNDS
 WEAPON_TYPES = ("gatling", "railgun", "rocket")
+TOWER_LOADOUT = ("gatling", "railgun", "rocket")
 MAX_WEAPONS = 3
 WEAPON_GOLD_COST = 25
 ORE_TYPES = ("stone", "iron", "copper")
+WALL_MATERIAL = "stone"
+STONE_BATCH = 6
 BACKPACK_SELL_RATIO = 0.8
-BUILD_RING_MIN_RADIUS = 2
-BUILD_RING_MAX_RADIUS = 6
 
 WALL_FIXER_GOLD_COST = 10
 WALL_REPAIR_RATIO = 0.8
@@ -38,6 +47,11 @@ HEAL_HP_RATIO = 0.5
 MEDICINE_GOLD_COST = 10
 
 _ROBOT_PRIORITY = {"bossRobot": 4, "largeRobot": 3, "middleRobot": 2, "smallRobot": 1}
+_NEIGHBOUR_STEPS = (
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1), (0, 1),
+    (1, -1), (1, 0), (1, 1),
+)
 
 
 def is_day_round(round_no) -> bool:
@@ -46,19 +60,6 @@ def is_day_round(round_no) -> bool:
     if round_no is None:
         return True
     return (round_no % DAY_NIGHT_CYCLE) < DAY_ROUNDS
-
-
-def _ring_offsets(min_radius=BUILD_RING_MIN_RADIUS, max_radius=BUILD_RING_MAX_RADIUS):
-    offsets = []
-    for r in range(min_radius, max_radius + 1):
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                if max(abs(dx), abs(dy)) == r:
-                    offsets.append((dx, dy))
-    return offsets
-
-
-_BUILD_RING_OFFSETS = _ring_offsets()
 
 
 def find_zone(state: "MatchState", neutral_type: str):
@@ -89,83 +90,50 @@ def own_station(state: "MatchState"):
     return next((r for r in state.team_our.roles if r.role_type == "station"), None)
 
 
-def assign_worker_specialties(state: "MatchState") -> dict:
-    """两个工人按 id 分工：较小的专建炮台，较大的专建围墙。只活一人时两者都做。"""
-    if not state.team_our:
-        return {}
-    workers = sorted(
-        (r for r in state.team_our.roles if r.role_type == "worker"),
-        key=lambda r: r.id,
-    )
-    if not workers:
-        return {}
-    if len(workers) == 1:
-        return {workers[0].id: "both"}
-    mapping = {workers[0].id: "weapon", workers[-1].id: "wall"}
-    for extra in workers[1:-1]:
-        mapping[extra.id] = "wall"
-    return mapping
+def _cells_at_distance(station_pos: Pos, radius: int):
+    footprint = station_footprint(station_pos)
+    xs = [p.x for p in footprint]
+    ys = [p.y for p in footprint]
+    cells = []
+    for x in range(min(xs) - radius, max(xs) + radius + 1):
+        for y in range(min(ys) - radius, max(ys) + radius + 1):
+            pos = Pos(x, y)
+            if pos in footprint:
+                continue
+            if footprint_distance(pos, footprint) == radius:
+                cells.append(pos)
+    return tuple(cells)
 
 
-def is_base_top_left(state: "MatchState", base_pos: Pos) -> bool:
-    """左半图视为左上出生点，右半图视为右下出生点。"""
-    return base_pos.x < state.map_info.width / 2
+def tower_sites(state: "MatchState") -> tuple:
+    """Demo：基地脚印距离为1的空地中取3格作为固定炮台位。"""
+    station = own_station(state)
+    if station is None or not state.map_info:
+        return ()
+    footprint = station_footprint(station.pos)
+    cells = [pos for pos in _cells_at_distance(station.pos, 1) if is_land_cell(state, pos)]
+    cells.sort(key=lambda pos: (footprint_distance(pos, footprint), pos.x, pos.y))
+    return tuple(cells[:3])
 
 
-def _wall_direction_score(dx: int, dy: int, prefer_right: bool) -> int:
-    """优先朝敌方一侧延伸；同侧内更靠外、更贴近基地高度的格子优先。"""
-    side = dx if prefer_right else -dx
-    return side * 10 - abs(dy)
-
-
-def _in_preferred_wall_side(dx: int, dy: int, prefer_right: bool) -> bool:
-    """左上基地铺右侧上下，右下基地铺左侧上下。"""
-    if prefer_right:
-        return dx >= 0
-    return dx <= 0
-
-
-def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optional[Pos]:
-    """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。"""
-    width, height = state.map_info.width, state.map_info.height
-    for dx, dy in _BUILD_RING_OFFSETS:
-        x, y = base_pos.x + dx, base_pos.y + dy
-        if not (0 <= x < width and 0 <= y < height):
-            continue
-        key = (x, y)
-        if key in state.failed_build_spots or key in blocked:
-            continue
-        return Pos(x, y)
-    return None
-
-
-def pick_wall_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optional[Pos]:
-    """围墙朝向敌方竖边：左上基地优先右侧上下，右下基地优先左侧上下；先近后远。"""
-    prefer_right = is_base_top_left(state, base_pos)
-    width, height = state.map_info.width, state.map_info.height
-    preferred = []
-    fallback = []
-    for dx, dy in _BUILD_RING_OFFSETS:
-        x, y = base_pos.x + dx, base_pos.y + dy
-        if not (0 <= x < width and 0 <= y < height):
-            continue
-        key = (x, y)
-        if key in state.failed_build_spots or key in blocked:
-            continue
-        radius = max(abs(dx), abs(dy))
-        score = _wall_direction_score(dx, dy, prefer_right)
-        item = (radius, -score, x, y)
-        if _in_preferred_wall_side(dx, dy, prefer_right):
-            preferred.append(item)
-        else:
-            fallback.append(item)
-    for bucket in (preferred, fallback):
-        if not bucket:
-            continue
-        bucket.sort()
-        _, _, x, y = bucket[0]
-        return Pos(x, y)
-    return None
+def wall_order(state: "MatchState") -> tuple:
+    """Demo：绕基地脚印一圈、外扩2格的围墙顺序，留一个入口。"""
+    station = own_station(state)
+    if station is None or not state.map_info:
+        return ()
+    footprint = station_footprint(station.pos)
+    xs = [p.x for p in footprint]
+    ys = [p.y for p in footprint]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    order = [
+        *(Pos(x, ymin - 2) for x in range(xmax + 2, xmin - 3, -1)),
+        *(Pos(xmin - 2, y) for y in range(ymin - 1, ymax + 2)),
+        *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
+        *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)),
+    ]
+    entrance = Pos(xmax + 2, ymin - 1)
+    return tuple(pos for pos in order if pos != entrance and is_land_cell(state, pos))
 
 
 def pick_weapon_name(state: "MatchState") -> str:
@@ -329,7 +297,7 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
 
 
 def learn_from_last_round(state: "MatchState") -> None:
-    """用上一回合的执行结果反馈修正建造黑名单。"""
+    """用上一回合的执行结果反馈修正建造黑名单（固定蓝图失败格跳过）。"""
     if not state.last_round_role_action_results or not state.last_sent_command:
         return
     for role_id, success in state.last_round_role_action_results.items():
@@ -342,93 +310,106 @@ def learn_from_last_round(state: "MatchState") -> None:
             state.failed_build_spots.add((pos["x"], pos["y"]))
 
 
-def _allowed_build_kinds(worker: Role, state: "MatchState", specialty: str):
-    weapon_count = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
-    can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count < MAX_WEAPONS
-    can_wall = "stone" in worker.backpack
-    if specialty == "weapon":
-        return ("weapon",) if can_weapon else ()
-    if specialty == "wall":
-        return ("wall",) if can_wall else ()
-    kinds = []
-    if can_weapon:
-        kinds.append("weapon")
-    if can_wall:
-        kinds.append("wall")
-    return tuple(kinds)
+def _pos_key(pos: Pos):
+    return (pos.x, pos.y)
 
 
-def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set, specialty: str = "both"):
-    """按工人分工建造：炮台工只建武器，围墙工只建围墙；单人时先炮后墙。"""
-    base = own_station(state)
-    if base is None or state.map_info is None:
-        return None
-
-    allowed = _allowed_build_kinds(worker, state, specialty)
-    pending = state.worker_build_targets.get(worker.id)
-    if pending:
-        x, y, kind = pending
-        if (x, y) in state.failed_build_spots or kind not in allowed:
-            del state.worker_build_targets[worker.id]
-            pending = None
-        else:
-            target = Pos(x, y)
-            if chebyshev(worker.pos, target) <= 1:
-                del state.worker_build_targets[worker.id]
-                if kind == "weapon":
-                    if state.team_our.gold_num < WEAPON_GOLD_COST:
-                        return None
-                    name = pick_weapon_name(state)
-                else:
-                    if "stone" not in worker.backpack:
-                        return None
-                    name = "wall"
-                return {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}
-            step = move_towards(worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
-            if step:
-                reserved.add((step.x, step.y))
-                return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
-            return None
-
-    if not allowed:
-        return None
-    kind = allowed[0]
-    picker = pick_wall_target if kind == "wall" else pick_build_target
-    target = picker(state, base.pos, blocked | reserved)
-    if target is None:
-        return None
-    state.worker_build_targets[worker.id] = (target.x, target.y, kind)
-    reserved.add((target.x, target.y))
-    step = move_towards(worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
+def _build_or_walk(worker: Role, target: Pos, name: str, blocked: set, reserved: set, width: int, height: int):
+    """Demo：已在目标一格内则 build，否则走向目标旁。"""
+    if worker.pos != target and chebyshev(worker.pos, target) <= 1:
+        reserved.add(_pos_key(target))
+        return {"action": "build", "name": name, "targetPos": [{"x": target.x, "y": target.y}]}
+    step = move_towards(worker.pos, target, blocked | reserved, width, height)
     if step:
         reserved.add((step.x, step.y))
         return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
-    if chebyshev(worker.pos, target) <= 1:
-        del state.worker_build_targets[worker.id]
-        name = pick_weapon_name(state) if kind == "weapon" else "wall"
-        return {"action": "build", "name": name, "targetPos": [{"x": target.x, "y": target.y}]}
     return None
 
 
-def _sellable_ores(worker: Role, specialty: str):
-    ores = [item for item in worker.backpack if item in ORE_TYPES]
-    if specialty != "wall":
-        return ores
-    return [item for item in ores if item != "stone"]
+def _adjacent_stone_mine(state: "MatchState", worker: Role):
+    mines = []
+    for zone in state.map_info.zones:
+        if zone.neutral_type != WALL_MATERIAL:
+            continue
+        if worker.pos != zone.pos and chebyshev(worker.pos, zone.pos) <= 1:
+            mines.append(zone.pos)
+    if not mines:
+        return None
+    return min(mines, key=lambda pos: (chebyshev(worker.pos, pos), pos.x, pos.y))
 
 
-def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set, specialty: str = "both"):
+def _mine_stone(worker: Role, state: "MatchState", blocked: set, reserved: set):
+    if len(worker.backpack) >= worker.back_pack_capability:
+        return None
+    width, height = state.map_info.width, state.map_info.height
+    mines = sorted(
+        (
+            z.pos for z in state.map_info.zones
+            if z.neutral_type == WALL_MATERIAL and _pos_key(z.pos) not in reserved
+        ),
+        key=lambda pos: (chebyshev(worker.pos, pos), pos.x, pos.y),
+    )
+    for mine in mines:
+        if worker.pos != mine and chebyshev(worker.pos, mine) <= 1:
+            reserved.add(_pos_key(mine))
+            return {"action": "collect", "targetPos": [{"x": mine.x, "y": mine.y}]}
+        step = move_towards(worker.pos, mine, blocked | reserved, width, height)
+        if step:
+            reserved.add((step.x, step.y))
+            return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+    return None
+
+
+def decide_worker_day(
+    worker: Role,
+    state: "MatchState",
+    blocked: set,
+    reserved: set,
+    sites: tuple,
+    free_towers: list,
+    free_walls: list,
+):
+    """Demo 建造动线：先补齐固定炮台位，再攒石建围墙蓝图；完成后才做卖矿/升级。"""
     heal_cmd = decide_self_heal(worker)
     if heal_cmd:
         return heal_cmd
 
     width, height = state.map_info.width, state.map_info.height
-    vendor = find_zone(state, "vendor")
-    sellable = _sellable_ores(worker, specialty)
-    ore_in_backpack = [item for item in worker.backpack if item in ORE_TYPES]
 
-    if vendor and sellable and chebyshev(worker.pos, vendor.pos) <= 1:
-        name, num = Counter(sellable).most_common(1)[0]
+    if free_towers and state.team_our.gold_num >= WEAPON_GOLD_COST:
+        for index, site in enumerate(sites):
+            if site in free_towers and _pos_key(site) not in reserved and _pos_key(site) not in state.failed_build_spots:
+                name = TOWER_LOADOUT[index] if index < len(TOWER_LOADOUT) else pick_weapon_name(state)
+                cmd = _build_or_walk(worker, site, name, blocked, reserved, width, height)
+                if cmd:
+                    if cmd["action"] == "build":
+                        free_towers.remove(site)
+                    return cmd
+
+    if free_walls:
+        stones = worker.backpack.count(WALL_MATERIAL)
+        mine = _adjacent_stone_mine(state, worker)
+        if mine is not None and stones < STONE_BATCH:
+            reserved.add(_pos_key(mine))
+            return {"action": "collect", "targetPos": [{"x": mine.x, "y": mine.y}]}
+        if stones:
+            for site in list(free_walls):
+                if _pos_key(site) in reserved or _pos_key(site) in state.failed_build_spots:
+                    continue
+                cmd = _build_or_walk(worker, site, "wall", blocked, reserved, width, height)
+                if cmd:
+                    if cmd["action"] == "build":
+                        free_walls.remove(site)
+                    return cmd
+            return None
+        mine_cmd = _mine_stone(worker, state, blocked, reserved)
+        if mine_cmd:
+            return mine_cmd
+
+    vendor = find_zone(state, "vendor")
+    ore_in_backpack = [item for item in worker.backpack if item in ORE_TYPES]
+    if vendor and ore_in_backpack and chebyshev(worker.pos, vendor.pos) <= 1:
+        name, num = Counter(ore_in_backpack).most_common(1)[0]
         return {"action": "sell", "name": name, "num": num}
 
     buy_cmd = decide_buy_medicine(worker, state)
@@ -439,12 +420,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if item_job_cmd:
         return item_job_cmd
 
-    build_cmd = try_build(worker, state, blocked, reserved, specialty)
-    if build_cmd:
-        return build_cmd
-
-    cargo_for_sell_trip = sellable if specialty == "wall" else ore_in_backpack
-    if vendor and len(cargo_for_sell_trip) >= int(worker.back_pack_capability * BACKPACK_SELL_RATIO):
+    if vendor and len(ore_in_backpack) >= int(worker.back_pack_capability * BACKPACK_SELL_RATIO):
         step = move_towards(worker.pos, vendor.pos, blocked | reserved, width, height)
         if step:
             reserved.add((step.x, step.y))
@@ -456,8 +432,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if item_job_cmd:
         return item_job_cmd
 
-    preferred_ores = ("stone",) if specialty == "wall" else ("iron", "copper")
-    mine = nearest_mine(state, worker, preferred_ores if specialty != "both" else None)
+    mine = nearest_mine(state, worker)
     if mine:
         if chebyshev(worker.pos, mine.pos) <= 1:
             return {"action": "collect", "targetPos": [{"x": mine.pos.x, "y": mine.pos.y}]}
@@ -468,8 +443,8 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     return None
 
 
-def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """V1暂不实现任务系统。"""
+def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set, sites: tuple):
+    """开拓者白天：自疗/买药/升级；若有炮台则贴过去待命（Demo 风格）。"""
     heal_cmd = decide_self_heal(pioneer)
     if heal_cmd:
         return heal_cmd
@@ -483,7 +458,22 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
         return item_job_cmd
 
     maybe_start_shop_item_job(pioneer, state)
-    return decide_shop_item_job(pioneer, state, blocked, reserved)
+    item_job_cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+    if item_job_cmd:
+        return item_job_cmd
+
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES]
+    if weapons:
+        nearest = min(weapons, key=lambda w: chebyshev(pioneer.pos, w.pos))
+        if chebyshev(pioneer.pos, nearest.pos) > 1:
+            step = move_towards(
+                pioneer.pos, nearest.pos, blocked | reserved,
+                state.map_info.width, state.map_info.height,
+            )
+            if step:
+                reserved.add((step.x, step.y))
+                return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+    return None
 
 
 def plan_day(state: "MatchState") -> dict:
@@ -492,14 +482,25 @@ def plan_day(state: "MatchState") -> dict:
         return commands
     blocked = build_blocked_set(state)
     reserved = set()
-    specialties = assign_worker_specialties(state)
+    sites = tower_sites(state)
+    order = wall_order(state)
+    standing_towers = {_pos_key(r.pos) for r in state.team_our.roles if r.role_type in WEAPON_TYPES}
+    standing_walls = {_pos_key(r.pos) for r in state.team_our.roles if r.role_type == "wall"}
+    free_towers = [
+        pos for pos in sites
+        if _pos_key(pos) not in standing_towers and _pos_key(pos) not in blocked
+    ]
+    free_walls = [
+        pos for pos in order
+        if _pos_key(pos) not in standing_walls and _pos_key(pos) not in blocked
+    ]
     for role in state.team_our.roles:
         if role.role_type == "worker":
             cmd = decide_worker_day(
-                role, state, blocked, reserved, specialties.get(role.id, "both")
+                role, state, blocked, reserved, sites, free_towers, free_walls,
             )
         elif role.role_type == "pioneer":
-            cmd = decide_pioneer_day(role, state, blocked, reserved)
+            cmd = decide_pioneer_day(role, state, blocked, reserved, sites)
         else:
             continue
         if cmd:

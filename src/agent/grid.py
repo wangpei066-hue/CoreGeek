@@ -83,10 +83,8 @@ def build_blocked_set(state: "MatchState") -> set:
 
     def add_role(role: Role):
         if role.role_type == "station":
-            bx, by = role.pos.x, role.pos.y
-            for dx in (0, 1):
-                for dy in (0, 1):
-                    blocked.add((bx + dx, by + dy))
+            for cell in station_footprint(role.pos):
+                blocked.add((cell.x, cell.y))
         else:
             blocked.add((role.pos.x, role.pos.y))
 
@@ -100,3 +98,31 @@ def build_blocked_set(state: "MatchState") -> set:
         for robot in state.robot.roles:
             blocked.add((robot.pos.x, robot.pos.y))
     return blocked
+
+
+def station_footprint(pos: Pos):
+    """基地 pos 为左上角，脚印为 (x,y)/(x+1,y)/(x,y-1)/(x+1,y-1)。"""
+    return (
+        pos,
+        Pos(pos.x + 1, pos.y),
+        Pos(pos.x, pos.y - 1),
+        Pos(pos.x + 1, pos.y - 1),
+    )
+
+
+def footprint_distance(pos: Pos, footprint) -> int:
+    if not footprint:
+        return 0
+    return min(chebyshev(pos, cell) for cell in footprint)
+
+
+def is_land_cell(state: "MatchState", pos: Pos) -> bool:
+    if not state.map_info:
+        return False
+    width, height = state.map_info.width, state.map_info.height
+    if not (0 <= pos.x < width and 0 <= pos.y < height):
+        return False
+    for zone in state.map_info.zones:
+        if zone.pos.x == pos.x and zone.pos.y == pos.y:
+            return False
+    return True
