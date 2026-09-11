@@ -2,7 +2,7 @@
 import itertools
 import json
 from pathlib import Path
-from typing import Callable
+from threading import Lock
 
 from flask import Flask, jsonify, request
 
@@ -22,6 +22,11 @@ def load_build_memory(state: "MatchState", state_dir: Path) -> None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
+    if not isinstance(data, dict):
+        return
+    state.memory_context = data.get("memory_context")
+    state.memory_round = data.get("memory_round")
+    state.build_retry_after = {tuple(entry[:3]): entry[3] for entry in data.get("build_retry_after", [])}
     state.failed_build_spots = {tuple(p) for p in data.get("failed_build_spots", [])}
     state.worker_build_targets = {
         int(role_id): tuple(value) for role_id, value in data.get("worker_build_targets", {}).items()
@@ -43,11 +48,16 @@ def save_build_memory(state: "MatchState", state_dir: Path) -> None:
         and not state.worker_build_targets
         and not state.worker_item_jobs
         and not state.last_sent_command
+        and state.memory_context is None
+        and not (state_dir / "build_memory.json").exists()
     ):
         return
     state_dir.mkdir(parents=True, exist_ok=True)
     path = state_dir / "build_memory.json"
     data = {
+        "memory_context": state.memory_context,
+        "memory_round": state.memory_round,
+        "build_retry_after": [[*key, value] for key, value in state.build_retry_after.items()],
         "failed_build_spots": [list(pos) for pos in state.failed_build_spots],
         "worker_build_targets": {
             str(role_id): list(value)
@@ -68,6 +78,7 @@ class GameServer:
     """游戏HTTP服务器，管理请求响应周期与跨回合持久化。"""
 
     def __init__(self, root_dir: Path, strategy=None):
+        self._request_lock = Lock()
         self.root = root_dir
         self.log_dir = root_dir / "logs"
         self.state_dir = root_dir / "state"
@@ -80,7 +91,8 @@ class GameServer:
     def _setup_routes(self):
         @self.app.route("/", methods=["POST"])
         def process_request():
-            return self._handle_request()
+            with self._request_lock:
+                return self._handle_request()
 
     def prepare_directories(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -133,3 +145,15 @@ class GameServer:
 
     def run(self, host: str = "0.0.0.0", port: int = 5000, debug: bool = False):
         self.app.run(host=host, port=port, debug=debug)
+
+
+def main():
+    """Installed console entry point; runtime files default to the working directory."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Competition HTTP service")
+    parser.add_argument("port", type=int)
+    parser.add_argument("--data-dir", type=Path, default=Path.cwd())
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    GameServer(args.data_dir).run(port=args.port)

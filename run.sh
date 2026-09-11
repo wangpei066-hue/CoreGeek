@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 接口文档启动样例：bash run.sh port（docs/接口文档.md 开头）。
 # 判题平台是否真的靠这个脚本拉起程序尚未核实（见 docs/current_audit.md 缺口清单）；
-# 这里只做参数转发，不改变 main.py 的行为，即使平台不用它也无副作用。
+# 这里只做参数转发，不改变 main3.py 的行为，即使平台不用它也无副作用。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,4 +23,4 @@ pick_python() {
 }
 
 PYTHON_BIN="$(pick_python)" || { echo "run.sh: 找不到可用的 python/python3 解释器" >&2; exit 1; }
-exec "$PYTHON_BIN" main.py "$1"
+exec "$PYTHON_BIN" main3.py "$1"

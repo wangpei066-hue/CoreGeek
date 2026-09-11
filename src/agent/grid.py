@@ -1,5 +1,6 @@
 """网格路径规划与碰撞检测算法。"""
 import heapq
+from collections import deque
 from typing import Optional, Generator
 
 from .protocol import Pos, MatchState, Role
@@ -45,7 +46,7 @@ def astar_next_step(start: Pos, goal: Pos, blocked: set, width: int, height: int
             return Pos(*path[0]) if path else None
         for n in neighbors8(Pos(*current), width, height):
             key = (n.x, n.y)
-            if key != goal_key and key in blocked:
+            if key in blocked:
                 continue
             tentative = g + 1
             if tentative < g_score.get(key, 1_000_000_000):
@@ -67,10 +68,22 @@ def move_towards(start: Pos, target: Pos, blocked: set, width: int, height: int)
     """返回本回合应移动到的下一格；已在target一格范围内则返回None（可直接行动，无需移动）。"""
     if chebyshev(start, target) <= 1:
         return None
-    goal = nearest_adjacent_free_cell(start, target, blocked, width, height)
-    if goal is None:
-        return None
-    return astar_next_step(start, goal, blocked, width, height)
+    # 所有步长都是1：BFS同时搜索所有交互格，避免最近格不可达导致停滞。
+    goals = {(p.x, p.y) for p in neighbors8(target, width, height)
+             if (p.x, p.y) not in blocked}
+    queue = deque([((start.x, start.y), None)])
+    visited = {(start.x, start.y)}
+    while queue:
+        current, first_step = queue.popleft()
+        if current in goals:
+            return first_step
+        for p in neighbors8(Pos(*current), width, height):
+            key = (p.x, p.y)
+            if key in blocked or key in visited:
+                continue
+            visited.add(key)
+            queue.append((key, first_step or p))
+    return None
 
 
 def build_blocked_set(state: "MatchState") -> set:
@@ -86,7 +99,7 @@ def build_blocked_set(state: "MatchState") -> set:
             bx, by = role.pos.x, role.pos.y
             for dx in (0, 1):
                 for dy in (0, 1):
-                    blocked.add((bx + dx, by + dy))
+                    blocked.add((bx + dx, by - dy))
         else:
             blocked.add((role.pos.x, role.pos.y))
 

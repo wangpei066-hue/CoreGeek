@@ -78,7 +78,8 @@ class PathfindingTests(unittest.TestCase):
         state = minimal_state()
         blocked = build_blocked_set(state)
         self.assertIn((10, 10), blocked)
-        self.assertIn((11, 11), blocked)
+        self.assertIn((11, 9), blocked)
+        self.assertNotIn((11, 11), blocked)
 
 
 class DayNightTests(unittest.TestCase):

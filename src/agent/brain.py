@@ -1,5 +1,7 @@
 """V1策略实现：白天经济循环+夜晚武器操控战斗。"""
 from collections import Counter
+import logging
+from copy import copy
 from typing import Optional
 
 from .protocol import (
@@ -18,6 +20,7 @@ ORE_TYPES = ("stone", "iron", "copper")
 BACKPACK_SELL_RATIO = 0.8
 BUILD_RING_MIN_RADIUS = 2
 BUILD_RING_MAX_RADIUS = 6
+BUILD_RETRY_ROUNDS = 30  # 经验性重试间隔，不是官方规则。
 
 WALL_FIXER_GOLD_COST = 10
 WALL_REPAIR_RATIO = 0.8
@@ -85,7 +88,7 @@ def own_station(state: "MatchState"):
     return next((r for r in state.team_our.roles if r.role_type == "station"), None)
 
 
-def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optional[Pos]:
+def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: str = "weapon") -> Optional[Pos]:
     """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。"""
     width, height = state.map_info.width, state.map_info.height
     for dx, dy in _BUILD_RING_OFFSETS:
@@ -93,7 +96,7 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optio
         if not (0 <= x < width and 0 <= y < height):
             continue
         key = (x, y)
-        if key in state.failed_build_spots or key in blocked:
+        if (x, y, kind) in state.failed_build_spots or key in blocked:
             continue
         return Pos(x, y)
     return None
@@ -143,7 +146,7 @@ def decide_buy_medicine(role: Role, state: "MatchState"):
         return None
     if "Medicine" in role.backpack:
         return None
-    if state.team_our.gold_num < MEDICINE_GOLD_COST:
+    if state.team_our.gold_num < item_cost("Medicine", state):
         return None
     if len(role.backpack) >= role.back_pack_capability:
         return None
@@ -233,9 +236,18 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
     x, y = job["target"]
     target = Pos(x, y)
 
+    if job.get("awaiting_use"):
+        previous = state.last_sent_command.get(role.id, {})
+        confirmed = (previous.get("action") == "use" and previous.get("name") == item
+                     and state.last_round_role_action_results.get(role.id) is True)
+        if confirmed or item not in role.backpack:
+            del state.worker_item_jobs[role.id]
+            return None
+        job.pop("awaiting_use", None)
+
     if item in role.backpack:
         if chebyshev(role.pos, target) <= 1:
-            del state.worker_item_jobs[role.id]
+            job["awaiting_use"] = True
             return {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}
         step = move_towards(role.pos, target, blocked | reserved, width, height)
         if step:
@@ -243,6 +255,9 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             return {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
         return None
 
+    if state.team_our.gold_num < item_cost(item, state):
+        del state.worker_item_jobs[role.id]
+        return None
     shop = find_zone(state, "weaponShop")
     if shop is None:
         del state.worker_item_jobs[role.id]
@@ -259,18 +274,36 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
     return None
 
 
+def item_cost(name: str, state: "MatchState") -> int:
+    for item in state.weapon_shop_list:
+        if item.name == name:
+            return item.price
+    if name == "Medicine":
+        return MEDICINE_GOLD_COST
+    if name == "WallFixer":
+        return WALL_FIXER_GOLD_COST
+    for kind in ("weapon", "station", "wall"):
+        for level in (1, 2):
+            item, cost = voucher_for(kind, level)
+            if item == name:
+                return cost
+    return 0
+
+
 def learn_from_last_round(state: "MatchState") -> None:
-    """用上一回合的执行结果反馈修正建造黑名单。"""
-    if not state.last_round_role_action_results or not state.last_sent_command:
-        return
+    """失败只代表暂时不可用；按建筑类型冷却30回合，不能推断永久非法。"""
+    now = state.round_no or 0
+    state.build_retry_after = {k: v for k, v in state.build_retry_after.items() if v > now}
+    state.failed_build_spots = set(state.build_retry_after)
     for role_id, success in state.last_round_role_action_results.items():
-        if success:
+        prev = state.last_sent_command.get(role_id, {})
+        if success or prev.get("action") != "build":
             continue
-        prev = state.last_sent_command.get(role_id)
-        if not prev or prev.get("action") != "build":
-            continue
+        kind = "wall" if prev.get("name") == "wall" else "weapon"
         for pos in prev.get("targetPos", []):
-            state.failed_build_spots.add((pos["x"], pos["y"]))
+            key = (pos["x"], pos["y"], kind)
+            state.build_retry_after[key] = now + BUILD_RETRY_ROUNDS
+            state.failed_build_spots.add(key)
 
 
 def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
@@ -282,7 +315,9 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     pending = state.worker_build_targets.get(worker.id)
     if pending:
         x, y, kind = pending
-        if (x, y) in state.failed_build_spots:
+        if ((x, y, kind) in state.failed_build_spots or (x, y) in blocked or (x, y) in reserved
+                or (kind == "weapon" and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles)
+                    + getattr(state, "planned_weapons", 0) >= MAX_WEAPONS)):
             del state.worker_build_targets[worker.id]
         else:
             target = Pos(x, y)
@@ -296,6 +331,7 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                     if "stone" not in worker.backpack:
                         return None
                     name = "wall"
+                reserved.add((x, y))
                 return {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}
             step = move_towards(worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
             if step:
@@ -304,7 +340,7 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             return None
 
     weapon_count = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
-    can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count < MAX_WEAPONS
+    can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count + getattr(state, "planned_weapons", 0) < MAX_WEAPONS
     can_wall = "stone" in worker.backpack
     if can_weapon:
         kind = "weapon"
@@ -313,7 +349,8 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     else:
         return None
 
-    target = pick_build_target(state, base.pos, blocked | reserved)
+    pending_spots = {(x, y) for x, y, _ in state.worker_build_targets.values()}
+    target = pick_build_target(state, base.pos, blocked | reserved | pending_spots, kind)
     if target is None:
         return None
     state.worker_build_targets[worker.id] = (target.x, target.y, kind)
@@ -395,6 +432,10 @@ def plan_day(state: "MatchState") -> dict:
     commands = {}
     if not state.team_our or not state.map_info:
         return commands
+    # 仅复制本回合预算；任务字典仍与真实状态共享，保留跨回合计划。
+    state = copy(state)
+    state.team_our = copy(state.team_our)
+    state.planned_weapons = 0
     blocked = build_blocked_set(state)
     reserved = set()
     for role in state.team_our.roles:
@@ -405,6 +446,15 @@ def plan_day(state: "MatchState") -> dict:
         else:
             continue
         if cmd:
+            cost = 0
+            if cmd["action"] == "buy":
+                cost = item_cost(cmd["name"], state) * cmd.get("num", 1)
+            elif cmd["action"] == "build" and cmd["name"] in WEAPON_TYPES:
+                cost = WEAPON_GOLD_COST
+                state.planned_weapons += 1
+            if cost > state.team_our.gold_num:
+                continue
+            state.team_our.gold_num -= cost
             commands[role.id] = cmd
     return commands
 
@@ -475,8 +525,29 @@ class BasicActionValidator(ActionValidator):
 
     def validate(self, command: dict, state: GameState) -> None:
         action = command.get("action")
-        if not action:
-            raise ValueError("missing action")
+        allowed = {"move", "build", "remove", "collect", "attack", "sell", "buy",
+                   "use", "drop", "acceptTask", "submitAnswer", "summonTreasure"}
+        if action not in allowed:
+            raise ValueError("unknown or missing action")
+        positions = command.get("targetPos")
+        if positions is not None:
+            if not isinstance(positions, list) or not positions:
+                raise ValueError("targetPos must be a nonempty list")
+            if action != "attack" and len(positions) != 1:
+                raise ValueError("action requires exactly one target")
+            for pos in positions:
+                if not isinstance(pos, dict) or any(type(pos.get(k)) is not int for k in ("x", "y")):
+                    raise ValueError("target coordinates must be integers")
+                if state is not None and state.map_info and not (0 <= pos["x"] < state.map_info.width and 0 <= pos["y"] < state.map_info.height):
+                    raise ValueError("target outside map")
+        if "num" in command and (type(command["num"]) is not int or command["num"] <= 0):
+            raise ValueError("num must be a positive integer")
+        if action == "build" and command.get("name") not in (*WEAPON_TYPES, "wall"):
+            raise ValueError("unknown or missing building name")
+        targeted_items = {"WallFixer", "DizzyWeapon", "Bomb"}
+        name = command.get("name", "")
+        if action == "use" and (name in targeted_items or "UpgradeVoucher" in name) and not positions:
+            raise ValueError("targeted item requires targetPos")
         if action in self._REQUIRES_TARGET_POS and not command.get("targetPos"):
             raise ValueError(f"{action} requires targetPos")
         if action == "attack" and (not command.get("targetPos") or not command.get("controllerId")):
@@ -485,7 +556,7 @@ class BasicActionValidator(ActionValidator):
             raise ValueError("summonTreasure requires targetPos and item")
         if action == "submitAnswer" and not command.get("taskAnswer"):
             raise ValueError("submitAnswer requires taskAnswer")
-        if action in ("sell", "buy", "use") and not command.get("name"):
+        if action in ("sell", "buy", "use", "drop") and not command.get("name"):
             raise ValueError(f"{action} requires name")
 
 
@@ -512,7 +583,8 @@ class V1Strategy(Strategy):
         for role_id, command in commands.items():
             try:
                 self.validator.validate(command, state)
-            except ValueError:
+            except ValueError as exc:
+                logging.getLogger(__name__).warning("Dropped command for %s: %s (%r)", role_id, exc, command)
                 continue
             valid[role_id] = command
         return valid

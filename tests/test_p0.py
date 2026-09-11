@@ -76,13 +76,12 @@ class P0Tests(unittest.TestCase):
 
     def test_real_http_process(self):
         # Test real HTTP process via Python module invocation to handle imports
-        import main
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         # Start the service via the main module
         process = subprocess.Popen(
-            [sys.executable, "-m", "main", str(port)],
+            [sys.executable, "-c", "from src.agent.server import main; main()", str(port), "--data-dir", str(self.root)],
             cwd=str(Path(__file__).parent.parent),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT
