@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 logs/
 state/
+.env
+.env.*
+!.env.example

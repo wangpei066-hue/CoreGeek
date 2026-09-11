@@ -2,8 +2,7 @@ import json
 from pathlib import Path
 import unittest
 
-from main import (
-    BasicActionValidator,
+from src.agent.protocol import (
     MapInfo,
     MatchState,
     Pos,
@@ -12,12 +11,16 @@ from main import (
     RobotRole,
     TeamEnemy,
     TeamOur,
-    V1Strategy,
     Zone,
-    build_blocked_set,
-    chebyshev,
+)
+from src.agent.grid import build_blocked_set, chebyshev, move_towards
+from src.agent.brain import (
+    V1Strategy,
+    BasicActionValidator,
+    decide_buy_medicine,
+    decide_self_heal,
     is_day_round,
-    move_towards,
+    max_health,
     pick_attack_target,
 )
 
@@ -230,6 +233,101 @@ class ValidatorTests(unittest.TestCase):
         validator = BasicActionValidator()
         for command in commands.values():
             validator.validate(command, state)  # 不抛异常即视为通过
+
+
+class MaxHealthTests(unittest.TestCase):
+    def test_worker_and_pioneer_use_fixed_hp_regardless_of_level(self):
+        worker = make_role(10010, 0, 0, "worker", level=None)
+        pioneer = make_role(10011, 0, 0, "pioneer", level=None)
+        self.assertEqual(max_health(worker), 220)
+        self.assertEqual(max_health(pioneer), 200)
+
+    def test_building_hp_scales_with_level(self):
+        gatling1 = make_role(10020, 0, 0, "gatling", level=1)
+        gatling3 = make_role(10020, 0, 0, "gatling", level=3)
+        self.assertEqual(max_health(gatling1), 1000)
+        self.assertEqual(max_health(gatling3), 2000)
+
+    def test_unknown_role_type_falls_back_to_current_health(self):
+        mystery = make_role(99999, 0, 0, "mysteryUnit", health=777)
+        self.assertEqual(max_health(mystery), 777)
+
+
+class SelfHealTests(unittest.TestCase):
+    def test_no_heal_without_medicine_in_backpack(self):
+        worker = make_role(10010, 0, 0, "worker", health=10, backpack=[])
+        self.assertIsNone(decide_self_heal(worker))
+
+    def test_no_heal_when_above_threshold(self):
+        worker = make_role(10010, 0, 0, "worker", health=220, backpack=["Medicine"])
+        self.assertIsNone(decide_self_heal(worker))
+
+    def test_heals_when_below_half_hp_and_carrying_medicine(self):
+        worker = make_role(10010, 0, 0, "worker", health=50, backpack=["Medicine"])
+        self.assertEqual(decide_self_heal(worker), {"action": "use", "name": "Medicine"})
+
+    def test_self_heal_preempts_night_combat(self):
+        state = minimal_state(round_no=75)
+        gatling = make_role(10020, 9, 10, "gatling", attack_range=4, level=1)
+        hurt_worker = make_role(10010, 9, 11, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], gatling, hurt_worker]
+        state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
+        strategy = V1Strategy(BasicActionValidator())
+        commands = strategy.decide(state)
+        self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
+        self.assertNotIn(10020, commands)  # 治疗优先，这一回合没有人操控武器
+
+    def test_self_heal_preempts_day_economy(self):
+        state = minimal_state(round_no=5)
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="stone")])
+        hurt_worker = make_role(10010, 10, 10, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], hurt_worker]
+        strategy = V1Strategy(BasicActionValidator())
+        commands = strategy.decide(state)
+        self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
+
+
+class BuyMedicineTests(unittest.TestCase):
+    def _state_with_shop(self, gold=50, shop_pos=(11, 10)):
+        state = minimal_state(round_no=5)
+        state.map_info = MapInfo(
+            width=41, height=32, zones=[Zone(pos=Pos(*shop_pos), neutral_type="weaponShop")]
+        )
+        state.team_our.gold_num = gold
+        return state
+
+    def test_no_buy_when_not_adjacent_to_shop(self):
+        state = self._state_with_shop(shop_pos=(30, 30))
+        worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
+        self.assertIsNone(decide_buy_medicine(worker, state))
+
+    def test_no_buy_when_already_carrying_medicine(self):
+        state = self._state_with_shop()
+        worker = make_role(10010, 10, 10, "worker", backpack=["Medicine"], back_pack_capability=100)
+        self.assertIsNone(decide_buy_medicine(worker, state))
+
+    def test_no_buy_when_gold_insufficient(self):
+        state = self._state_with_shop(gold=5)
+        worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
+        self.assertIsNone(decide_buy_medicine(worker, state))
+
+    def test_no_buy_when_backpack_full(self):
+        state = self._state_with_shop()
+        worker = make_role(10010, 10, 10, "worker", backpack=["stone"], back_pack_capability=1)
+        self.assertIsNone(decide_buy_medicine(worker, state))
+
+    def test_buys_when_adjacent_and_affordable(self):
+        state = self._state_with_shop()
+        worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
+        self.assertEqual(decide_buy_medicine(worker, state), {"action": "buy", "name": "Medicine", "num": 1})
+
+    def test_pioneer_buys_medicine_while_passing_shop_on_day(self):
+        state = self._state_with_shop()
+        pioneer = make_role(10011, 10, 10, "pioneer", backpack=[], back_pack_capability=40)
+        state.team_our.roles = [state.team_our.roles[0], pioneer]
+        strategy = V1Strategy(BasicActionValidator())
+        commands = strategy.decide(state)
+        self.assertEqual(commands[10011], {"action": "buy", "name": "Medicine", "num": 1})
 
 
 if __name__ == "__main__":

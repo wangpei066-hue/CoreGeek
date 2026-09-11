@@ -38,6 +38,7 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 2. 官方判题器/最小对局启动器、运行命令、地图及对手配置。当前无法运行官方对局，也无法确认空动作待机被接受。
 3. 官方 Python SDK 发布包/版本、依赖与提交打包要求。用户已确认 HTTP/SDK 入口；《编译运行环境说明》已由用户核对，仅确认 Python 3.11.10，依赖包版本等仍未说明，发布物和评测环境仍未独立验证。
 4. 建造区坐标、回合从 0/1 开始、换边重启/状态清理约定、实际任务答案 schema 等缺口，详见 rules_verified.md。
+5. 【2026-09-11 补充】已按接口文档开头"样例：bash run.sh port"新增 `run.sh`（转发给 `python main.py`），本地在 Windows + Git Bash 下语法检查通过且实测能正常拉起服务、响应 200；但判题平台是否真的用 `run.sh` 拉起程序、提交包目录结构要求，仍未从赛事组委会得到确认。
 
 服务可启动、本地测试可追溯；官方对局不可运行（材料缺失）。停止于 Python P0，不推进 E1–E7。第一份真实 JSON 是接入状态的下一项关键输入，但并不能替代官方判题器和完整运行/提交材料。
 
@@ -62,3 +63,13 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 - 明确未实现：三类任务系统（`acceptTask`/`submitAnswer`/`summonTreasure`）、商店消耗品/升级券购买使用、`prompt`/`executeCmd` 调用、复活/换边状态衔接——均依赖当前仍缺失或未核实的材料（任务答案 schema、可建造区精确坐标等）。
 
 新增 `tests/test_v1_strategy.py`（45 项全部通过，覆盖寻路、昼夜判定、目标优先级、日间/夜间决策、校验器）；`tests/test_state_parser.py` 中依赖旧版"固定空响应"的断言已更新为结构断言。人工用 `sample_match_state.json` 起真实 HTTP 服务验证：请求为夜晚回合（roundNo=85）时返回的 `roleCommandMap` 非空、结构合法。仍未接入官方判题器，V1 决策质量未经真实对局验证。
+
+## V1 补全：响应日志、run.sh、跨回合持久化、生存兜底（2026-09-11）
+
+- 响应日志：`process_request` 现在同时落盘 `logs/request_NNNNNN.json` 与 `logs/response_NNNNNN.json`（同序号配对），配合新增的 `tools/analyze_build_attempts.py` 离线核对 `build` 指令是否被判题器接受（用下一轮 `lastRoundRoleActionResults` + `teamOur.roles` 结构双重验证）。
+- `run.sh`：按接口文档开头"样例：bash run.sh port"补充，转发给 `python`/`python3`（用实际执行一次空脚本而非仅 `command -v` 判断可用性，避开 Windows python3 商店空壳的坑）。本地 Git Bash 下语法检查、实际拉起服务、响应 200 均验证通过；判题平台是否真的依赖它仍未核实。
+- 跨回合记忆持久化：`load_build_memory`/`save_build_memory` 把建造黑名单、待建造目标、上一次发送的指令落盘到 `state/build_memory.json`，`callback` 请求前读、处理后写；无内容可记时不落盘。`V1Strategy.decide()` 本身保持无 IO，磁盘读写只发生在 `callback()`，便于策略单测继续用内存态 `MatchState` 直接跑。
+- 生存兜底：`max_health()` 按任务书4.5.1/4.5.2 表格给出各单位满血值；`decide_self_heal` 让血量低于满血一半且背包有 Medicine 的角色优先自愈（优先级高于经济/建造/战斗，白天夜晚均生效）；`decide_buy_medicine` 让角色路过武器商店时机会性补给。
+- 商店升级/维修体系：`maybe_start_shop_item_job`/`decide_shop_item_job` 实现"买道具→走到目标建筑→use"两段式任务，覆盖围墙维修（WallFixer）与武器/围墙/基地升级券，优先级 围墙维修>基地升级>武器升级>围墙升级；工人和开拓者均可执行（`buy`/`use`/`sell` 是全角色动作）；任务队列与建造记忆一起落盘。同时修了一个潜在 bug：贩卖逻辑原先用 `Counter(worker.backpack)` 不加过滤，如果背包里恰好升级券/药品数量最多会被当矿石误卖，现在只统计 `ORE_TYPES` 内的物品。
+- 新增 `tests/test_persistence.py`、`tests/test_response_logging.py`、`tests/test_shop_items.py`，加上既有测试扩充，共 87 项全部通过（`python -m unittest discover -s tests -v`）。人工起服务验证过完整流程（含 `sample_match_state.json`）不产生异常，`state/`、`logs/` 内容符合预期后已清理测试产物。
+- 仍未实现：三类任务系统（唯一有意搁置的部分，答案 schema 未核实）、眩晕法宝/范围炸弹/机器人召唤令、`prompt`/`executeCmd`。均已在 README 标注。用户计划接下来上传到真实判题环境测试，测试后会提供日志用于进一步分析校准。

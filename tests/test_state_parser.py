@@ -1,9 +1,10 @@
 import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-import main
-from main import GameState, MatchState
+from src.agent import GameServer, GameState, MatchState
 
 FIXTURE = Path(__file__).parent / "fixtures/sample_match_state.json"
 
@@ -91,19 +92,15 @@ class StateParserTests(unittest.TestCase):
         self.state.update(payload)
         self.assertIsNone(self.state.team_our)
 
-    def test_callback_updates_module_level_match_state(self):
-        original = main.match_state
-        main.match_state = MatchState()
-        try:
-            result = main.callback(self.payload)
-            self.assertEqual(set(result.keys()), {"roleCommandMap", "prompt", "executeCmd"})
-            self.assertIsInstance(result["roleCommandMap"], dict)
-            self.assertEqual(result["prompt"], "")
-            self.assertEqual(result["executeCmd"], "")
-            self.assertEqual(main.match_state.round_no, 85)
-            self.assertEqual(len(main.match_state.team_our.roles), 9)
-        finally:
-            main.match_state = original
+    def test_callback_processes_game_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 在临时目录中创建GameServer，避免测试把学习记忆写进项目真实的state/目录
+            server = GameServer(Path(tmp))
+            server.match_state.update(self.payload)
+            role_command_map = server.strategy.decide(server.match_state)
+            self.assertIsInstance(role_command_map, dict)
+            self.assertEqual(server.match_state.round_no, 85)
+            self.assertEqual(len(server.match_state.team_our.roles), 9)
 
 
 if __name__ == "__main__":

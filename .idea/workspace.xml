@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ChangeListManager">
+    <option name="CHANGE_LISTS">
+      <ChangeListsImpl>
+        <ChangeListSettings name="Default">
+          <option name="myName" value="Default" />
+          <option name="comment" value="" />
+          <option name="ACTION_PROJECT_WIDE" value="false" />
+        </ChangeListSettings>
+      </ChangeListsImpl>
+    </option>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+</project>

@@ -1,0 +1,7 @@
+# 尚未启用：将下列示例中的账号替换为真实、有写权限的成员后取消注释。
+# 路径匹配时最后一条生效；同一行多个 owner 不表示必须全部批准。
+# * @your-maintainer
+# /main.py @your-runtime-owner
+# /tests/ @your-test-owner
+# /docs/ @your-docs-owner
+# /.github/ @your-maintainer
