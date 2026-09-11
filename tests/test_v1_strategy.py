@@ -168,11 +168,15 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(assign_worker_specialties(state)[10012], "wall")
         self.assertEqual(commands[10010]["action"], "build")
         self.assertIn(commands[10010]["name"], ("gatling", "railgun", "rocket"))
-        self.assertEqual(commands[10012]["action"], "build")
-        self.assertEqual(commands[10012]["name"], "wall")
-        wall_pos = commands[10012]["targetPos"][0]
-        self.assertGreaterEqual(wall_pos["x"], 10)
-        self.assertLessEqual(wall_pos["y"], 24)
+        self.assertIn(commands[10012]["action"], ("build", "move"))
+        if commands[10012]["action"] == "build":
+            self.assertEqual(commands[10012]["name"], "wall")
+            wall_pos = commands[10012]["targetPos"][0]
+            self.assertGreaterEqual(wall_pos["x"], 10)
+        else:
+            pending = state.worker_build_targets[10012]
+            self.assertEqual(pending[2], "wall")
+            self.assertGreaterEqual(pending[0], 10)
 
     def test_wall_worker_keeps_stone_when_adjacent_to_vendor(self):
         state = minimal_state(round_no=5)
@@ -187,24 +191,22 @@ class V1StrategyDayTests(unittest.TestCase):
         if commands[10012]["action"] == "build":
             self.assertEqual(commands[10012]["name"], "wall")
 
-    def test_wall_prefers_upper_left_when_base_is_bottom_right(self):
+    def test_wall_prefers_left_side_when_base_is_bottom_right(self):
         state = minimal_state()
         state.team_our.roles[0].pos = Pos(30, 8)
         blocked = {(30, 8), (31, 8), (30, 9), (31, 9)}
         target = pick_wall_target(state, Pos(30, 8), blocked)
         self.assertIsNotNone(target)
         self.assertLessEqual(target.x, 30)
-        self.assertGreaterEqual(target.y, 8)
         self.assertFalse(is_base_top_left(state, Pos(30, 8)))
 
-    def test_wall_prefers_lower_right_when_base_is_top_left(self):
+    def test_wall_prefers_right_side_when_base_is_top_left(self):
         state = minimal_state()
         state.team_our.roles[0].pos = Pos(10, 24)
         blocked = {(10, 24), (11, 24), (10, 25), (11, 25)}
         target = pick_wall_target(state, Pos(10, 24), blocked)
         self.assertIsNotNone(target)
         self.assertGreaterEqual(target.x, 10)
-        self.assertLessEqual(target.y, 24)
         self.assertTrue(is_base_top_left(state, Pos(10, 24)))
 
     def test_no_actions_at_night_for_economy(self):

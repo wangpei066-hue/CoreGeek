@@ -112,16 +112,17 @@ def is_base_top_left(state: "MatchState", base_pos: Pos) -> bool:
     return base_pos.x < state.map_info.width / 2
 
 
-def _wall_direction_score(dx: int, dy: int, prefer_lower_right: bool) -> int:
-    if prefer_lower_right:
-        return dx - dy
-    return -dx + dy
+def _wall_direction_score(dx: int, dy: int, prefer_right: bool) -> int:
+    """优先朝敌方一侧延伸；同侧内更靠外、更贴近基地高度的格子优先。"""
+    side = dx if prefer_right else -dx
+    return side * 10 - abs(dy)
 
 
-def _in_preferred_wall_quadrant(dx: int, dy: int, prefer_lower_right: bool) -> bool:
-    if prefer_lower_right:
-        return dx >= 0 and dy <= 0
-    return dx <= 0 and dy >= 0
+def _in_preferred_wall_side(dx: int, dy: int, prefer_right: bool) -> bool:
+    """左上基地铺右侧上下，右下基地铺左侧上下。"""
+    if prefer_right:
+        return dx >= 0
+    return dx <= 0
 
 
 def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optional[Pos]:
@@ -139,8 +140,8 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optio
 
 
 def pick_wall_target(state: "MatchState", base_pos: Pos, blocked: set) -> Optional[Pos]:
-    """围墙朝向敌方：左上基地优先右下，右下基地优先左上；先铺近处再往外扩。"""
-    prefer_lower_right = is_base_top_left(state, base_pos)
+    """围墙朝向敌方竖边：左上基地优先右侧上下，右下基地优先左侧上下；先近后远。"""
+    prefer_right = is_base_top_left(state, base_pos)
     width, height = state.map_info.width, state.map_info.height
     preferred = []
     fallback = []
@@ -152,9 +153,9 @@ def pick_wall_target(state: "MatchState", base_pos: Pos, blocked: set) -> Option
         if key in state.failed_build_spots or key in blocked:
             continue
         radius = max(abs(dx), abs(dy))
-        score = _wall_direction_score(dx, dy, prefer_lower_right)
+        score = _wall_direction_score(dx, dy, prefer_right)
         item = (radius, -score, x, y)
-        if _in_preferred_wall_quadrant(dx, dy, prefer_lower_right):
+        if _in_preferred_wall_side(dx, dy, prefer_right):
             preferred.append(item)
         else:
             fallback.append(item)
