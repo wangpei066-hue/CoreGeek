@@ -1,4 +1,4 @@
-"""第一天：三座武器 -> 采石围城 -> 三人分别就位。
+"""第一天：三座武器 -> 迎敌正面与侧翼 -> 三人分别就位。
 
 墙线是候选几何规划，不是官方合法区域；以快照中的建筑判断完成。
 """
@@ -41,14 +41,36 @@ def adjacent_path(role, target, blocked, state):
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
 
 
-def wall_ring(state, base):
+def defense_bounds(state, base):
     # 靠地图边缘时，地图边界充当屏障，墙线收缩到地图内。
     left = max(0, base.pos.x - WALL_MARGIN)
     right = min(state.map_info.width - 1, base.pos.x + 1 + WALL_MARGIN)
     bottom = max(0, base.pos.y - 1 - WALL_MARGIN)
     top = min(state.map_info.height - 1, base.pos.y + WALL_MARGIN)
-    return [(x, y) for x in range(left, right + 1) for y in range(bottom, top + 1)
-            if x in (left, right) or y in (bottom, top)]
+    return left, right, bottom, top
+
+
+def attack_direction(state, base):
+    """用户确认：左上基地受右侧进攻，右下基地受左侧进攻；按实际坐标换边。"""
+    return 1 if base.pos.x + 0.5 < (state.map_info.width - 1) / 2 else -1
+
+
+def wall_priority(state, base, point):
+    left, right, _, _ = defense_bounds(state, base)
+    front = right if attack_direction(state, base) == 1 else left
+    return 0 if point[0] == front else 1
+
+
+def wall_ring(state, base):
+    """迎敌正面 + 前半部上下侧翼，后方开放；名称保留兼容现有调用。"""
+    left, right, bottom, top = defense_bounds(state, base)
+    direction = attack_direction(state, base)
+    front = right if direction == 1 else left
+    center_x = base.pos.x + 0.5
+    cells = {(front, y) for y in range(bottom, top + 1)}
+    cells.update((x, y) for x in range(left, right + 1) for y in (bottom, top)
+                 if (x - center_x) * direction > 0)
+    return sorted(cells, key=lambda p: (wall_priority(state, base, p), p))
 
 
 def assign_weapons(state, excluded_ids=()):
@@ -122,11 +144,12 @@ def plan_opening(state):
     travel = [station_path(r, assignments[r.id], blocked - {(a.pos.x, a.pos.y) for a in fighters}, state)
               for r in fighters if r.id in assignments]
     muster = bool(weapons) and (remaining <= max([len(p) for p in travel if p is not None] + [0]) + MUSTER_BUFFER)
-    phase = '就位' if muster else ('武器' if len(weapons) < 3 else '围墙')
+    phase = '就位' if muster else ('武器' if len(weapons) < 3 else ('围墙' if missing else '升级'))
     trace(state, None, 'opening_phase', '第一天阶段计划', phase=phase, weapons=len(weapons),
           wall_goal=len(ring), walls_completed=len(ring)-len(missing), wall_missing=missing,
-          geometry_note='候选墙线；合法性由实际执行反馈确认', rounds_to_night=remaining)
-    gold, builds = state.team_our.gold_num, 0
+          geometry_note='正面优先、侧翼其次、后方开放；格子合法性由执行反馈确认', rounds_to_night=remaining,
+          attack_from='右侧' if attack_direction(state, base) == 1 else '左侧', direction_source='用户确认的刷新规则')
+    commands, gold, builds = {}, state.team_our.gold_num, 0
     claimed = set()
     # 开拓者先规划撤离，避免继续占住墙线和工人施工邻接格。
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
@@ -136,7 +159,20 @@ def plan_opening(state):
         if heal:
             commands[role.id] = selected(state, role.id, heal, '低血量优先自救')
             continue
-        if muster or not missing:
+        if not missing and not muster and len(weapons) >= 3:
+            from copy import copy
+            from .brain import maybe_start_shop_item_job, decide_shop_item_job
+            budget_state = copy(state)
+            budget_state.team_our = copy(state.team_our)
+            budget_state.team_our.gold_num = gold
+            maybe_start_shop_item_job(role, budget_state)
+            cmd = decide_shop_item_job(role, budget_state, blocked, reserved)
+            if cmd:
+                if cmd['action'] == 'buy':
+                    gold -= item_cost(cmd['name'], state)
+                commands[role.id] = cmd
+                continue
+        if muster or (not missing and len(weapons) >= 3):
             weapon = assignments.get(role.id)
             if weapon:
                 trace(state, role.id, 'weapon_assignment', '夜间一人一炮，提前就位', weapon_id=weapon.id)
@@ -146,8 +182,8 @@ def plan_opening(state):
             continue
         if role.role_type == 'pioneer':
             # 停靠在墙线内部，远离其他角色、武器候选圈与工人的已计划目标。
-            xs, ys = [p[0] for p in ring], [p[1] for p in ring]
-            goals = {(x, y) for x in range(min(xs)+1, max(xs)) for y in range(min(ys)+1, max(ys))
+            left, right, bottom, top = defense_bounds(state, base)
+            goals = {(x, y) for x in range(left+1, right) for y in range(bottom+1, top)
                      if (x, y) not in blocked | reserved or (x, y) == (role.pos.x, role.pos.y)}
             # 优先基地旁、避开正在使用的工人交互位置。
             goals = {p for p in goals if all(chebyshev(Pos(*p), w.pos) > 1 for w in workers)} or goals
@@ -198,7 +234,7 @@ def plan_opening(state):
             if stones == 0:
                 trace(state, role.id, 'wall_no_stone', '没有石头，且没有可执行的采石行动')
                 continue
-        candidates = sorted(candidates, key=lambda p: (chebyshev(role.pos, Pos(*p)), p))
+        candidates = sorted(candidates, key=lambda p: (wall_priority(state, base, p) if kind == 'wall' else 0, chebyshev(role.pos, Pos(*p)), p))
         for point in candidates:
             if point in blocked | reserved | claimed or (*point, kind) in state.failed_build_spots:
                 continue
@@ -209,11 +245,11 @@ def plan_opening(state):
                 continue
             claimed.add(point)
             if path:
-                cmd = move_on_path(state, role, path, reserved, '前往武器施工位' if kind == 'weapon' else '优先补齐同一圈围墙缺口')
+                cmd = move_on_path(state, role, path, reserved, '前往武器施工位' if kind == 'weapon' else '优先补齐迎敌正面，其次侧翼')
             else:
                 name = next((t for t in WEAPON_TYPES if t not in [w.role_type for w in weapons]
                              and t not in [c.get('name') for c in commands.values()]), 'gatling') if kind == 'weapon' else 'wall'
-                cmd = selected(state, role.id, {'action': 'build', 'name': name, 'targetPos': [{'x': point[0], 'y': point[1]}]}, '建造武器' if kind == 'weapon' else '补齐基地围墙环线')
+                cmd = selected(state, role.id, {'action': 'build', 'name': name, 'targetPos': [{'x': point[0], 'y': point[1]}]}, '建造武器' if kind == 'weapon' else '建造迎敌防线')
                 reserved.add(point)
                 if kind == 'weapon':
                     gold -= 25

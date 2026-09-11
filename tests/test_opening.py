@@ -28,11 +28,12 @@ class OpeningTests(unittest.TestCase):
         self.assertNotEqual(commands[1]['targetPos'], commands[2]['targetPos'])
         self.assertEqual(state.team_our.gold_num, 75)
 
-    def test_ring_is_around_entire_2x2_base(self):
+    def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
         ring = wall_ring(state, state.team_our.roles[0])
-        self.assertEqual(len(ring), 20)
-        self.assertIn((8, 7), ring)
+        self.assertEqual(len(ring), 10)
+        self.assertTrue(all(x >= 11 for x, y in ring))
+        self.assertTrue(all(x == 13 for x, y in ring[:6]))
         self.assertIn((13, 12), ring)
 
     def test_failed_weapon_position_is_not_counted_as_completed(self):
@@ -49,6 +50,15 @@ class OpeningTests(unittest.TestCase):
         phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
         self.assertEqual(phase['weapons'], 0)
         self.assertEqual(phase['phase'], '武器')
+
+    def test_right_base_faces_left_after_switching_sides(self):
+        state = opening_state()
+        base = state.team_our.roles[0]
+        base.pos = Pos(30, 8)
+        line = wall_ring(state, base)
+        self.assertEqual(len(line), 10)
+        self.assertTrue(all(x <= 30 for x, y in line))
+        self.assertTrue(all(x == 28 for x, y in line[:6]))
 
     def test_cooldown_does_not_assign_same_weapon_twice(self):
         state = opening_state()

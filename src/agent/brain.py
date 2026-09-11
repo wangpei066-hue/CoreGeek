@@ -101,6 +101,13 @@ def own_station(state: "MatchState"):
 def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: str = "weapon") -> Optional[Pos]:
     """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。"""
     width, height = state.map_info.width, state.map_info.height
+    if kind == "wall":
+        from .opening import wall_ring
+        base = own_station(state)
+        if base is None:
+            return None
+        return next((Pos(x, y) for x, y in wall_ring(state, base)
+                     if (x, y) not in blocked and (x, y, kind) not in state.failed_build_spots), None)
     for dx, dy in _BUILD_RING_OFFSETS:
         x, y = base_pos.x + dx, base_pos.y + dy
         if not (0 <= x < width and 0 <= y < height):
@@ -208,14 +215,6 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
         }
         return
 
-    station = own_station(state)
-    if station and (station.level or 1) < 3 and (station.pos.x, station.pos.y) not in pending_targets:
-        name, cost = voucher_for("station", station.level or 1)
-        if state.team_our.gold_num >= cost:
-            state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
-            return
-        trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
-
     weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets)
     if weapon:
         name, cost = voucher_for("weapon", weapon.level or 1)
@@ -228,6 +227,16 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
         name, cost = voucher_for("wall", wall.level or 1)
         if state.team_our.gold_num >= cost:
             state.worker_item_jobs[role.id] = {"item": name, "target": (wall.pos.x, wall.pos.y), "kind": "wall"}
+            return
+
+    station = own_station(state)
+    if station and (station.level or 1) < 3 and (station.pos.x, station.pos.y) not in pending_targets:
+        name, cost = voucher_for("station", station.level or 1)
+        if state.team_our.gold_num >= cost:
+            state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
+            return
+        trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
+
 
 
 def _job_target_still_exists(state: "MatchState", job: dict) -> bool:
@@ -246,6 +255,16 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         del state.worker_item_jobs[role.id]
         return None
 
+    # 旧存档中尚未购买的基地升级任务，让位于武器/城墙。
+    if job.get("kind") == "station" and job["item"] not in role.backpack:
+        available = _pending_item_job_targets(state) - {tuple(job["target"])}
+        defense = _pick_upgradeable(state, WEAPON_TYPES + ("wall",), available)
+        if defense:
+            del state.worker_item_jobs[role.id]
+            maybe_start_shop_item_job(role, state)
+            job = state.worker_item_jobs.get(role.id)
+            if not job:
+                return None
     width, height = state.map_info.width, state.map_info.height
     item = job["item"]
     x, y = job["target"]
@@ -332,6 +351,11 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
         return None
 
     pending = state.worker_build_targets.get(worker.id)
+    if pending and pending[2] == "wall":
+        from .opening import wall_ring
+        if pending[:2] not in wall_ring(state, base):
+            del state.worker_build_targets[worker.id]
+            pending = None
     if pending:
         x, y, kind = pending
         if ((x, y, kind) in state.failed_build_spots or (x, y) in blocked or (x, y) in reserved

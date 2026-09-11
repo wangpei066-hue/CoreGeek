@@ -58,6 +58,24 @@ class VoucherCostTests(unittest.TestCase):
 
 
 class MaybeStartJobPriorityTests(unittest.TestCase):
+    def test_weapon_then_wall_then_station(self):
+        state = minimal_state(gold_num=1000)
+        weapon = make_role(20, 12, 10, "gatling", health=1000, level=1)
+        wall = make_role(30, 13, 10, "wall", health=1000, level=1)
+        state.team_our.roles += [weapon, wall]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["kind"], "weapon")
+        state.worker_item_jobs.clear()
+        weapon.level = 3
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["kind"], "wall")
+        state.worker_item_jobs.clear()
+        wall.level = 3
+        wall.health = 2000
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["kind"], "station")
+
     def test_damaged_wall_takes_priority_over_everything(self):
         state = minimal_state(gold_num=1000)
         wall = make_role(40000, 11, 10, "wall", health=100, level=1)  # 满血1000，明显受损
