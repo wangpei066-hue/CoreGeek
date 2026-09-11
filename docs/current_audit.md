@@ -62,3 +62,34 @@ results/baseline/python-tests.log 保存完整测试输出与真实 HTTP 服务�
 - 明确未实现：三类任务系统（`acceptTask`/`submitAnswer`/`summonTreasure`）、商店消耗品/升级券购买使用、`prompt`/`executeCmd` 调用、复活/换边状态衔接——均依赖当前仍缺失或未核实的材料（任务答案 schema、可建造区精确坐标等）。
 
 新增 `tests/test_v1_strategy.py`（45 项全部通过，覆盖寻路、昼夜判定、目标优先级、日间/夜间决策、校验器）；`tests/test_state_parser.py` 中依赖旧版"固定空响应"的断言已更新为结构断言。人工用 `sample_match_state.json` 起真实 HTTP 服务验证：请求为夜晚回合（roundNo=85）时返回的 `roleCommandMap` 非空、结构合法。仍未接入官方判题器，V1 决策质量未经真实对局验证。
+<<<<<<< Updated upstream
+=======
+
+## V1 补全：响应日志、run.sh、跨回合持久化、生存兜底（2026-09-11）
+
+- 响应日志：`process_request` 现在同时落盘 `logs/request_NNNNNN.json` 与 `logs/response_NNNNNN.json`（同序号配对），配合新增的 `tools/analyze_build_attempts.py` 离线核对 `build` 指令是否被判题器接受（用下一轮 `lastRoundRoleActionResults` + `teamOur.roles` 结构双重验证）。
+- `run.sh`：按接口文档开头"样例：bash run.sh port"补充，转发给 `python`/`python3`（用实际执行一次空脚本而非仅 `command -v` 判断可用性，避开 Windows python3 商店空壳的坑）。本地 Git Bash 下语法检查、实际拉起服务、响应 200 均验证通过；判题平台是否真的依赖它仍未核实。
+- 跨回合记忆持久化：`load_build_memory`/`save_build_memory` 把建造黑名单、待建造目标、上一次发送的指令落盘到 `state/build_memory.json`，`callback` 请求前读、处理后写；无内容可记时不落盘。`V1Strategy.decide()` 本身保持无 IO，磁盘读写只发生在 `callback()`，便于策略单测继续用内存态 `MatchState` 直接跑。
+- 生存兜底：`max_health()` 按任务书4.5.1/4.5.2 表格给出各单位满血值；`decide_self_heal` 让血量低于满血一半且背包有 Medicine 的角色优先自愈（优先级高于经济/建造/战斗，白天夜晚均生效）；`decide_buy_medicine` 让角色路过武器商店时机会性补给。
+- 商店升级/维修体系：`maybe_start_shop_item_job`/`decide_shop_item_job` 实现"买道具→走到目标建筑→use"两段式任务，覆盖围墙维修（WallFixer）与武器/围墙/基地升级券，优先级 围墙维修>基地升级>武器升级>围墙升级；工人和开拓者均可执行（`buy`/`use`/`sell` 是全角色动作）；任务队列与建造记忆一起落盘。同时修了一个潜在 bug：贩卖逻辑原先用 `Counter(worker.backpack)` 不加过滤，如果背包里恰好升级券/药品数量最多会被当矿石误卖，现在只统计 `ORE_TYPES` 内的物品。
+- 新增 `tests/test_persistence.py`、`tests/test_response_logging.py`、`tests/test_shop_items.py`，加上既有测试扩充，共 87 项全部通过（`python -m unittest discover -s tests -v`）。人工起服务验证过完整流程（含 `sample_match_state.json`）不产生异常，`state/`、`logs/` 内容符合预期后已清理测试产物。
+- 仍未实现：三类任务系统（唯一有意搁置的部分，答案 schema 未核实）、眩晕法宝/范围炸弹/机器人召唤令、`prompt`/`executeCmd`。均已在 README 标注。用户计划接下来上传到真实判题环境测试，测试后会提供日志用于进一步分析校准。
+
+## 自进化任务接取及平台日志回传（2026-09-11）
+
+- 已实现：pioneer 昼夜选择可用自进化任务点、移动至一格范围、发送 `acceptTask`；以系统 `phaseTask` 判断任务执行期间并原地保持，可原地用药。任务结束后重新读取系统冷却和有效状态。
+- 日志：stderr 输出 `PIONEER_TASK` 诊断；任务期间经 `executeCmd` 在判题沙盒输出任务原文分片和角色反馈，由协议规定的下一回合 `lastCmdResult` 回传，不依赖下载本地 logs 文件夹。发出接取请求与实际收到任务原文分别记录。
+- 启动：run.sh 改为仓库实际存在的 main3.py；真实 HTTP 测试改为复制上传所需文件到临时目录后通过 run.sh 启动。
+- 验证：93 项 unittest 全部通过，包含昼夜接取、移动、冷却/失效过滤、死亡过滤、重启后凭 phaseTask 保持、沙盒字符串引用与日志回传链路，以及真实 HTTP 启动。依赖安装在 /tmp/pioneer-test-deps，使用 PYTHONPATH 指定；真实 HTTP 测试需要沙盒外的本地端口权限。
+- 未验证：尚未上传到官方平台、未下载官方日志；docs 未规定下载日志字段，不能把本地链路测试表述为系统下载验证。操作与搜索字段见 README 的“自进化任务与平台下载日志”。
+- 范围：仅接取与观测，不自动求解或 submitAnswer；当前任务会等待平台超时。后续解题需要统一调度 executeCmd，避免与诊断输出竞争。
+
+## 自进化任务自动解题（2026-09-11，接取版本的后续实现）
+
+- 新增 task_solver.py：正则提取任务中的 Markdown 路径，经平台 executeCmd 查找文件、分页读取，通过下一回合 lastCmdResult 关联请求并收集正文，然后构造平台 prompt。
+- 解析下一回合 llmResp 的结构化 JSON。LLM 可请求沙盒命令以调用任务 API/运行 Python，获得真实结果后继续解题；最终将字符串答案写入 pioneer 的 submitAnswer.taskAnswer。非法 LLM 输出或明确的答案错误反馈会触发重新求解。
+- 自进化任务会话原子保存到 state/task_session.json，支持重启和相同回合重试；任务消失、队伍变化或回合倒退重置。协议没有任务唯一ID，连续同文任务仍依赖任务结束的空 phaseTask 快照区分。
+- 系统日志：读取和工具执行输出 PIONEER_TASK JSON，含 requestId 和结果；空闲沙盒回合补充阶段诊断，避免诊断覆盖解题命令。stderr 同时记录 llmResp。平台下载可见性仍未实测。
+- 限制：文件搜索7秒，工具执行10秒；文档每页6000字符、每文档自动读取最多60000字符；工具结果最多6000字符；每任务最多12次LLM调用。超限/找不到/歧义/截断信息反馈给LLM。未知工具反馈不自动重放命令。
+- 验证：完整105项 unittest通过（含真实HTTP启动）；新增12项测试覆盖读文档→平台LLM→执行工具→平台LLM→提交、分页、路径查找与歧义、安全引用、错误答案、重启、重复回合及旧任务结果隔离。测试使用模拟LLM回复和实际本机执行生成的沙盒命令，未调用官方LLM或上传平台。
+>>>>>>> Stashed changes

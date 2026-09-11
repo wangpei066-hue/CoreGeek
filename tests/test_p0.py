@@ -81,6 +81,7 @@ class P0Tests(unittest.TestCase):
                 interface()
 
     def test_real_http_process(self):
+<<<<<<< Updated upstream
         # A private copy keeps actual socket-test logs away from any existing service.
         shutil.copyfile(main.__file__, self.root / "main.py")
         with socket.socket() as probe:
@@ -88,6 +89,23 @@ class P0Tests(unittest.TestCase):
             port = probe.getsockname()[1]
         process = subprocess.Popen([sys.executable, str(self.root / "main.py"), str(port)],
                                    cwd=self.root.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+=======
+        # 按上传目录布局验证真实入口，日志写入临时目录。
+        project = Path(__file__).parent.parent
+        shutil.copy2(project / "main3.py", self.root / "main3.py")
+        shutil.copy2(project / "run.sh", self.root / "run.sh")
+        shutil.copytree(project / "src", self.root / "src")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        # Start the service via the main module
+        process = subprocess.Popen(
+            ["bash", "run.sh", str(port)],
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT
+        )
+>>>>>>> Stashed changes
         try:
             for _ in range(100):
                 self.assertIsNone(process.poll(), "service exited during startup")

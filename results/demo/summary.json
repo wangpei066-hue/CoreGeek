@@ -1,0 +1,131 @@
+{
+  "optimized": {
+    "seed": 7,
+    "rounds": 1300,
+    "gold": 1978,
+    "revenue": 2003,
+    "spent": 100,
+    "inventoryValue": 0,
+    "baseHP": 1500,
+    "kills": 85,
+    "score": 705,
+    "failedActions": 0,
+    "nights": [
+      {
+        "day": 1,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 2,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 3,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 4,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 5,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 6,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 7,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 8,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 9,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 10,
+        "ready": 3,
+        "baseHP": 1500
+      }
+    ]
+  },
+  "nearest": {
+    "seed": 7,
+    "rounds": 1300,
+    "gold": 1709,
+    "revenue": 1734,
+    "spent": 100,
+    "inventoryValue": 80,
+    "baseHP": 1500,
+    "kills": 85,
+    "score": 705,
+    "failedActions": 0,
+    "nights": [
+      {
+        "day": 1,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 2,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 3,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 4,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 5,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 6,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 7,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 8,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 9,
+        "ready": 3,
+        "baseHP": 1500
+      },
+      {
+        "day": 10,
+        "ready": 3,
+        "baseHP": 1500
+      }
+    ]
+  },
+  "revenueGain": 269
+}
