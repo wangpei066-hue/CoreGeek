@@ -26,9 +26,9 @@ class PioneerTaskTests(unittest.TestCase):
         state.update(data)
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_accept_day_and_night(self):
-        for round_no in (10, 80):
-            self.assertEqual(self.decide(self.payload(round_no))[10011], {'action': 'acceptTask'})
+    def test_accept_only_during_day(self):
+        self.assertEqual(self.decide(self.payload(10))[10011], {'action': 'acceptTask'})
+        self.assertNotEqual(self.decide(self.payload(80)).get(10011, {}).get('action'), 'acceptTask')
 
     def test_moves_to_task(self):
         data = self.payload()

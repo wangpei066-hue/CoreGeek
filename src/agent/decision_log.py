@@ -2,6 +2,7 @@
 from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
 import sys
 
@@ -77,8 +78,15 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
             old, new = previous_snapshot["roles"].get(key), before["roles"].get(key)
             if old != new:
                 changes.append({"role_id": key, "before": old, "after": new})
+    from .diagnostics import diagnostics
+    try:
+        metrics = diagnostics(state, commands, previous_snapshot, comparable, previous_commands)
+    except Exception as exc:
+        metrics = {'alerts': [{'code': 'DIAGNOSTICS_ERROR', 'message': str(exc)}]}
     return {
-        "schema_version": 1, "sequence": sequence, "round": state.round_no,
+        "schema_version": 2, "sequence": sequence, "round": state.round_no,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "diagnostics": metrics,
         "phase": phase, "phase_basis": "策略按roundNo从0起算；官方起点尚待核验",
         "decision_ms": round(elapsed_ms, 3),
         "summary": {"gold": before["gold"], "weapons": sum(counts[t] for t in ("gatling", "railgun", "rocket")),
@@ -100,6 +108,12 @@ def render_text(report):
         if event["role_id"] is None:
             lines.append(event["message"] + " " + json.dumps(
                 {k: v for k, v in event.items() if k not in ("role_id", "code", "message")}, ensure_ascii=False))
+    diagnostic = report.get('diagnostics', {})
+    for alert in diagnostic.get('alerts', []):
+        lines.append('【重点】' + json.dumps(alert, ensure_ascii=False))
+    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons'):
+        if key in diagnostic:
+            lines.append(f'{key}: ' + json.dumps(diagnostic[key], ensure_ascii=False))
     for base in summary["bases"]:
         lines.append(f"基地 {base['id']}：血量 {base['health']}，等级 {base['level']}")
     for role in report["roles"]:
@@ -155,5 +169,8 @@ def emit_console_report(report):
         "systemErrors": report["system_errors"],
         "observedChanges": report["observed_changes"],
         "decisionMs": report["decision_ms"],
+        "schemaVersion": report['schema_version'],
+        "timestampUtc": report['timestamp_utc'],
+        "diagnostics": report.get('diagnostics', {}),
     }
     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)

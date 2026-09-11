@@ -5,31 +5,48 @@ from .protocol import Pos, Role
 from .grid import chebyshev
 from .decision_log import trace, selected
 
-SELL_VALUE = 25
-SELL_COUNT = 12
-SELL_FILL_RATIO = 0.35
+SELL_VALUE = 10
+SELL_COUNT = 6
+SELL_FILL_RATIO = 0.20
 BUILD_STONE_RESERVE = 4
+
+
+def defense_due(role, state, blocked):
+    """夜间、白天第50回合或返程余量不足时，防守覆盖任务与经济。"""
+    from .opening import assign_weapons, station_path
+    from .tactics import pressure
+    cycle = (state.round_no or 0) % 130
+    if cycle >= 50 or pressure(state):
+        return True
+    weapon = assign_weapons(state).get(role.id)
+    if weapon is None:
+        return False
+    path = station_path(role, weapon, blocked, state)
+    return path is not None and len(path) + 8 >= 70 - cycle
 
 
 def muster_for_night(role, state, blocked, reserved):
     """所有白天都按实际返程距离提前回防，而非仅首日集合。"""
     from .opening import assign_weapons, station_path, move_on_path
     cycle = (state.round_no or 0) % 130
-    if not 40 <= cycle < 70:
+    from .tactics import pressure
+    if (state.round_no or 0) < 70 and role.role_type == 'worker' and not pressure(state):
+        return False, None  # 首日由施工计划按实际武器返程时间集合。
+    if not defense_due(role, state, blocked):
         return False, None
-    excluded = [r.id for r in state.team_our.roles if r.role_type == 'pioneer'
-                and (state.phase_task or any(t.is_valid and t.cold_down_rounds == 0
-                    and t.task_type in ('自进化类1', '自进化类2') for t in state.team_our.player_tasks))]
-    weapon = assign_weapons(state, excluded).get(role.id)
+    weapon = assign_weapons(state).get(role.id)
     if weapon is None:
-        return False, None
+        from .brain import own_station
+        from .opening import adjacent_path
+        base = own_station(state)
+        path = adjacent_path(role, base.pos, blocked | reserved, state) if base else None
+        trace(state, role.id, 'no_free_weapon', '进入回防时段但缺少独立武器，先返回基地')
+        return True, move_on_path(state, role, path, reserved, '没有武器也不留在外面，返回基地')
     path = station_path(role, weapon, blocked | reserved, state)
     # 临时受阻时仍停止向外采矿，下一回合重新寻路。
-    if path is None or 70 - cycle <= len(path) + 5:
-        trace(state, role.id, 'income_muster', '经济行动截止，提前回到分配武器等待夜战', weapon_id=weapon.id,
-              remaining_day_rounds=70-cycle, return_steps=None if path is None else len(path))
-        return True, move_on_path(state, role, path, reserved, '停止采矿和购物，提前回防')
-    return False, None
+    trace(state, role.id, 'income_muster', '经济行动截止，提前回到分配武器等待夜战', weapon_id=weapon.id,
+          remaining_day_rounds=70-cycle, return_steps=None if path is None else len(path))
+    return True, move_on_path(state, role, path, reserved, '停止采矿和购物，提前回防')
 
 
 def ore_prices(state):
@@ -39,15 +56,18 @@ def ore_prices(state):
 
 def sellable_ores(role, state):
     from .brain import own_station
-    from .opening import wall_ring
+    from .opening import active_wall_plan
     ores = Counter(i for i in role.backpack if i in ('stone', 'iron', 'copper'))
     base = own_station(state)
     reserve = 0
     if base and role.role_type == 'worker':
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
-        missing = len(set(wall_ring(state, base)) - walls)
+        missing = len(set(active_wall_plan(state, base)) - walls)
         workers = max(1, sum(r.role_type == 'worker' and r.health > 0 for r in state.team_our.roles))
         reserve = min(BUILD_STONE_RESERVE, (missing + workers - 1) // workers)
+        from .brain import max_health
+        if base.health < max_health(base) * 0.7:
+            reserve = min(reserve, 1)
     ores['stone'] = max(0, ores['stone'] - reserve)
     return +ores
 
@@ -69,15 +89,21 @@ def liquidate(role, state, blocked, reserved):
     adjacent = any(chebyshev(role.pos, z.pos) <= 1 for z in vendors)
     triggers = []
     if value >= SELL_VALUE:
-        triggers.append('可出售矿石估值达到25金币')
+        triggers.append('可出售矿石估值达到10金币')
     if sum(ores.values()) >= SELL_COUNT:
-        triggers.append('可出售矿石达到12个')
+        triggers.append('可出售矿石达到6个')
     if role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * SELL_FILL_RATIO:
-        triggers.append('背包达到35%')
+        triggers.append('背包达到20%')
     if role.health < max_health(role) * 0.6:
         triggers.append('低血量携矿风险')
     if 40 <= cycle_round < 70:
         triggers.append('天黑前提前变现')
+    if 20 <= cycle_round < 50:
+        triggers.append('白天中段提前清仓，为防守消费留时间')
+    from .brain import own_station
+    base = own_station(state)
+    if base and base.health < max_health(base) * 0.8:
+        triggers.append('基地受损，提前变现用于防守')
     if not (triggers or adjacent or role.id in committed):
         return False, None
     choices = []

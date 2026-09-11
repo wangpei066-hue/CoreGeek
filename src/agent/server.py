@@ -157,8 +157,11 @@ class GameServer:
                     "未知" if self.match_state.round_no is None else (
                         "白天" if is_day_round(self.match_state.round_no) else "夜晚"),
                 )
-                write_report(self.log_dir, report)
-                emit_console_report(report)
+                for sink in (lambda: write_report(self.log_dir, report), lambda: emit_console_report(report)):
+                    try:
+                        sink()
+                    except Exception:
+                        self.app.logger.exception('decision log output failed (other output unaffected)')
             except Exception:
                 self.app.logger.exception("decision logging failed (response unaffected)")
             self.previous_snapshot = before

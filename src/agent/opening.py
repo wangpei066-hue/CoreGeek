@@ -95,10 +95,32 @@ def wall_ring(state, base):
     return sorted(cells, key=lambda p: (wall_priority(state, base, p), p))
 
 
+def primary_wall_plan(state, base):
+    gap = funnel_gap(state, base)
+    return [p for p in wall_ring(state, base) if gap is None or p[0] != gap[0]]
+
+
+def outer_wall_ready(state):
+    """二层准入：一层完整、至少二级且血量80%；三座武器至少二级。"""
+    from .brain import own_station, max_health
+    base = own_station(state)
+    if base is None:
+        return False
+    walls = {(r.pos.x, r.pos.y): r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    weapons = [r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0]
+    return (len(weapons) >= 3 and all((r.level or 1) >= 2 for r in weapons)
+            and all(p in walls and (walls[p].level or 1) >= 2 and walls[p].health >= max_health(walls[p])*0.8
+                    for p in primary_wall_plan(state, base)))
+
+
+def active_wall_plan(state, base):
+    return wall_ring(state, base) if outer_wall_ready(state) else primary_wall_plan(state, base)
+
+
 def assign_weapons(state, excluded_ids=()):
     """至多三座武器，枚举一对一分配，优先可达并最小化总路程。"""
-    fighters = sorted((r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.id not in excluded_ids), key=lambda r: r.id)
-    weapons = sorted((r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')), key=lambda r: r.id)
+    fighters = sorted((r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id not in excluded_ids), key=lambda r: r.id)
+    weapons = sorted((r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0), key=lambda r: r.id)
     if not fighters or not weapons:
         return {}
     blocked = (build_blocked_set(state) - {(r.pos.x, r.pos.y) for r in fighters}) | movement_avoid(state)
@@ -139,6 +161,42 @@ def station_path(role, weapon, blocked, state):
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
 
 
+def weapon_candidates(state, base, name):
+    """按一级射程10/6/3分层选址，长程靠迎敌侧，全部置于内墙后。"""
+    left, right, bottom, top = defense_bounds(state, base)
+    direction = attack_direction(state, base)
+    front = right if direction == 1 else left
+    depth = {'rocket': 1, 'railgun': 2, 'gatling': 3}[name]
+    ideal_x = front - direction * depth
+    return sorted(((x, y) for x in range(left+1, right) for y in range(bottom+1, top)),
+                  key=lambda p: (abs(p[0]-ideal_x), abs(p[1]-base.pos.y), p))
+
+
+def replenish_walls(role, state, blocked, reserved, primary_only=False):
+    """缺墙就是持续施工任务，缺石主动找石矿，不转去采铜铁。"""
+    from .brain import own_station, try_build
+    base = own_station(state)
+    if base is None:
+        return False, None
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    missing = set(primary_wall_plan(state, base) if primary_only else active_wall_plan(state, base)) - existing
+    if not missing:
+        return False, None
+    trace(state, role.id, 'persistent_wall_plan', '按阶段补墙，缺石就采石', missing=sorted(missing), outer_unlocked=outer_wall_ready(state))
+    if 'stone' in role.backpack:
+        return True, try_build(role, state, blocked, reserved)
+    paths = [adjacent_path(role, z.pos, blocked | reserved, state) for z in state.map_info.zones if z.neutral_type == 'stone']
+    mines = [z for z in state.map_info.zones if z.neutral_type == 'stone']
+    choices = [(p, z) for p, z in zip(paths, mines) if p is not None]
+    if choices and len(role.backpack) < role.back_pack_capability:
+        path, mine = min(choices, key=lambda pair: len(pair[0]))
+        if path:
+            return True, move_on_path(state, role, path, reserved, '双层墙尚未完成，专程采石')
+        return True, selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, '采集下一段城墙所需石料')
+    trace(state, role.id, 'wall_material_blocked', '缺墙但石矿不可达或背包已满', backpack_count=len(role.backpack))
+    return False, None
+
+
 def safe_wall(state, point, blocked, assignments):
     # 不把任何操控者封在无法返回其武器的位置；忽略可移动队友的临时占位。
     actors = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')]
@@ -166,7 +224,7 @@ def plan_opening(state):
     fighters = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')]
     workers = sorted((r for r in fighters if r.role_type == 'worker'), key=lambda r: r.id)
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES]
-    ring = wall_ring(state, base)
+    ring = active_wall_plan(state, base)
     existing_walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
     missing = [p for p in ring if p not in existing_walls]
     blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
@@ -182,7 +240,8 @@ def plan_opening(state):
           geometry_note='正面优先、侧翼其次、后方开放；格子合法性由执行反馈确认', rounds_to_night=remaining,
           attack_from='右侧' if attack_direction(state, base) == 1 else '左侧', direction_source='用户确认的刷新规则')
     trace(state, None, 'funnel_layout', '实验性双层防线；外层留口，己方从后方通行',
-          gap=funnel_gap(state, base), layers=2 if funnel_gap(state, base) else 1,
+          gap=funnel_gap(state, base), layers=2 if outer_wall_ready(state) and funnel_gap(state, base) else 1,
+          outer_unlocked=outer_wall_ready(state),
           effect_note='机器人可能直接攻击墙，分流效果需回放验证')
     gold, builds = state.team_our.gold_num, 0  # 保留plan_pioneer_tasks已经生成的指令。
     claimed = set()
@@ -190,9 +249,11 @@ def plan_opening(state):
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
         if role.id in task_pioneers:
             continue
-        heal = decide_self_heal(role)
-        if heal:
-            commands[role.id] = selected(state, role.id, heal, '低血量优先自救')
+        from .economy import muster_for_night
+        handled, cmd = muster_for_night(role, state, blocked, reserved)
+        if handled:
+            if cmd:
+                commands[role.id] = cmd
             continue
         from copy import copy
         budget_state = copy(state)
@@ -237,9 +298,9 @@ def plan_opening(state):
                 trace(state, role.id, 'opening_no_gold', '武器资金不足；首日不切换到卖矿流程，等待资金或第二天变现')
                 continue
             # 三种武器置于墙线内侧；不在未来墙位上试建。
-            candidates = [(x, y) for x in range(base.pos.x-1, base.pos.x+3)
-                          for y in range(base.pos.y-2, base.pos.y+2)
-                          if 0 <= x < state.map_info.width and 0 <= y < state.map_info.height]
+            weapon_name = next((t for t in WEAPON_TYPES if t not in [w.role_type for w in weapons]
+                               and t not in [c.get('name') for c in commands.values()]), 'gatling')
+            candidates = weapon_candidates(state, base, weapon_name)
             kind = 'weapon'
         elif not missing and len(weapons) < 3:
             trace(state, role.id, 'await_weapons', '等待本回合武器建造结果，不提前转入围墙')
@@ -264,7 +325,8 @@ def plan_opening(state):
             if stones == 0:
                 trace(state, role.id, 'wall_no_stone', '没有石头，且没有可执行的采石行动')
                 continue
-        candidates = sorted(candidates, key=lambda p: (wall_priority(state, base, p) if kind == 'wall' else 0, chebyshev(role.pos, Pos(*p)), p))
+        if kind == 'wall':
+            candidates = sorted(candidates, key=lambda p: (wall_priority(state, base, p), chebyshev(role.pos, Pos(*p)), p))
         for point in candidates:
             if point in blocked | reserved | claimed or (*point, kind) in state.failed_build_spots:
                 continue
@@ -297,4 +359,9 @@ def plan_opening(state):
                 cmd = move_on_path(state, role, path, reserved, '先返回墙内，准备从内侧封闭最后缺口')
                 if cmd:
                     commands[role.id] = cmd
+    for role in fighters:
+        if role.id not in commands:
+            heal = decide_self_heal(role)
+            if heal:
+                commands[role.id] = selected(state, role.id, heal, '没有更高优先级行动，最后执行自救')
     return commands

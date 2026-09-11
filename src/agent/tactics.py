@@ -18,6 +18,22 @@ def begin_round(state):
         state.policy_memory['summon_attempts'] = []
     state.tactical_purchases = set()
     state.bombed_robots = set()
+    from .brain import own_station
+    from .opening import primary_wall_plan, wall_priority
+    base = own_station(state)
+    if base:
+        front = {p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) == 0}
+        standing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+        known = {tuple(p) for p in state.policy_memory.get('front_wall_seen', [])} | (standing & front)
+        state.policy_memory['front_wall_seen'] = [list(p) for p in sorted(known & front)]
+        state.policy_memory['front_wall_breaches'] = [list(p) for p in sorted((known & front) - standing)]
+
+
+def front_breached(state):
+    from .brain import own_station
+    base = own_station(state)
+    return bool(base and state.policy_memory.get('front_wall_breaches')
+                and any(chebyshev(base.pos, r.pos) <= 7 for r in threat_robots(state)))
 
 
 def threat_robots(state):
@@ -30,7 +46,7 @@ def pressure(state):
     base = own_station(state)
     robots = threat_robots(state)
     nearby = [r for r in robots if base and chebyshev(base.pos, r.pos) <= 7]
-    return bool(base and (len(nearby) >= 4 or (nearby and base.health < max_health(base) * 0.6)))
+    return bool(base and (front_breached(state) or len(nearby) >= 4 or (nearby and base.health < max_health(base) * 0.6)))
 
 
 def bomb_target(state):
@@ -45,7 +61,7 @@ def bomb_target(state):
         kills = sum(r.health <= 100 for r in hits)
         if best is None or (kills, damage) > best[:2]:
             best = (kills, damage, Pos(x, y), hits)
-    return best if best and (best[0] >= 2 or best[1] >= 200) else None
+    return best if best and (best[0] >= 2 or best[1] >= 200 or (front_breached(state) and best[3])) else None
 
 
 def tactical_action(role, state, blocked, reserved, allow_travel=True):
@@ -54,12 +70,22 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     if role.health <= 0:
         return None
     urgent = pressure(state)
+    breached = front_breached(state)
+    if breached:
+        trace(state, role.id, 'front_breached', '正面已建城墙被攻破且敌人逼近，立即使用或购买防御道具', gaps=state.policy_memory['front_wall_breaches'])
     target = bomb_target(state)
     if 'Bomb' in role.backpack and urgent and target:
         _, damage, point, hits = target
         state.bombed_robots.update(r.id for r in hits)
         trace(state, role.id, 'emergency_bomb', '高防守压力下使用3×3炸弹，不把范围炸弹当作全图清除', expected_damage=damage, targets=[r.id for r in hits])
         return selected(state, role.id, {'action': 'use', 'name': 'Bomb', 'targetPos': [{'x': point.x, 'y': point.y}]}, '对密集机器人使用范围炸弹')
+    if breached and 'WallFixer' in role.backpack:
+        damaged = [r for r in state.team_our.roles if r.role_type == 'wall' and 0 < r.health < max_health(r)*0.8
+                   and chebyshev(role.pos, r.pos) <= 1 and ('repair', r.id) not in state.tactical_purchases]
+        if damaged:
+            wall = min(damaged, key=lambda r: r.health/max_health(r))
+            state.tactical_purchases.add(('repair', wall.id))
+            return selected(state, role.id, {'action': 'use', 'name': 'WallFixer', 'targetPos': [{'x': wall.pos.x, 'y': wall.pos.y}]}, '正面破口告急，修复附近仍存活的城墙')
     attempts = state.policy_memory.setdefault('summon_attempts', [])
     cycle_round = (state.round_no or 0) % 130
     owned_order = next((name for name in reversed(tuple(ITEM_COSTS)) if name.endswith('SummonOrder') and name in role.backpack), None)
@@ -80,7 +106,7 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
           and len(weapons) >= 3 and sum(r.role_type == 'wall' for r in state.team_our.roles) >= 6
           and not urgent and role.id not in state.worker_item_jobs
           and not any(i.endswith('SummonOrder') for i in all_backpacks)
-          and not any(i.endswith('SummonOrder') for i in state.tactical_purchases)
+          and not any(isinstance(i, str) and i.endswith('SummonOrder') for i in state.tactical_purchases)
           and len(attempts) < DAILY_SUMMON_LIMIT):
         # 每次干扰最多花剩余金币25%，并给防守留下至少100金币。
         cap = min(state.team_our.gold_num // 4, state.team_our.gold_num-reserve)

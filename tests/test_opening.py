@@ -2,7 +2,7 @@
 import unittest
 
 from src.agent.brain import V1Strategy, BasicActionValidator
-from src.agent.opening import wall_ring, assign_weapons, safe_wall
+from src.agent.opening import wall_ring, primary_wall_plan, assign_weapons, safe_wall
 from src.agent.grid import build_blocked_set
 from src.agent.protocol import Pos, Zone, RobotRole
 from test_shop_items import minimal_state, make_role
@@ -117,7 +117,7 @@ class OpeningTests(unittest.TestCase):
                     else:
                         self.assertTrue(wall_built)
                         self.assertEqual({(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'},
-                                         set(wall_ring(state, state.team_our.roles[0])))
+                                         set(primary_wall_plan(state, state.team_our.roles[0])))
                         state.team_our.gold_num -= 25
                     pos = cmd['targetPos'][0]
                     state.team_our.roles.append(make_role(100+len(state.team_our.roles), pos['x'], pos['y'], cmd['name'], level=1, attack_range=10))
@@ -130,4 +130,4 @@ class OpeningTests(unittest.TestCase):
                 weapon = assignments[role.id]
                 self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 1)
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
-        self.assertEqual(walls, set(wall_ring(state, state.team_our.roles[0])))
+        self.assertEqual(walls, set(primary_wall_plan(state, state.team_our.roles[0])))

@@ -71,10 +71,42 @@ class DecisionLoggingTests(unittest.TestCase):
         self.assertTrue(all('未提供' in f['message'] for f in feedback))
 
     def test_logging_failure_does_not_fail_response(self):
-        with patch('src.agent.server.write_report', side_effect=OSError('disk unavailable')):
+        with patch('src.agent.server.write_report', side_effect=OSError('disk unavailable')), patch('src.agent.server.emit_console_report') as console:
             with self.assertLogs(self.server.app.logger, level='ERROR'):
                 response = self.client.post('/', json={})
         self.assertEqual(response.status_code, 200)
+        console.assert_called_once()
+
+    def test_diagnostics_expose_defense_and_economy_without_mutating_state(self):
+        from copy import deepcopy
+        from test_defense_priority import defended
+        state = defended()
+        state.round_no = 200
+        state.team_our.roles[1].backpack = ['copper'] * 8
+        previous = snapshot(state)
+        previous['round'] = 199
+        previous['gold'] = 25
+        memory = deepcopy(state.policy_memory)
+        commands = {1: {'action': 'move', 'targetPos': [{'x': 8, 'y': 9}]}}
+        report = build_report(state, {}, commands, snapshot(state), previous, 1, 0, '夜晚')
+        diag = report['diagnostics']
+        self.assertEqual(diag['gold_delta'], 50)
+        self.assertEqual(diag['primary']['planned'], 10)
+        self.assertEqual(diag['outer']['planned'], 5)
+        self.assertEqual(len(diag['weapons']), 3)
+        self.assertTrue(any(a['code'] == 'MOVE_NO_PROGRESS' for a in diag['alerts']))
+        self.assertTrue(any(a['code'] == 'NIGHT_UNSTATIONED' for a in diag['alerts']))
+        self.assertEqual(state.policy_memory, memory)
+
+    def test_diagnostics_do_not_compare_unrelated_matches(self):
+        from test_defense_priority import defended
+        state = defended()
+        previous = snapshot(state)
+        previous['context'] = {'different': 'match'}
+        previous['gold'] = 9999
+        report = build_report(state, {}, {}, snapshot(state), previous, 1, 0, '白天')
+        self.assertIsNone(report['diagnostics']['gold_delta'])
+        self.assertIsNotNone(report['diagnostics']['initial_context'])
 
     def test_invalid_json_does_not_generate_decision(self):
         self.assertEqual(self.client.post('/', data='{broken', content_type='application/json').status_code, 400)

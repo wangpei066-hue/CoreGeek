@@ -76,6 +76,7 @@ class EconomyTests(unittest.TestCase):
 
     def test_keeps_only_small_stone_reserve_and_never_sells_items(self):
         state, role = economy_state()
+        state.team_our.roles[0].health = 1500
         role.backpack = ['stone']*20 + ['Medicine', 'Bomb', 'WeaponUpgradeVoucher1']
         self.assertEqual(sellable_ores(role, state), {'stone': 16})
 
