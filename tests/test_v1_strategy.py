@@ -17,11 +17,14 @@ from src.agent.grid import build_blocked_set, chebyshev, move_towards
 from src.agent.brain import (
     V1Strategy,
     BasicActionValidator,
+    assign_worker_specialties,
     decide_buy_medicine,
     decide_self_heal,
+    is_base_top_left,
     is_day_round,
     max_health,
     pick_attack_target,
+    pick_wall_target,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures/sample_match_state.json"
@@ -152,6 +155,57 @@ class V1StrategyDayTests(unittest.TestCase):
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
         self.assertEqual(commands[10010], {"action": "sell", "name": "stone", "num": 2})
+
+    def test_two_workers_split_weapon_and_wall_jobs(self):
+        state = minimal_state(round_no=5)
+        state.team_our.gold_num = 25
+        state.team_our.roles[0].pos = Pos(10, 24)
+        weapon_worker = make_role(10010, 8, 23, "worker", backpack=[], back_pack_capability=100)
+        wall_worker = make_role(10012, 12, 21, "worker", backpack=["stone"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], weapon_worker, wall_worker]
+        commands = self.strategy.decide(state)
+        self.assertEqual(assign_worker_specialties(state)[10010], "weapon")
+        self.assertEqual(assign_worker_specialties(state)[10012], "wall")
+        self.assertEqual(commands[10010]["action"], "build")
+        self.assertIn(commands[10010]["name"], ("gatling", "railgun", "rocket"))
+        self.assertEqual(commands[10012]["action"], "build")
+        self.assertEqual(commands[10012]["name"], "wall")
+        wall_pos = commands[10012]["targetPos"][0]
+        self.assertGreaterEqual(wall_pos["x"], 10)
+        self.assertLessEqual(wall_pos["y"], 24)
+
+    def test_wall_worker_keeps_stone_when_adjacent_to_vendor(self):
+        state = minimal_state(round_no=5)
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
+        state.team_our.roles[0].pos = Pos(10, 10)
+        weapon_worker = make_role(10010, 0, 0, "worker", backpack=[], back_pack_capability=100)
+        wall_worker = make_role(10012, 10, 10, "worker", backpack=["stone"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], weapon_worker, wall_worker]
+        commands = self.strategy.decide(state)
+        self.assertNotEqual((commands.get(10012) or {}).get("action"), "sell")
+        self.assertIn(commands[10012]["action"], ("build", "move"))
+        if commands[10012]["action"] == "build":
+            self.assertEqual(commands[10012]["name"], "wall")
+
+    def test_wall_prefers_upper_left_when_base_is_bottom_right(self):
+        state = minimal_state()
+        state.team_our.roles[0].pos = Pos(30, 8)
+        blocked = {(30, 8), (31, 8), (30, 9), (31, 9)}
+        target = pick_wall_target(state, Pos(30, 8), blocked)
+        self.assertIsNotNone(target)
+        self.assertLessEqual(target.x, 30)
+        self.assertGreaterEqual(target.y, 8)
+        self.assertFalse(is_base_top_left(state, Pos(30, 8)))
+
+    def test_wall_prefers_lower_right_when_base_is_top_left(self):
+        state = minimal_state()
+        state.team_our.roles[0].pos = Pos(10, 24)
+        blocked = {(10, 24), (11, 24), (10, 25), (11, 25)}
+        target = pick_wall_target(state, Pos(10, 24), blocked)
+        self.assertIsNotNone(target)
+        self.assertGreaterEqual(target.x, 10)
+        self.assertLessEqual(target.y, 24)
+        self.assertTrue(is_base_top_left(state, Pos(10, 24)))
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night

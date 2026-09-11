@@ -215,7 +215,12 @@ class MultiRoundRepairIntegrationTest(unittest.TestCase):
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
         wall = make_role(40000, 30, 30, "wall", health=100, level=1)  # 远离商店，逼出多回合移动
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
-        state.team_our.roles += [wall, worker]
+        weapons = [
+            make_role(10020, 8, 10, "gatling", level=1),
+            make_role(10030, 9, 10, "railgun", level=1),
+            make_role(10040, 8, 11, "rocket", level=1),
+        ]
+        state.team_our.roles += [wall, worker, *weapons]
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()
