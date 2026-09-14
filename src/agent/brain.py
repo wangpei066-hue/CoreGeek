@@ -465,13 +465,23 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             pending = None
     if pending:
         x, y, kind = pending
-        if ((x, y, kind) in state.failed_build_spots or (x, y) in blocked or (x, y) in reserved
+        if ((x, y, kind) in state.failed_build_spots
+                or ((x, y) in blocked and (x, y) != (worker.pos.x, worker.pos.y))
+                or (x, y) in reserved
                 or (kind == "weapon" and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles)
                     + getattr(state, "planned_weapons", 0) >= MAX_WEAPONS)):
             del state.worker_build_targets[worker.id]
         else:
             target = Pos(x, y)
-            if chebyshev(worker.pos, target) <= 1:
+            dist = chebyshev(worker.pos, target)
+            if dist == 0:
+                from .grid import neighbors8
+                for step in neighbors8(worker.pos, state.map_info.width, state.map_info.height):
+                    if (step.x, step.y) not in blocked | reserved:
+                        reserved.add((step.x, step.y))
+                        return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '先离开施工格再建造')
+                return None
+            if dist == 1:
                 del state.worker_build_targets[worker.id]
                 if kind == "weapon":
                     if state.team_our.gold_num < WEAPON_GOLD_COST:
@@ -487,6 +497,10 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                     name = "wall"
                 reserved.add((x, y))
                 return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+            if kind == "wall":
+                from .opening import wall_approach_path, move_on_path
+                path = wall_approach_path(worker, target, blocked | reserved, state)
+                return move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
             step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
             if step:
                 reserved.add((step.x, step.y))
@@ -505,12 +519,25 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
         return None
 
     pending_spots = {(x, y) for x, y, _ in state.worker_build_targets.values()}
-    target = pick_build_target(state, base.pos, blocked | reserved | pending_spots, kind)
+    own = {(worker.pos.x, worker.pos.y)}
+    target = pick_build_target(state, base.pos, (blocked | reserved | pending_spots) - own, kind)
     if target is None:
         trace(state, worker.id, "no_build_candidate", "搜索范围内无可用建造候选格（占用、越界或失败冷却）", kind=kind)
         return None
     state.worker_build_targets[worker.id] = (target.x, target.y, kind)
     reserved.add((target.x, target.y))
+    if kind == "wall":
+        from .opening import wall_approach_path, move_on_path
+        if chebyshev(worker.pos, target) == 1:
+            del state.worker_build_targets[worker.id]
+            if "stone" not in worker.backpack:
+                return None
+            from .opening import safe_wall, assign_weapons
+            if not safe_wall(state, (target.x, target.y), blocked | reserved, assign_weapons(state)):
+                return None
+            return selected(state, worker.id, {"action": "build", "name": "wall", "targetPos": [{"x": target.x, "y": target.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+        path = wall_approach_path(worker, target, blocked | reserved, state)
+        return move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
     step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
     if step:
         reserved.add((step.x, step.y))
@@ -535,13 +562,13 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         if cmd:
             return cmd
         handled, cmd = liquidate(worker, state, blocked, reserved)
-        if handled:
+        if cmd:
             return cmd
     handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True)
-    if handled:
+    if cmd:
         return cmd
     handled, cmd = liquidate(worker, state, blocked, reserved)
-    if handled:
+    if cmd:
         return cmd
     maybe_start_shop_item_job(worker, state, allow_weapon=should_upgrade_weapon(state))
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
@@ -549,7 +576,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         return cmd
     if sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
         handled, cmd = replenish_walls(worker, state, blocked, reserved)
-        if handled:
+        if cmd:
             return cmd
     cmd = tactical_action(worker, state, blocked, reserved)
     if cmd:
@@ -723,7 +750,7 @@ def plan_night(state: "MatchState") -> dict:
     task_pioneers = ({r.id for r in state.team_our.roles
                        if r.role_type == 'pioneer' and r.health > 0 and state.phase_task}
                       if not task_defense_override(state) else set())
-    assignments = assign_weapons(state, excluded_ids=task_pioneers)
+    assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
     from .tactics import threat_robots
     robots = threat_robots(state)
     for fighter in sorted(state.team_our.roles, key=lambda r: r.id):
