@@ -1,3 +1,4 @@
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from src.agent.task_sop import DEPLOYMENT_SOP
 
 
+@unittest.skipUnless(shutil.which('sh'), '需要 POSIX sh；请在 Linux 比赛运行环境补跑沙盒集成测试')
 class DeploymentSopTests(unittest.TestCase):
     def test_template_repairs_and_preserves_unrelated_content(self):
         command = 'set -e\n' + DEPLOYMENT_SOP.split('set -e\n', 1)[1].split('\n在上述命令', 1)[0]
