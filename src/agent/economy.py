@@ -11,6 +11,9 @@ SELL_FILL_RATIO = 0.20
 BUILD_STONE_RESERVE = 4
 
 
+THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
+
+
 def defense_due(role, state, blocked):
     """夜间、白天第50回合或返程余量不足时，防守覆盖任务与经济。"""
     from .opening import assign_weapons, station_path
@@ -25,6 +28,18 @@ def defense_due(role, state, blocked):
     return path is not None and len(path) + 8 >= 70 - cycle
 
 
+def task_defense_override(state) -> bool:
+    """用户确认的任务/防守优先级门控：返回 True 表示"防守优先，进行中的任务也要让路"（方案A）；
+    False 表示"武器已全部升级到二级以上，且还没到第三夜，允许任务撑到自然结束"（方案B）。
+    第三夜（round_no >= 330）起不再看武器状态，永远防守优先——生存权重高于任务，
+    此时哪怕武器全满级也不再为任务让防守让路。"""
+    if (state.round_no or 0) >= THIRD_NIGHT_ROUND:
+        return True
+    from .brain import WEAPON_TYPES
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
+    return not weapons or any((w.level or 1) < 2 for w in weapons)
+
+
 def muster_for_night(role, state, blocked, reserved):
     """所有白天都按实际返程距离提前回防，而非仅首日集合。"""
     from .opening import assign_weapons, station_path, move_on_path
@@ -34,6 +49,8 @@ def muster_for_night(role, state, blocked, reserved):
         return False, None  # 首日由施工计划按实际武器返程时间集合。
     if not defense_due(role, state, blocked):
         return False, None
+    if role.role_type == 'pioneer' and state.phase_task and not task_defense_override(state):
+        return False, None  # 方案B条件满足：回防时段已到，但武器已全部二级+、未到第三夜，任务继续，不被回防打断。
     weapon = assign_weapons(state).get(role.id)
     if weapon is None:
         from .brain import own_station

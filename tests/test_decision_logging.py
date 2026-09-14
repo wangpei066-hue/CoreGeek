@@ -91,7 +91,7 @@ class DecisionLoggingTests(unittest.TestCase):
         report = build_report(state, {}, commands, snapshot(state), previous, 1, 0, '夜晚')
         diag = report['diagnostics']
         self.assertEqual(diag['gold_delta'], 50)
-        self.assertEqual(diag['primary']['planned'], 10)
+        self.assertEqual(diag['primary']['planned'], 12)
         self.assertEqual(diag['outer']['planned'], 5)
         self.assertEqual(len(diag['weapons']), 3)
         self.assertTrue(any(a['code'] == 'MOVE_NO_PROGRESS' for a in diag['alerts']))

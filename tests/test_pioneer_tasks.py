@@ -14,7 +14,7 @@ from src.agent.protocol import MatchState
 
 class PioneerTaskTests(unittest.TestCase):
     def payload(self, round_no=10):
-        data = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text())
+        data = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text(encoding='utf-8'))
         data['roundNo'] = round_no
         data['phaseTask'] = ''
         data['teamOur']['roles'] = [r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer']

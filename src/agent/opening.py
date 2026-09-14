@@ -10,7 +10,7 @@ from .grid import build_blocked_set, chebyshev, neighbors8
 from .decision_log import trace, selected
 
 WALL_MARGIN = 2
-STONE_BATCH = 4  # 与经济策略的建墙石料预留一致，避免采满后又卖掉形成循环。
+STONE_BATCH = 6  # 首日两名工人各备半圈，减少往返；首日不会启动卖矿。
 MUSTER_BUFFER = 3
 
 
@@ -85,13 +85,13 @@ def wall_ring(state, base):
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front = right if direction == 1 else left
-    center_x = base.pos.x + 0.5
+    protected_rear = front - 3 * direction
     cells = {(front, y) for y in range(bottom, top + 1)}
     gap = funnel_gap(state, base)
     if gap:
         cells.update((gap[0], y) for y in range(bottom, top + 1) if (gap[0], y) != gap)
     cells.update((x, y) for x in range(left, right + 1) for y in (bottom, top)
-                 if (x - center_x) * direction > 0)
+                 if (x - protected_rear) * direction >= 0)
     return sorted(cells, key=lambda p: (wall_priority(state, base, p), p))
 
 

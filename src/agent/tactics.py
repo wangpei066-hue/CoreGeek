@@ -104,6 +104,7 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
         item = 'Bomb'
     elif (cycle_round < 70 and (state.round_no or 0) < 1240 and base and base.health >= max_health(base)*0.7
           and len(weapons) >= 3 and sum(r.role_type == 'wall' for r in state.team_our.roles) >= 6
+          and all((r.level or 1) >= 2 for r in weapons)
           and not urgent and role.id not in state.worker_item_jobs
           and not any(i.endswith('SummonOrder') for i in all_backpacks)
           and not any(isinstance(i, str) and i.endswith('SummonOrder') for i in state.tactical_purchases)

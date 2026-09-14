@@ -85,6 +85,23 @@ def diagnostics(state, commands, previous, comparable, previous_commands):
         if cycle >= 70 and targets and not cmd and not (w.role_type == 'rocket' and w.cooldown):
             alerts.append({'code': 'WEAPON_NOT_FIRING', 'weapon_id': w.id, 'message': '射程内有敌人且武器未冷却，但本回合没有攻击；需结合角色道具/移动指令判断'})
     primary_status = wall_status(primary)
+    weapon_upgrade_costs = []
+    for weapon in (r for r in roles if r.role_type in WEAPON_TYPES and r.health > 0 and (r.level or 1) < 2):
+        from .brain import voucher_for, item_cost
+        voucher, _ = voucher_for('weapon', weapon.level or 1)
+        weapon_upgrade_costs.append({'weapon_id': weapon.id, 'type': weapon.role_type,
+                                     'level': weapon.level or 1, 'voucher': voucher,
+                                     'cost': item_cost(voucher, state)})
+    upgrade_need = sum(item['cost'] for item in weapon_upgrade_costs)
+    upgrade_deadline = {'target_round': 330, 'rounds_left': max(0, 330-(state.round_no or 0)),
+                        'pending': weapon_upgrade_costs, 'gold_required': upgrade_need,
+                        'gold_available': state.team_our.gold_num,
+                        'funding_gap': max(0, upgrade_need-state.team_our.gold_num),
+                        'on_target': not weapon_upgrade_costs}
+    if weapon_upgrade_costs and (state.round_no or 0) >= 260:
+        alerts.append({'code': 'WEAPON_UPGRADE_DEADLINE', 'message': '第三夜前仍有一级武器',
+                       'rounds_left': upgrade_deadline['rounds_left'],
+                       'funding_gap': upgrade_deadline['funding_gap'], 'pending': weapon_upgrade_costs})
     if primary_status['missing']:
         alerts.append({'code': 'PRIMARY_GAPS', 'message': '第一层防线存在缺口', 'positions': primary_status['missing']})
     return {'source_version': SOURCE_VERSION, 'team_id': state.team_our.team_id, 'side': state.team_our.type,
@@ -93,6 +110,7 @@ def diagnostics(state, commands, previous, comparable, previous_commands):
             'gold_delta': state.team_our.gold_num-previous['gold'] if comparable and previous['gold'] is not None else None,
             'delta_note': '净变化可能包含交易、任务及其他来源，不能直接归因于某次卖矿。',
             'primary': primary_status, 'outer': wall_status(outer), 'outer_unlocked': outer_wall_ready(state),
+            'weapon_upgrade_deadline': upgrade_deadline,
             'actors': actors, 'weapons': weapons, 'robots_by_type': dict(Counter(r.role_type for r in robots)),
             'robots_near_base': sum(chebyshev(base.pos, r.pos) <= 7 for r in robots) if base else None,
             'alerts': alerts,

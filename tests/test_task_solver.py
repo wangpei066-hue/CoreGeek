@@ -18,7 +18,7 @@ class TaskSolverTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.server = GameServer(self.root)
         self.client = self.server.app.test_client()
-        self.payload = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text())
+        self.payload = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text(encoding='utf-8'))
         self.payload.update(roundNo=10, phaseTask='请计算1+1，仅返回数字', llmResp='', lastCmdResult='')
         self.payload['teamOur']['roles'] = [r for r in self.payload['teamOur']['roles'] if r['roleType'] == 'pioneer']
         self.output = io.StringIO()

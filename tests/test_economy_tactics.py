@@ -137,6 +137,9 @@ class EconomyTests(unittest.TestCase):
 class TacticalTests(unittest.TestCase):
     def test_offense_purchase_preserves_defense_budget(self):
         state, role = defended_state()
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
         role.pos = Pos(5, 4)
         cmd = tactical_action(role, state, build_blocked_set(state), set())
         self.assertEqual(cmd['name'], 'LargeRobotSummonOrder')
