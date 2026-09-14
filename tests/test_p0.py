@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -85,7 +86,7 @@ class P0Tests(unittest.TestCase):
             port = probe.getsockname()[1]
         # Start the service via the main module
         process = subprocess.Popen(
-            ["bash", "run.sh", str(port)],
+            [sys.executable, "main3.py", str(port)] if os.name == 'nt' else ["bash", "run.sh", str(port)],
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT

@@ -63,6 +63,7 @@ class StateParserTests(unittest.TestCase):
     def test_world_news_and_shops(self):
         self.state.update(self.payload)
         self.assertIn("无重大新闻", self.state.world_news.official_news)
+        self.assertIn("采药人", self.state.world_news.folk_legends)
         self.assertEqual(len(self.state.vendor_shop_list), 3)
         self.assertEqual(self.state.vendor_shop_list[1].name, "iron")
         self.assertEqual(self.state.weapon_shop_list[0].price, 100)

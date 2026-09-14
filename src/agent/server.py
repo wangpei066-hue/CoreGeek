@@ -15,7 +15,7 @@ from .task_solver import PioneerTaskSolver
 from .news_memory import NewsMemory
 from .prompt_router import PromptRouter
 from .brain import V1Strategy, BasicActionValidator, is_day_round
-from .decision_log import snapshot, build_report, write_report
+from .decision_log import snapshot, build_report, write_report, emit_console_report
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -34,6 +34,7 @@ def load_build_memory(state: "MatchState", state_dir: Path) -> None:
         return
     state.memory_context = data.get("memory_context")
     state.memory_round = data.get("memory_round")
+    state.policy_memory = data.get("policy_memory", {})
     state.build_retry_after = {tuple(entry[:3]): entry[3] for entry in data.get("build_retry_after", [])}
     state.failed_build_spots = {tuple(p) for p in data.get("failed_build_spots", [])}
     state.worker_build_targets = {
@@ -56,6 +57,7 @@ def save_build_memory(state: "MatchState", state_dir: Path) -> None:
         and not state.worker_build_targets
         and not state.worker_item_jobs
         and not state.last_sent_command
+        and not state.policy_memory
         and state.memory_context is None
         and not (state_dir / "build_memory.json").exists()
     ):
@@ -65,6 +67,7 @@ def save_build_memory(state: "MatchState", state_dir: Path) -> None:
     data = {
         "memory_context": state.memory_context,
         "memory_round": state.memory_round,
+        "policy_memory": state.policy_memory,
         "build_retry_after": [[*key, value] for key, value in state.build_retry_after.items()],
         "failed_build_spots": [list(pos) for pos in state.failed_build_spots],
         "worker_build_targets": {
@@ -149,6 +152,11 @@ class GameServer:
             started = perf_counter()
             role_command_map = self.strategy.decide(self.match_state)
             prompt, execute_cmd = self.task_solver.step(self.match_state, role_command_map)
+            if not prompt:
+                from .world_intel import maybe_prompt
+                intel_prompt, intel_cmd = maybe_prompt(self.match_state)
+                prompt = prompt or intel_prompt
+                execute_cmd = execute_cmd or intel_cmd
             news_prompt = self.prompt_router.request_prompt(self.match_state)
             prompt = prompt or news_prompt
             diagnostic_cmd = task_diagnostics(
@@ -169,7 +177,11 @@ class GameServer:
                     "未知" if self.match_state.round_no is None else (
                         "白天" if is_day_round(self.match_state.round_no) else "夜晚"),
                 )
-                write_report(self.log_dir, report)
+                for sink in (lambda: write_report(self.log_dir, report), lambda: emit_console_report(report)):
+                    try:
+                        sink()
+                    except Exception:
+                        self.app.logger.exception('decision log output failed (other output unaffected)')
             except Exception:
                 self.app.logger.exception("decision logging failed (response unaffected)")
             self.previous_snapshot = before

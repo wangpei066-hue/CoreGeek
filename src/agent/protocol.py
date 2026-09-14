@@ -228,6 +228,9 @@ class MatchState(GameState):
         self.build_retry_after = {}
         self.memory_context = None
         self.memory_round = None
+        self.policy_memory = {}  # 变现承诺和召唤令每日限额，随对局重置并落盘。
+        self.tactical_purchases = set()
+        self.bombed_robots = set()
 
     def update(self, payload: dict) -> None:
         incoming_round = payload.get("roundNo")
@@ -245,6 +248,7 @@ class MatchState(GameState):
                 self.build_retry_after.clear()
                 self.worker_build_targets.clear()
                 self.worker_item_jobs.clear()
+                self.policy_memory.clear()
             self.memory_context = context
             self.memory_round = incoming_round
         self.round_no = incoming_round

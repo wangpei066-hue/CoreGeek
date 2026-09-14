@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ from src.agent.protocol import MatchState
 
 class PioneerTaskTests(unittest.TestCase):
     def payload(self, round_no=10):
-        data = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text())
+        data = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text(encoding='utf-8'))
         data['roundNo'] = round_no
         data['phaseTask'] = ''
         data['teamOur']['roles'] = [r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer']
@@ -25,9 +26,9 @@ class PioneerTaskTests(unittest.TestCase):
         state.update(data)
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_accept_day_and_night(self):
-        for round_no in (10, 80):
-            self.assertEqual(self.decide(self.payload(round_no))[10011], {'action': 'acceptTask'})
+    def test_accept_only_during_day(self):
+        self.assertEqual(self.decide(self.payload(10))[10011], {'action': 'acceptTask'})
+        self.assertNotEqual(self.decide(self.payload(80)).get(10011, {}).get('action'), 'acceptTask')
 
     def test_moves_to_task(self):
         data = self.payload()
@@ -52,6 +53,7 @@ class PioneerTaskTests(unittest.TestCase):
         data['teamOur']['roles'][0]['health'] = 0
         self.assertNotIn(10011, self.decide(data))
 
+    @unittest.skipUnless(shutil.which('sh'), '需要 POSIX sh 执行平台沙盒命令')
     def test_platform_command_output_and_feedback(self):
         with tempfile.TemporaryDirectory() as root, contextlib.redirect_stderr(io.StringIO()) as stderr:
             server = GameServer(Path(root))
@@ -70,7 +72,8 @@ class PioneerTaskTests(unittest.TestCase):
             self.assertEqual(record['phaseTaskChunk'], data['phaseTask'])
             data.update(roundNo=12, lastCmdResult='[exitCode:0]\n' + result.stdout)
             self.assertEqual(client.post('/', json=data).status_code, 200)
-            records = [json.loads(line) for line in stderr.getvalue().splitlines()]
+            records = [record for line in stderr.getvalue().splitlines()
+                       if (record := json.loads(line)).get('marker') == 'PIONEER_TASK']
             self.assertEqual(records[1]['pioneers'][0]['previousCommand'], {'action': 'acceptTask'})
             self.assertTrue(records[1]['pioneers'][0]['lastActionLegal'])
             self.assertIn('PIONEER_TASK', records[2]['lastCmdResult'])

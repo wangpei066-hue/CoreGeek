@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,7 +8,7 @@ from unittest.mock import patch
 
 from src.agent import GameServer
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.decision_log import build_report, snapshot
+from src.agent.decision_log import CONSOLE_MARKER, build_report, emit_console_report, snapshot
 from test_shop_items import minimal_state, make_role
 
 
@@ -69,10 +71,42 @@ class DecisionLoggingTests(unittest.TestCase):
         self.assertTrue(all('未提供' in f['message'] for f in feedback))
 
     def test_logging_failure_does_not_fail_response(self):
-        with patch('src.agent.server.write_report', side_effect=OSError('disk unavailable')):
+        with patch('src.agent.server.write_report', side_effect=OSError('disk unavailable')), patch('src.agent.server.emit_console_report') as console:
             with self.assertLogs(self.server.app.logger, level='ERROR'):
                 response = self.client.post('/', json={})
         self.assertEqual(response.status_code, 200)
+        console.assert_called_once()
+
+    def test_diagnostics_expose_defense_and_economy_without_mutating_state(self):
+        from copy import deepcopy
+        from test_defense_priority import defended
+        state = defended()
+        state.round_no = 200
+        state.team_our.roles[1].backpack = ['copper'] * 8
+        previous = snapshot(state)
+        previous['round'] = 199
+        previous['gold'] = 25
+        memory = deepcopy(state.policy_memory)
+        commands = {1: {'action': 'move', 'targetPos': [{'x': 8, 'y': 9}]}}
+        report = build_report(state, {}, commands, snapshot(state), previous, 1, 0, '夜晚')
+        diag = report['diagnostics']
+        self.assertEqual(diag['gold_delta'], 50)
+        self.assertEqual(diag['primary']['planned'], 12)
+        self.assertEqual(diag['outer']['planned'], 5)
+        self.assertEqual(len(diag['weapons']), 3)
+        self.assertTrue(any(a['code'] == 'MOVE_NO_PROGRESS' for a in diag['alerts']))
+        self.assertTrue(any(a['code'] == 'NIGHT_UNSTATIONED' for a in diag['alerts']))
+        self.assertEqual(state.policy_memory, memory)
+
+    def test_diagnostics_do_not_compare_unrelated_matches(self):
+        from test_defense_priority import defended
+        state = defended()
+        previous = snapshot(state)
+        previous['context'] = {'different': 'match'}
+        previous['gold'] = 9999
+        report = build_report(state, {}, {}, snapshot(state), previous, 1, 0, '白天')
+        self.assertIsNone(report['diagnostics']['gold_delta'])
+        self.assertIsNotNone(report['diagnostics']['initial_context'])
 
     def test_invalid_json_does_not_generate_decision(self):
         self.assertEqual(self.client.post('/', data='{broken', content_type='application/json').status_code, 400)
@@ -86,3 +120,27 @@ class DecisionLoggingTests(unittest.TestCase):
         count = len(state.decision_events)
         strategy.decide(state)
         self.assertEqual(len(state.decision_events), count)
+
+    def test_console_record_contains_strategy_summary_and_role_reasons(self):
+        state = minimal_state(gold_num=75)
+        state.team_our.roles.append(make_role(1, 1, 1, 'pioneer', back_pack_capability=40))
+        before = snapshot(state)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        report = build_report(state, commands, {}, before, None, 7, 1.2, '白天')
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            emit_console_report(report)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record['marker'], CONSOLE_MARKER)
+        self.assertEqual(record['summary']['gold'], 75)
+        self.assertEqual(record['roles'][0]['id'], 1)
+        self.assertTrue(record['roles'][0]['reasons'])
+
+    def test_server_emits_console_strategy_record(self):
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.client.post('/', json={'roundNo': 1})
+        records = [json.loads(line) for line in output.getvalue().splitlines()
+                   if 'STRATEGY_DECISION' in line]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['roundNo'], 1)

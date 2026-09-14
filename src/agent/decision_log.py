@@ -2,7 +2,12 @@
 from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
+import sys
+
+
+CONSOLE_MARKER = "STRATEGY_DECISION"
 
 
 def trace(state, role_id, code, message, **details):
@@ -73,8 +78,15 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
             old, new = previous_snapshot["roles"].get(key), before["roles"].get(key)
             if old != new:
                 changes.append({"role_id": key, "before": old, "after": new})
+    from .diagnostics import diagnostics
+    try:
+        metrics = diagnostics(state, commands, previous_snapshot, comparable, previous_commands)
+    except Exception as exc:
+        metrics = {'alerts': [{'code': 'DIAGNOSTICS_ERROR', 'message': str(exc)}]}
     return {
-        "schema_version": 1, "sequence": sequence, "round": state.round_no,
+        "schema_version": 2, "sequence": sequence, "round": state.round_no,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "diagnostics": metrics,
         "phase": phase, "phase_basis": "策略按roundNo从0起算；官方起点尚待核验",
         "decision_ms": round(elapsed_ms, 3),
         "summary": {"gold": before["gold"], "weapons": sum(counts[t] for t in ("gatling", "railgun", "rocket")),
@@ -96,6 +108,12 @@ def render_text(report):
         if event["role_id"] is None:
             lines.append(event["message"] + " " + json.dumps(
                 {k: v for k, v in event.items() if k not in ("role_id", "code", "message")}, ensure_ascii=False))
+    diagnostic = report.get('diagnostics', {})
+    for alert in diagnostic.get('alerts', []):
+        lines.append('【重点】' + json.dumps(alert, ensure_ascii=False))
+    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons'):
+        if key in diagnostic:
+            lines.append(f'{key}: ' + json.dumps(diagnostic[key], ensure_ascii=False))
     for base in summary["bases"]:
         lines.append(f"基地 {base['id']}：血量 {base['health']}，等级 {base['level']}")
     for role in report["roles"]:
@@ -122,3 +140,37 @@ def write_report(log_dir, report):
                          (".txt", render_text(report))):
         with (log_dir / (stem + suffix)).open("x", encoding="utf-8") as stream:
             stream.write(text)
+
+
+def emit_console_report(report):
+    """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
+
+    本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
+    任务原文、背包明细或重复路径事件刷满平台输出。
+    """
+    role_reports = []
+    for role in report["roles"]:
+        reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
+                   for event in role["events"]]
+        role_reports.append({
+            "id": role["role_id"], "type": role["role_type"],
+            "pos": role["position"], "status": role["status"],
+            "health": role["health"], "backpackCounts": role["backpack"],
+            "commandKey": role["command_key"], "command": role["command"],
+            "reasons": reasons, "pendingBuild": role["pending_build"],
+            "itemJob": role["item_job"],
+        })
+    record = {
+        "marker": CONSOLE_MARKER, "sequence": report["sequence"],
+        "roundNo": report["round"], "phase": report["phase"],
+        "summary": report["summary"], "roles": role_reports,
+        "globalEvents": [event for event in report["events"] if event["role_id"] is None],
+        "previousFeedback": report["previous_feedback"],
+        "systemErrors": report["system_errors"],
+        "observedChanges": report["observed_changes"],
+        "decisionMs": report["decision_ms"],
+        "schemaVersion": report['schema_version'],
+        "timestampUtc": report['timestamp_utc'],
+        "diagnostics": report.get('diagnostics', {}),
+    }
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)

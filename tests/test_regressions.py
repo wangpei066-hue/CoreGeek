@@ -59,11 +59,11 @@ class RegressionTests(unittest.TestCase):
 
     def test_failed_build_is_type_specific_and_expires(self):
         state = minimal_state()
-        state.last_sent_command = {1: {'action': 'build', 'name': 'gatling', 'targetPos': [{'x': 8, 'y': 8}]}}
+        state.last_sent_command = {1: {'action': 'build', 'name': 'gatling', 'targetPos': [{'x': 13, 'y': 7}]}}
         state.last_round_role_action_results = {1: False}
         learn_from_last_round(state)
-        self.assertIn((8, 8, 'weapon'), state.failed_build_spots)
-        self.assertEqual(pick_build_target(state, Pos(10, 10), set(), 'wall'), Pos(8, 8))
+        self.assertIn((13, 7, 'weapon'), state.failed_build_spots)
+        self.assertEqual(pick_build_target(state, Pos(10, 10), set(), 'wall'), Pos(13, 7))
         state.round_no += 30
         state.last_sent_command = {}
         learn_from_last_round(state)

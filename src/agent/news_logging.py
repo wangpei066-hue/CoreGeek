@@ -87,6 +87,8 @@ def news_diagnostics(state, memory, commands, previous_commands):
     print(json.dumps({**record, "llmResp": _clip(state.llm_resp, 1200)}, ensure_ascii=False),
           file=sys.stderr, flush=True)
 
+    if not state.team_our or not state.map_info:
+        return ""
     if state.phase_task:
         # 自进化占用沙盒期间不抢 executeCmd。
         return ""

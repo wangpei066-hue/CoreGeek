@@ -121,6 +121,12 @@ class PioneerTaskSolver:
         tmp.replace(self.path)
 
     def step(self, state, commands):
+        if state.team_our and state.map_info:
+            from .economy import defense_due
+            from .grid import build_blocked_set
+            pioneer = next((r for r in state.team_our.roles if r.role_type == 'pioneer' and r.health > 0), None)
+            if pioneer and defense_due(pioneer, state, build_blocked_set(state)):
+                return '', ''  # 不让解题器或重试缓存覆盖回防、占用武器操控者。
         key = [state.team_our.team_id, state.team_our.type, state.phase_task] if state.team_our else None
         s = self.session
         if not state.phase_task or not state.team_our:

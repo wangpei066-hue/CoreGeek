@@ -9,7 +9,6 @@ from src.agent.protocol import (
     Role,
     RobotInfo,
     RobotRole,
-    ShopItem,
     TeamEnemy,
     TeamOur,
     Zone,
@@ -131,7 +130,7 @@ class V1StrategyDayTests(unittest.TestCase):
         self.strategy = V1Strategy(self.validator)
 
     def test_worker_moves_toward_nearest_mine(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(15, 10), neutral_type="stone")])
         worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
@@ -140,7 +139,7 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010]["action"], "move")
 
     def test_worker_collects_when_adjacent_to_mine(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="stone")])
         worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
@@ -148,17 +147,15 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010], {"action": "collect", "targetPos": [{"x": 11, "y": 10}]})
 
     def test_worker_sells_when_adjacent_to_vendor_with_backpack(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
+        state.team_our.roles[0].health = 1500
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
-        state.vendor_shop_list = [
-            ShopItem(name="stone", price=1),
-            ShopItem(name="iron", price=3),
-            ShopItem(name="copper", price=5),
-        ]
         worker = make_role(10010, 10, 10, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        self.assertEqual(commands[10010], {"action": "sell", "name": "iron", "num": 1})
+        # 保留少量施工石头，出售不用于建墙的矿石。
+        # 第一层缺墙时，施工覆盖顺路出售。
+        self.assertEqual(commands[10010]['action'], 'move')
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night
@@ -273,7 +270,7 @@ class SelfHealTests(unittest.TestCase):
         worker = make_role(10010, 0, 0, "worker", health=50, backpack=["Medicine"])
         self.assertEqual(decide_self_heal(worker), {"action": "use", "name": "Medicine"})
 
-    def test_self_heal_preempts_night_combat(self):
+    def test_night_combat_preempts_self_heal(self):
         state = minimal_state(round_no=75)
         gatling = make_role(10020, 9, 10, "gatling", attack_range=4, level=1)
         hurt_worker = make_role(10010, 9, 11, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
@@ -281,17 +278,17 @@ class SelfHealTests(unittest.TestCase):
         state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
-        self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
-        self.assertNotIn(10020, commands)  # 治疗优先，这一回合没有人操控武器
+        self.assertNotIn(10010, commands)
+        self.assertEqual(commands[10020]['action'], 'attack')
 
-    def test_self_heal_preempts_day_economy(self):
-        state = minimal_state(round_no=5)
+    def test_wall_material_collection_preempts_self_heal(self):
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="stone")])
         hurt_worker = make_role(10010, 10, 10, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], hurt_worker]
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
-        self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
+        self.assertEqual(commands[10010]['action'], 'collect')
 
 
 class BuyMedicineTests(unittest.TestCase):
