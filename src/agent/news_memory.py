@@ -144,7 +144,11 @@ class NewsMemory:
         ]
         if self.data["context"] is not None and self.data["context"] != context:
             self.reset()
+        prev_round = self.data.get("memoryRound")
+        if prev_round is not None and state.round_no is not None and state.round_no < prev_round:
+            self.reset()
         self.data["context"] = context
+        self.data["memoryRound"] = state.round_no
 
         day = game_day(state.round_no)
         if self.data["llmDay"] != day:

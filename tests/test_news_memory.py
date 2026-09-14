@@ -137,6 +137,13 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(len(self.memory.data["legends"]), 1)
         self.assertEqual(self.memory.data["legends"][0]["text"], "b")
 
+    def test_round_rewind_resets(self):
+        self.memory.ingest(self._state(200, official=IRON_COLLAPSE, folk="旧传闻"))
+        self.assertEqual(self.memory.banned_ores(3), {"iron"})
+        self.memory.ingest(self._state(0, official="今日无重大新闻", folk=""))
+        self.assertEqual(self.memory.banned_ores(3), set())
+        self.assertEqual(self.memory.data["legends"], [])
+
 
 class OrePricingTests(unittest.TestCase):
     def test_sell_highest_price(self):

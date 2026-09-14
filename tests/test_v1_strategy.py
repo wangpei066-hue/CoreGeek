@@ -146,15 +146,24 @@ class V1StrategyDayTests(unittest.TestCase):
         commands = self.strategy.decide(state)
         self.assertEqual(commands[10010], {"action": "collect", "targetPos": [{"x": 11, "y": 10}]})
 
-    def test_worker_sells_when_adjacent_to_vendor_with_backpack(self):
+    def test_worker_sells_iron_when_adjacent_to_vendor(self):
         state = minimal_state(round_no=135)
         state.team_our.roles[0].health = 1500
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
-        worker = make_role(10010, 10, 10, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
+        worker = make_role(10010, 10, 10, "worker", backpack=["iron", "iron", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        # 第一晚后石头留给建墙，铁可以卖掉。
         self.assertEqual(commands[10010]['action'], 'sell')
+
+    def test_worker_builds_front_wall_before_selling_when_holding_stone(self):
+        state = minimal_state(round_no=135)
+        state.team_our.roles[0].health = 1500
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
+        worker = make_role(10010, 12, 7, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], worker]
+        commands = self.strategy.decide(state)
+        self.assertEqual(commands[10010].get('action'), 'build')
+        self.assertEqual(commands[10010].get('name'), 'wall')
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night
@@ -279,6 +288,16 @@ class SelfHealTests(unittest.TestCase):
         commands = strategy.decide(state)
         self.assertNotIn(10010, commands)
         self.assertEqual(commands[10020]['action'], 'attack')
+
+    def test_emergency_heal_preempts_night_attack_when_lethal(self):
+        state = minimal_state(round_no=75)
+        gatling = make_role(10020, 9, 10, "gatling", attack_range=4, level=1)
+        hurt_worker = make_role(10010, 9, 11, "worker", health=20, backpack=["Medicine"], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], gatling, hurt_worker]
+        state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
+        self.assertNotIn(10020, commands)
 
     def test_wall_material_collection_preempts_self_heal(self):
         state = minimal_state(round_no=135)

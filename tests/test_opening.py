@@ -239,7 +239,7 @@ class OpeningTests(unittest.TestCase):
             make_role(22, 12, 12, 'rocket', level=1),
         ]
 
-    def test_pioneer_buys_voucher_not_worker_when_gold_enough(self):
+    def test_worker_near_shop_buys_voucher_when_cheaper_than_pioneer(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 130
@@ -247,12 +247,11 @@ class OpeningTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         state.team_our.roles[1].pos = Pos(8, 9)
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(3, state.worker_item_jobs)
-        self.assertEqual(state.worker_item_jobs[3]['kind'], 'weapon')
-        self.assertNotIn(1, state.worker_item_jobs)
-        self.assertIn(commands[3]['action'], ('move', 'buy'))
-        if 1 in commands:
-            self.assertNotEqual(commands[1].get('name'), 'WeaponUpgradeVoucher1')
+        self.assertIn(1, state.worker_item_jobs)
+        self.assertEqual(state.worker_item_jobs[1]['kind'], 'weapon')
+        self.assertNotIn(3, state.worker_item_jobs)
+        self.assertIn(commands[1]['action'], ('move', 'buy'))
+        self.assertNotEqual(commands.get(3, {}).get('name'), 'WeaponUpgradeVoucher1')
 
     def test_outside_worker_enters_courtyard_instead_of_patrolling(self):
         state = opening_state()
@@ -380,9 +379,46 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[2].backpack = ['stone'] * 4
         state.robot.roles = []
         state.policy_memory['night_saw_threat'] = True
+        state.policy_memory['night_empty_streak'] = 7
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertTrue(any(e['code'] == 'night_wave_cleared' for e in state.decision_events))
         self.assertFalse(any(c['action'] == 'attack' for c in commands.values()))
         self.assertTrue(any(c['action'] in ('move', 'collect', 'build', 'acceptTask') for c in commands.values()))
         self.assertIn(commands[3]['action'], ('move', 'acceptTask', 'collect'))
+
+    def test_night_empty_one_round_still_holds_guns(self):
+        state = opening_state()
+        state.round_no = 80
+        self._rockets(state)
+        state.team_our.roles[1].backpack = ['stone'] * 4
+        state.team_our.roles[2].backpack = ['stone'] * 4
+        state.robot.roles = []
+        state.policy_memory['night_saw_threat'] = True
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(e['code'] == 'night_wave_cleared' for e in state.decision_events))
+        self.assertFalse(any(c['action'] in ('collect', 'acceptTask') for c in commands.values()))
+
+    def test_night_local_streak_builds_adjacent_front_wall(self):
+        from src.agent.tactics import WAVE_LOCAL_STREAK
+        state = opening_state()
+        state.round_no = 80
+        state.team_our.roles += [
+            make_role(20, 11, 10, 'rocket', level=2, attack_range=20),
+            make_role(21, 9, 8, 'rocket', level=2, attack_range=20),
+            make_role(22, 9, 11, 'rocket', level=2, attack_range=20),
+        ]
+        state.team_our.roles[1].pos = Pos(12, 10)
+        state.team_our.roles[1].backpack = ['stone'] * 4
+        state.team_our.roles[2].pos = Pos(9, 8)
+        state.team_our.roles[3].pos = Pos(9, 11)
+        state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
+        state.robot.roles = []
+        state.policy_memory['night_saw_threat'] = True
+        state.policy_memory['night_empty_streak'] = WAVE_LOCAL_STREAK - 1
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        builds = [c for c in commands.values() if c.get('action') == 'build' and c.get('name') == 'wall']
+        self.assertTrue(builds)
+        target = builds[0]['targetPos'][0]
+        self.assertEqual(target['x'], 13)
+        self.assertEqual(max(abs(target['x'] - 12), abs(target['y'] - 10)), 1)
 

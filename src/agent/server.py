@@ -142,7 +142,11 @@ class GameServer:
             # 策略决策
             self.load_build_memory()
             self.match_state.update(data)
+            if self.match_state.memory_reset:
+                self.news_memory.reset()
+                self.task_solver.reset()
             self.match_state.news_memory = self.news_memory
+            self.match_state.task_session = dict(self.task_solver.session)
             # 先清空再 ingest/consume，避免解码 trace 被冲掉
             self.match_state.decision_events = []
             self.news_memory.ingest(self.match_state)

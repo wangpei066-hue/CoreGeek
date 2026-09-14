@@ -8,7 +8,7 @@ from src.agent.protocol import MatchState, Pos, Zone
 from src.agent.grid import move_towards, astar_next_step
 from src.agent.brain import (
     BasicActionValidator, V1Strategy, decide_shop_item_job,
-    learn_from_last_round, pick_build_target,
+    learn_from_last_round, pick_build_target, BUILD_RETRY_UNKNOWN,
 )
 from src.agent.server import load_build_memory, save_build_memory
 from test_shop_items import minimal_state, make_role
@@ -64,10 +64,37 @@ class RegressionTests(unittest.TestCase):
         learn_from_last_round(state)
         self.assertIn((13, 7, 'weapon'), state.failed_build_spots)
         self.assertEqual(pick_build_target(state, Pos(10, 10), set(), 'wall'), Pos(13, 7))
-        state.round_no += 30
+        state.round_no += BUILD_RETRY_UNKNOWN
         state.last_sent_command = {}
         learn_from_last_round(state)
         self.assertFalse(state.failed_build_spots)
+
+    def test_occupied_build_failure_uses_short_backoff(self):
+        from src.agent.brain import BUILD_RETRY_OCCUPIED
+        state = minimal_state()
+        state.team_our.roles.append(make_role(1, 13, 7, 'worker'))
+        state.last_sent_command = {1: {'action': 'build', 'name': 'wall', 'targetPos': [{'x': 13, 'y': 7}]}}
+        state.last_round_role_action_results = {1: False}
+        learn_from_last_round(state)
+        self.assertEqual(state.build_retry_after[(13, 7, 'wall')], state.round_no + BUILD_RETRY_OCCUPIED)
+
+    def test_resource_build_failure_does_not_cooldown_cell(self):
+        state = minimal_state()
+        state.team_our.roles.append(make_role(1, 12, 7, 'worker', backpack=[]))
+        state.last_sent_command = {1: {'action': 'build', 'name': 'wall', 'targetPos': [{'x': 13, 'y': 7}]}}
+        state.last_round_role_action_results = {1: False}
+        learn_from_last_round(state)
+        self.assertNotIn((13, 7, 'wall'), state.failed_build_spots)
+
+    def test_repeated_unknown_build_failure_lengthens_cooldown(self):
+        from src.agent.brain import BUILD_RETRY_ROUNDS, BUILD_RETRY_UNKNOWN_LIMIT
+        state = minimal_state()
+        state.last_sent_command = {1: {'action': 'build', 'name': 'gatling', 'targetPos': [{'x': 13, 'y': 7}]}}
+        state.last_round_role_action_results = {1: False}
+        for _ in range(BUILD_RETRY_UNKNOWN_LIMIT):
+            learn_from_last_round(state)
+            state.round_no += 1
+        self.assertEqual(state.build_retry_after[(13, 7, 'weapon')], (state.round_no - 1) + BUILD_RETRY_ROUNDS)
 
     def test_unaffordable_job_is_released(self):
         state = minimal_state(gold_num=0)
@@ -133,3 +160,20 @@ class RegressionTests(unittest.TestCase):
         payload['teamOur']['type'] = 'changed-side'
         state.update(payload)
         self.assertFalse(state.worker_item_jobs)
+        self.assertTrue(state.memory_reset)
+
+    def test_respawn_clears_stale_role_jobs(self):
+        from src.agent.tactics import begin_round
+        state = minimal_state()
+        worker = make_role(1, 10, 10, 'worker', health=0)
+        state.team_our.roles.append(worker)
+        state.worker_build_targets[1] = (8, 8, 'wall')
+        state.worker_item_jobs[1] = {'item': 'WallFixer', 'target': (8, 8), 'kind': 'wall'}
+        state.policy_memory['weapon_assignment'] = {'1': 20}
+        state.policy_memory['role_alive'] = {'1': False}
+        worker.health = 220
+        begin_round(state)
+        self.assertNotIn(1, state.worker_build_targets)
+        self.assertNotIn(1, state.worker_item_jobs)
+        self.assertNotIn('1', state.policy_memory.get('weapon_assignment', {}))
+        self.assertTrue(any(e['code'] == 'role_respawned' for e in state.decision_events))

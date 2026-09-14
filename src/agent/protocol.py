@@ -228,6 +228,8 @@ class MatchState(GameState):
         self.build_retry_after = {}
         self.memory_context = None
         self.memory_round = None
+        self.memory_reset = False
+        self.task_session = {}
         self.policy_memory = {}  # 变现承诺和召唤令每日限额，随对局重置并落盘。
         self.tactical_purchases = set()
         self.bombed_robots = set()
@@ -238,6 +240,7 @@ class MatchState(GameState):
         map_data = payload.get("mapInfo", {})
         base = next((r.get("pos") for r in team.get("roles", []) if r.get("roleType") == "station"), None)
         context = [team.get("teamId"), team.get("type"), map_data.get("width"), map_data.get("height"), base]
+        self.memory_reset = False
         if team and map_data:
             changed = self.memory_context is not None and context != self.memory_context
             rewound = (incoming_round is not None and self.memory_round is not None
@@ -249,6 +252,8 @@ class MatchState(GameState):
                 self.worker_build_targets.clear()
                 self.worker_item_jobs.clear()
                 self.policy_memory.clear()
+                self.task_session = {}
+                self.memory_reset = True
             self.memory_context = context
             self.memory_round = incoming_round
         self.round_no = incoming_round

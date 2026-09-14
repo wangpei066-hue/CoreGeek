@@ -17,7 +17,8 @@ DAY2_WALL_TARGET = 12
 VOUCHER_USE_SLACK = 4  # 买券后走到最前火箭并使用的余量，不是官方耗时。
 WALL_STEP_SLACK = 1    # 每段墙在建造外再留1回合走位。
 FALLBACK_TRAVEL = 8
-LATE_BUILD_SLACK = 2   # 第一晚后白天末段建墙的额外余量，不是官方耗时。
+LATE_BUILD_SLACK = 2   # 墙工时 overrun 的初值，随后按入夜时是否仍缺墙调整。
+MAX_WALL_OVERRUN = 12
 
 
 def path_to_any(start, goals, blocked, width, height):
@@ -298,21 +299,76 @@ def staged_wall_missing(state):
     return [p for p in staged_wall_plan(state, base) if p not in existing]
 
 
-def staged_walls_incomplete(state):
-    return bool(staged_wall_missing(state))
+def station_return_steps(role, state, blocked):
+    """该角色走到操炮位（或基地旁）的步数；找不到路时用保守行程。"""
+    weapon = assign_weapons(state).get(role.id)
+    if weapon is None:
+        base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+        path = adjacent_path(role, base.pos, blocked, state) if base else None
+        return FALLBACK_TRAVEL if path is None else len(path)
+    path = station_path(role, weapon, blocked, state)
+    return FALLBACK_TRAVEL if path is None else len(path)
 
 
-def stones_cover_wall_plan(state):
-    missing = staged_wall_missing(state)
-    if not missing:
-        return False
-    have = sum(r.backpack.count('stone') for r in state.team_our.roles
-               if r.role_type == 'worker' and r.health > 0)
-    return have >= len(missing)
+def wall_overrun_margin(state):
+    return int((state.policy_memory or {}).get('wall_time_overrun', LATE_BUILD_SLACK))
 
 
-def worker_should_build_walls(state):
-    """首日由 opening 施工；第一晚后先攒石，只在白天末段（回防前）建墙。清波后的夜间可继续建。"""
+def update_wall_time_overrun(state):
+    """每个夜晚起点比较「计划是否完工」，加大或回收施工余量。不是官方耗时。"""
+    if (state.round_no or 0) % 130 != 70:
+        return
+    overrun = wall_overrun_margin(state)
+    front_missing = critical_wall_missing(state)
+    stage_missing = staged_wall_missing(state)
+    still_open = bool(front_missing or stage_missing)
+    if still_open:
+        state.policy_memory['wall_time_overrun'] = min(MAX_WALL_OVERRUN, overrun + 2)
+        trace(state, None, 'wall_time_overrun', '入夜时关键或阶段墙未完成，加大施工余量',
+              overrun=state.policy_memory['wall_time_overrun'],
+              missing=len(set(front_missing) | set(stage_missing)))
+    elif overrun > LATE_BUILD_SLACK:
+        state.policy_memory['wall_time_overrun'] = overrun - 1
+
+
+def critical_wall_missing(state):
+    """正面迎敌列缺口：直接挡基地和炮位，8/12 段上限不能代表这条线已经有效。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return []
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    return [p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) == 0 and p not in existing]
+
+
+def worker_wall_muster_rounds(state, role, missing):
+    """该工人补完分摊缺口并回到炮位的估计：到施工区 + 取石施工 + 回炮 + 历史余量。"""
+    blocked = build_blocked_set(state) | movement_avoid(state)
+    workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
+    hands = max(1, len(workers))
+    share = -(-len(missing) // hands)
+    stones = role.backpack.count('stone') if role is not None else 0
+    collect = max(0, share - stones)
+    mines = [z.pos for z in state.map_info.zones if z.neutral_type == 'stone']
+    mine_roles = [role] if role is not None else workers
+    mine_travel = _shortest_adjacent(mine_roles, mines, blocked, state) if collect and mines else 0
+    gaps = [Pos(*p) for p in missing]
+    if role is not None and gaps:
+        lengths = []
+        for gap in gaps:
+            path = wall_approach_path(role, gap, blocked, state)
+            if path is not None:
+                lengths.append(len(path))
+        gap_travel = min(lengths) if lengths else FALLBACK_TRAVEL
+        gun_travel = station_return_steps(role, state, blocked)
+    else:
+        gap_travel = _shortest_adjacent(workers, gaps, blocked, state) if gaps else 0
+        gun_travel = MUSTER_BUFFER
+    return mine_travel + collect + gap_travel + share * WALL_STEP_SLACK + gun_travel + MUSTER_BUFFER + wall_overrun_margin(state)
+
+
+def full_wall_build_window(state, role=None):
+    """侧翼/外层：按该工人回炮时间开工，不用固定「剩余≤估计+5」。"""
     from .tactics import night_wave_cleared
     if night_wave_cleared(state):
         return True
@@ -324,10 +380,36 @@ def worker_should_build_walls(state):
     missing = staged_wall_missing(state)
     if not missing:
         return False
-    blocked = build_blocked_set(state) | movement_avoid(state)
-    wall_need = wall_finish_rounds(state, missing, blocked)
     remaining = 70 - cycle
-    return remaining <= wall_need + MUSTER_BUFFER + LATE_BUILD_SLACK
+    return remaining <= worker_wall_muster_rounds(state, role, missing)
+
+
+def worker_should_build_walls(state, role=None):
+    """正面缺口有石就补；侧翼和外层等基本防线形成后再按回炮工时安排。"""
+    from .tactics import night_wave_cleared, night_near_work_allowed
+    if night_wave_cleared(state):
+        return True
+    if (state.round_no or 0) < 70:
+        return True
+    cycle = (state.round_no or 0) % 130
+    if cycle >= 70:
+        return bool(night_near_work_allowed(state) and critical_wall_missing(state))
+    if critical_wall_missing(state):
+        return True
+    return full_wall_build_window(state, role)
+
+
+def stones_cover_wall_plan(state):
+    missing = staged_wall_missing(state)
+    if not missing:
+        return False
+    have = sum(r.backpack.count('stone') for r in state.team_our.roles
+               if r.role_type == 'worker' and r.health > 0)
+    return have >= len(missing)
+
+
+def staged_walls_incomplete(state):
+    return bool(staged_wall_missing(state))
 
 
 def outer_wall_ready(state):
@@ -525,8 +607,11 @@ def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
 
 def pioneer_day_support(role, state, blocked, reserved, assignments):
     """开拓者白天合法工作：任务金币够了买武器券，用已有道具，让开施工，不去 collect/build。"""
-    from .brain import decide_buy_medicine, decide_pioneer_voucher, decide_self_heal
+    from .brain import decide_buy_medicine, decide_emergency_heal, decide_pioneer_voucher, decide_self_heal
     from .tactics import tactical_action
+    heal = decide_emergency_heal(role, state)
+    if heal:
+        return selected(state, role.id, heal, '血量过低且近敌，紧急用药')
     cmd = decide_pioneer_voucher(role, state, blocked, reserved)
     if cmd:
         return cmd
@@ -564,7 +649,7 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
     if 'stone' in role.backpack:
         if not allow_build:
             trace(state, role.id, 'stones_reserved_for_late_day',
-                  '第一晚后石头留着建墙，等到白天末段再施工', stones=role.backpack.count('stone'), missing=len(missing))
+                  '正面已封，侧翼和外层留到回炮工时足够时再施工', stones=role.backpack.count('stone'), missing=len(missing))
             return False, None
         cmd = try_build(role, state, blocked, reserved)
         if cmd:
@@ -580,6 +665,28 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         return True, selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, '采集下一段城墙所需石料')
     trace(state, role.id, 'wall_material_blocked', '缺墙但石矿不可达或背包已满', backpack_count=len(role.backpack))
     return False, None
+
+
+def adjacent_critical_build(role, state, blocked, reserved):
+    """操炮位旁补正面缺口：不离开炮去远工。"""
+    from .brain import own_station
+    if role.role_type != 'worker' or 'stone' not in role.backpack:
+        return None
+    base = own_station(state)
+    if base is None:
+        return None
+    assignments = assign_weapons(state)
+    for x, y in critical_wall_missing(state):
+        if chebyshev(role.pos, Pos(x, y)) != 1:
+            continue
+        if (x, y) in blocked | reserved or (x, y, 'wall') in state.failed_build_spots:
+            continue
+        if not safe_wall(state, (x, y), blocked | reserved, assignments):
+            continue
+        reserved.add((x, y))
+        return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': x, 'y': y}]},
+                        '夜间空窗就近补正面墙，不离开操炮位')
+    return None
 
 
 def safe_wall(state, point, blocked, assignments):
@@ -618,7 +725,7 @@ def safe_wall(state, point, blocked, assignments):
 
 def plan_opening(state):
     from .brain import (
-        WEAPON_TYPES, decide_self_heal, decide_shop_item_job, item_cost,
+        WEAPON_TYPES, decide_emergency_heal, decide_self_heal, decide_shop_item_job, item_cost,
         maybe_start_shop_item_job, own_station, plan_pioneer_tasks, pick_weapon_name,
         should_upgrade_weapon,
     )
@@ -658,31 +765,19 @@ def plan_opening(state):
     elif not missing or not has_three:
         state.policy_memory.pop('opening_commit', None)
     if has_three:
-        from .economy import pioneer_available_to_buy_voucher
+        from .economy import pick_weapon_voucher_buyer
+        buyer = pick_weapon_voucher_buyer(state, blocked)
         for role_id, job in list(state.worker_item_jobs.items()):
             owner = next((r for r in fighters if r.id == role_id), None)
-            pioneer = next((r for r in fighters if r.role_type == 'pioneer' and r.health > 0), None)
-            if (owner and owner.role_type == 'worker' and job.get('kind') == 'weapon'
-                    and job.get('item') not in owner.backpack and pioneer
-                    and pioneer_available_to_buy_voucher(state)
-                    and gold >= item_cost(job['item'], state)):
-                state.worker_item_jobs[pioneer.id] = job
+            if (buyer and owner and buyer.id != owner.id and job.get('kind') == 'weapon'
+                    and job.get('item') not in owner.backpack
+                    and not (buyer.role_type == 'pioneer' and state.phase_task)):
+                state.worker_item_jobs[buyer.id] = job
                 del state.worker_item_jobs[role_id]
-                trace(state, pioneer.id, 'weapon_upgrade_job_transferred',
-                      '金币已够，武器升级券改由开拓者购买', from_id=role_id)
-        if allow_upgrade and should_upgrade_weapon(state):
-            pioneer = next((r for r in fighters if r.role_type == 'pioneer' and r.health > 0
-                            and r.id not in task_pioneers), None)
-            voucher_cost = item_cost('WeaponUpgradeVoucher1', state)
-            if (pioneer and pioneer_available_to_buy_voucher(state)
-                    and (gold >= voucher_cost or any(
-                        isinstance(item, str) and 'WeaponUpgradeVoucher' in item
-                        for item in pioneer.backpack))):
-                maybe_start_shop_item_job(pioneer, state)
-            else:
-                carrier = best_voucher_worker(state, workers, blocked)
-                if carrier:
-                    maybe_start_shop_item_job(carrier, state)
+                trace(state, buyer.id, 'weapon_upgrade_job_transferred',
+                      '武器升级券改派给完整代价更低的人', from_id=role_id)
+        if allow_upgrade and should_upgrade_weapon(state) and buyer:
+            maybe_start_shop_item_job(buyer, state)
     if muster:
         phase = '就位'
     elif not has_three:
@@ -712,6 +807,10 @@ def plan_opening(state):
     # 开拓者先规划撤离，避免继续占住墙线和工人施工邻接格。
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
         if role.id in task_pioneers:
+            continue
+        heal = decide_emergency_heal(role, state)
+        if heal:
+            commands[role.id] = selected(state, role.id, heal, '血量过低且近敌，紧急用药')
             continue
         budget_state = copy(state)
         budget_state.team_our = copy(state.team_our)
