@@ -79,7 +79,7 @@ class FolkLegendTests(unittest.TestCase):
         state, _ = defended_state(gold=40)
         pioneer = make_role(3, 5, 5, "pioneer", health=200, back_pack_capability=40)
         state.team_our.roles.append(pioneer)
-        state.round_no = 270
+        state.round_no = 400
         state.weapon_shop_list = [ShopItem("AcientTablet", 15)]
         state.world_news = WorldNews(
             official_news="",
@@ -95,6 +95,22 @@ class FolkLegendTests(unittest.TestCase):
         handled, cmd = decide_treasure(pioneer, state, build_blocked_set(state), set())
         self.assertEqual(cmd["action"], "summonTreasure")
         self.assertEqual(cmd["item"], ["AcientTablet"])
+
+    def test_does_not_buy_treasure_items_before_day_four(self):
+        state, _ = defended_state(gold=400)
+        pioneer = make_role(3, 5, 5, "pioneer", health=200, back_pack_capability=40)
+        state.team_our.roles.append(pioneer)
+        state.round_no = 140
+        state.weapon_shop_list = [ShopItem("AcientTablet", 15)]
+        state.world_news = WorldNews(
+            official_news="",
+            folk_legends="携带AcientTablet在(6, 5)召唤。第3天。",
+        )
+        ingest_news(state)
+        handled, cmd = decide_treasure(pioneer, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e.get("code") == "treasure_buy_deferred" for e in state.decision_events))
 
     def test_maybe_prompt_uses_daily_quota_and_parses_llm(self):
         state = minimal_state(round_no=140)

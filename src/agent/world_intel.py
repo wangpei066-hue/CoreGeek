@@ -305,6 +305,13 @@ def decide_treasure(role, state, blocked, reserved):
     missing = [name for name in items if name not in role.backpack]
     from .brain import find_zone, item_cost
     if missing:
+        from .treasure import treasure_buys_allowed
+        from .news_memory import game_day
+        if not treasure_buys_allowed(state):
+            trace(state, role.id, "treasure_buy_deferred",
+                  "第四天前不买任务用品，金币留给武器升级",
+                  day=game_day(state.round_no), missing=missing)
+            return False, None
         shop = find_zone(state, "weaponShop")
         if shop is None:
             trace(state, role.id, "treasure_shop_missing", "传闻已抽出用品，但快照没有武器商店")

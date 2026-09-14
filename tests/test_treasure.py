@@ -67,7 +67,9 @@ class TreasureUnitTests(unittest.TestCase):
         self.memory.data["treasureStage"] = "gather"
 
     def test_buy_then_summon(self):
-        state, pioneer = make_state(round_no=210, pioneer_pos=(20, 20), backpack=[])
+        self.memory.data["treasureHypothesis"]["openFromRound"] = 390
+        self.memory.data["treasureHypothesis"]["openToRound"] = 520
+        state, pioneer = make_state(round_no=400, pioneer_pos=(20, 20), backpack=[])
         blocked, reserved = build_blocked_set(state), set()
         cmd = decide_treasure_action(pioneer, state, self.memory, blocked, reserved)
         self.assertEqual(cmd["action"], "move")
@@ -81,6 +83,14 @@ class TreasureUnitTests(unittest.TestCase):
         self.assertEqual(cmd["action"], "summonTreasure")
         self.assertEqual(cmd["item"], ["AcientTablet", "StarSand"])
         self.assertEqual(cmd["targetPos"], [{"x": 12, "y": 12}])
+
+    def test_does_not_buy_treasure_items_before_day_four(self):
+        state, pioneer = make_state(round_no=210, pioneer_pos=(14, 15), backpack=[])
+        blocked, reserved = build_blocked_set(state), set()
+        cmd = decide_treasure_action(pioneer, state, self.memory, blocked, reserved)
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e.get("code") == "treasure_buy_deferred" for e in state.decision_events))
+        self.assertFalse(treasure_should_claim_pioneer(state, pioneer, self.memory))
 
     def test_wait_outside_window(self):
         state, pioneer = make_state(round_no=100, backpack=["AcientTablet", "StarSand"])
