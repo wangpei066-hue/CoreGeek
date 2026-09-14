@@ -213,6 +213,10 @@ class PioneerTaskSolver:
                     execute = sandbox_command(EXEC_SCRIPT, dict(requestId=rid, command=s.pop('tool')))
                     s['stage'] = 'wait_tool'
                 s['pendingCommand'] = execute
+                # 远端平台只下载响应中的 prompt/executeCmd；把待执行命令也放入
+                # 会话历史，下一次生成 prompt 时即可和对应的沙盒结果配对。
+                s['history'].append({'requestId': rid, 'command': execute,
+                                     'stage': s['stage']})
             elif s['stage'] == 'ask':
                 if s['calls'] < 12:
                     prompt = self.make_prompt(state)
@@ -241,5 +245,7 @@ class PioneerTaskSolver:
 2. 已有充分证据：{"action":"submit","taskAnswer":"严格遵守任务要求的最终答案字符串"}
 taskAnswer是传给比赛submitAnswer的完整字符串；如果题目要求JSON答案，请将该JSON序列化在字符串中。
 找不到文档或有多个同名文件时，先用沙盒命令确认路径，不能凭空作答。
-''' + json.dumps({'phaseTask': state.phase_task, 'documents': self.session['documents'],
+''' + json.dumps({'requestId': self.session.get('requestId'),
+                   'task': state.phase_task,
+                   'documents': self.session['documents'],
                    'history': self.session['history'][-16:]}, ensure_ascii=False)

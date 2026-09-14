@@ -492,6 +492,11 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
             trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取', required_rounds=required)
             continue
         if chebyshev(pioneer.pos, task.task_position) <= 1:
+            trace(state, pioneer.id, 'accept_task', '先锋已到达任务点，发送接取任务指令',
+                  task_type=task.task_type,
+                  task_position={'x': task.task_position.x, 'y': task.task_position.y},
+                  timeout_rounds=task.timeout_rounds,
+                  score_reward=task.score_reward, gold_reward=task.gold_reward)
             return True, {"action": "acceptTask"}
         step = move_towards(pioneer.pos, task.task_position, blocked | reserved,
                             state.map_info.width, state.map_info.height)
