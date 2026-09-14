@@ -138,12 +138,13 @@ class GameServer:
             # 策略决策
             self.load_build_memory()
             self.match_state.update(data)
-            self.news_memory.ingest(self.match_state)
             self.match_state.news_memory = self.news_memory
+            # 先清空再 ingest/consume，避免解码 trace 被冲掉
+            self.match_state.decision_events = []
+            self.news_memory.ingest(self.match_state)
             self.prompt_router.consume_llm_resp(self.match_state)
             previous_commands = deepcopy(self.match_state.last_sent_command)
             before = snapshot(self.match_state)
-            self.match_state.decision_events = []
             started = perf_counter()
             role_command_map = self.strategy.decide(self.match_state)
             prompt, execute_cmd = self.task_solver.step(self.match_state, role_command_map)

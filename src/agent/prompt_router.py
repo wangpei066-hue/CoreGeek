@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Optional
 
 from .decision_log import trace
 from .news_memory import NewsMemory, game_day
 from .protocol import MatchState
+
+MARKER = "NEWS_INFER"
+
+
+def _log_infer(payload: dict) -> None:
+    print(json.dumps({"marker": MARKER, **payload}, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def _strip_fence(text: str) -> str:
@@ -95,11 +102,15 @@ class PromptRouter:
             return
         if pending == "treasure":
             self.memory.apply_treasure_llm(payload)
-            trace(state, None, "treasure_decoded", "民间传闻 LLM 解码完成", hypothesis=self.memory.data.get("treasureHypothesis"))
+            hyp = self.memory.data.get("treasureHypothesis")
+            trace(state, None, "treasure_decoded", "民间传闻 LLM 解码完成", hypothesis=hyp)
+            _log_infer({"event": "treasure_decoded", "roundNo": state.round_no, "hypothesis": hyp})
         elif pending == "ore":
             day = self.memory.data.get("officialDay") or game_day(state.round_no)
             self.memory.apply_ore_llm(payload, day)
-            trace(state, None, "ore_decoded", "官方消息 LLM 解码完成", effects=self.memory.data.get("oreEffects"))
+            effects = self.memory.data.get("oreEffects")
+            trace(state, None, "ore_decoded", "官方消息 LLM 解码完成", effects=effects)
+            _log_infer({"event": "ore_decoded", "roundNo": state.round_no, "effects": effects})
         self.memory.clear_pending()
 
     def request_prompt(self, state: MatchState) -> str:

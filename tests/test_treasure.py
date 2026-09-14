@@ -162,6 +162,32 @@ class TreasureHttpTests(unittest.TestCase):
         cmds = second.get_json()["roleCommandMap"]
         self.assertIn("10011", cmds)
         self.assertEqual(cmds["10011"]["action"], "summonTreasure")
+        # 解码结果应写入本回合决策报告，不被 decision_events 清空冲掉
+        reports = sorted((self.root / "logs").glob("decision_*.json"))
+        self.assertTrue(reports)
+        decoded = json.loads(reports[-1].read_text(encoding="utf-8"))
+        self.assertIn("treasure_decoded", json.dumps(decoded, ensure_ascii=False))
+        event_codes = [e.get("code") for e in decoded.get("events", [])]
+        self.assertIn("treasure_decoded", event_codes)
+
+    def test_heuristic_appears_in_http_decision_log(self):
+        self.payload["roundNo"] = 5
+        self.payload["worldNews"] = {
+            "officialNews": (
+                "矿业管理局紧急通报：北部铁矿区塌方，矿区将于明日全面停工，修复约需2天。"
+            ),
+            "folkLegends": "",
+        }
+        self.payload["phaseTask"] = "占住prompt的假任务"  # 避免本回合再发宝藏/矿价 LLM
+        resp = self.client.post("/", json=self.payload)
+        self.assertEqual(resp.status_code, 200)
+        reports = sorted((self.root / "logs").glob("decision_*.json"))
+        self.assertTrue(reports)
+        report = json.loads(reports[-1].read_text(encoding="utf-8"))
+        codes = [e.get("code") for e in report.get("events", [])]
+        self.assertIn("ore_heuristic", codes)
+        effects = self.server.news_memory.banned_ores(2)
+        self.assertIn("iron", effects)
 
     def test_task_solver_owns_prompt_during_phase_task(self):
         self.payload["phaseTask"] = "请计算1+1"

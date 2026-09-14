@@ -694,7 +694,8 @@ class V1Strategy(Strategy):
         self.validator = validator
 
     def decide(self, state: "MatchState") -> dict:
-        state.decision_events = []
+        # 不在此处清空 decision_events：server 已在 ingest/consume 前清空，
+        # 需保留 ore_decoded / treasure_decoded / ore_heuristic 等新闻推断记录。
         learn_from_last_round(state)
         if not state.team_our or not state.map_info:
             trace(state, None, "missing_state", "缺少队伍或地图快照，不能生成指令")
