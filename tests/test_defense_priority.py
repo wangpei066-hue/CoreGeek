@@ -102,28 +102,29 @@ class DefensePriorityTests(unittest.TestCase):
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            rocket = weapon_candidates(state, base, 'rocket')[0]
-            railgun = weapon_candidates(state, base, 'railgun')[0]
-            gatling = weapon_candidates(state, base, 'gatling')[0]
-            self.assertEqual(rocket[0], railgun[0])
-            self.assertEqual(rocket[0], gatling[0])
-            state.team_our.roles.append(make_role(50, rocket[0], rocket[1], 'rocket'))
-            rail = weapon_candidates(state, base, 'railgun')[0]
-            state.team_our.roles.append(make_role(51, rail[0], rail[1], 'railgun'))
-            gat = weapon_candidates(state, base, 'gatling')[0]
-            self.assertGreater(abs(rail[1] - 10), abs(rocket[1] - 10))
-            self.assertLess((gat[1] - rocket[1]) * (rail[1] - rocket[1]), 0)
+            first = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(50, first[0], first[1], 'rocket'))
+            second = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(51, second[0], second[1], 'rocket'))
+            third = weapon_candidates(state, base, 'rocket')[0]
+            self.assertEqual(first[0], second[0])
+            self.assertEqual(first[0], third[0])
+            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10))
+            self.assertLess((third[1] - first[1]) * (second[1] - first[1]), 0)
             state.team_our.roles.pop()
             state.team_our.roles.pop()
 
-    def test_rebuild_missing_wall_beats_weapon_upgrade(self):
+    def test_rebuild_missing_wall_beats_third_tier_upgrade(self):
         state = defended()
         state.team_our.gold_num = 200
+        weapons = [r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
+        weapons[0].level = 2
+        weapons[1].level = 2
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         worker = state.team_our.roles[1]
         worker.backpack = ['stone'] * 4
         commands = self.decide(state)
-        self.assertNotEqual(commands[1].get('name'), 'WeaponUpgradeVoucher1')
+        self.assertNotEqual(commands[1].get('name'), 'WeaponUpgradeVoucher2')
         self.assertIn(commands[1]['action'], ('build', 'move', 'collect'))
         if commands[1]['action'] == 'build':
             self.assertEqual(commands[1]['name'], 'wall')

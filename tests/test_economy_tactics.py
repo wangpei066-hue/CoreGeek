@@ -119,7 +119,7 @@ class EconomyTests(unittest.TestCase):
         self.assertEqual(sold_value, 34)
         self.assertEqual(role.backpack, [])
 
-    def test_first_day_never_sells_even_when_rich_low_health_or_out_of_gold(self):
+    def test_first_day_does_not_sell_before_three_rockets(self):
         for gold in (0, 75):
             state = opening_state()
             state.round_no = 45
@@ -131,7 +131,27 @@ class EconomyTests(unittest.TestCase):
             commands = V1Strategy(BasicActionValidator()).decide(state)
             self.assertFalse(any(c['action'] == 'sell' for c in commands.values()))
             self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
-            self.assertTrue(any(e['code'] == 'opening_defense_only' for e in state.decision_events))
+            self.assertTrue(any(e['code'] == 'opening_rockets_first' for e in state.decision_events))
+
+    def test_first_day_sells_after_rockets_when_ore_worth_about_130(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        role = state.team_our.roles[1]
+        role.pos = Pos(8, 9)
+        role.backpack = ['copper'] * 26
+        state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
+        state.map_info.zones.append(Zone(Pos(7, 9), 'weaponShop'))
+        from src.agent.protocol import ShopItem
+        state.vendor_shop_list = [ShopItem('copper', 5)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c['action'] == 'sell' for c in commands.values())
+                        or any(e['code'] == 'cashout_priority' for e in state.decision_events))
 
 
 class TacticalTests(unittest.TestCase):

@@ -19,23 +19,24 @@ def opening_state():
 
 
 class OpeningTests(unittest.TestCase):
-    def test_wanted_loadout_is_rocket_railgun_gatling(self):
+    def test_wanted_loadout_is_three_rockets(self):
         state = opening_state()
         self.assertEqual(pick_weapon_name(state), 'rocket')
         state.team_our.roles.append(make_role(20, 12, 10, 'rocket', level=1))
-        self.assertEqual(pick_weapon_name(state), 'railgun')
-        state.team_our.roles.append(make_role(21, 11, 10, 'railgun', level=1))
-        self.assertEqual(pick_weapon_name(state), 'gatling')
-        self.assertEqual(pick_weapon_name(state, ('gatling',)), 'rocket')
+        self.assertEqual(pick_weapon_name(state), 'rocket')
+        state.team_our.roles.append(make_role(21, 11, 10, 'rocket', level=1))
+        self.assertEqual(pick_weapon_name(state), 'rocket')
+        self.assertEqual(pick_weapon_name(state, ('rocket',)), 'rocket')
 
-    def test_initial_workers_gather_wall_material_before_weapons(self):
+    def test_initial_workers_build_rockets_before_walls(self):
         state = opening_state()
         commands = V1Strategy(BasicActionValidator()).decide(state)
         for role_id in (1, 2):
-            self.assertEqual(commands[role_id]['action'], 'move')
-        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '围墙' for e in state.decision_events))
+            self.assertIn(commands[role_id]['action'], ('move', 'build'))
+            if commands[role_id]['action'] == 'build':
+                self.assertEqual(commands[role_id]['name'], 'rocket')
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '武器' for e in state.decision_events))
         self.assertNotEqual(commands[1]['targetPos'], commands[2]['targetPos'])
-        self.assertEqual(state.team_our.gold_num, 75)
 
     def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
@@ -48,10 +49,16 @@ class OpeningTests(unittest.TestCase):
 
     def test_failed_wall_position_is_not_counted_as_completed(self):
         state = opening_state()
+        state.round_no = 50
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
         state.team_our.roles[2].backpack = ['stone'] * 4
         strategy = V1Strategy(BasicActionValidator())
         first = strategy.decide(state)
-        state.round_no = 1
+        state.round_no = 51
         state.last_round_role_action_results = {1: False, 2: False}
         second = strategy.decide(state)
         failed = {(c['targetPos'][0]['x'], c['targetPos'][0]['y'])
@@ -59,7 +66,7 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(all((c['targetPos'][0]['x'], c['targetPos'][0]['y']) not in failed
                             for c in second.values() if c['action'] == 'build'))
         phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
-        self.assertEqual(phase['weapons'], 0)
+        self.assertEqual(phase['weapons'], 3)
         self.assertEqual(phase['phase'], '围墙')
         self.assertEqual(phase['walls_completed'], 0)
         self.assertTrue(failed)
@@ -121,13 +128,12 @@ class OpeningTests(unittest.TestCase):
                     role.backpack.append('stone')
                 elif cmd['action'] == 'build':
                     if cmd['name'] == 'wall':
-                        self.assertEqual(sum(r.role_type in ('gatling', 'railgun', 'rocket') for r in state.team_our.roles), 0)
+                        self.assertGreaterEqual(sum(r.role_type == 'rocket' for r in state.team_our.roles), 3)
                         role.backpack.remove('stone')
                         wall_built = True
                     else:
-                        self.assertTrue(wall_built)
-                        self.assertEqual({(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'},
-                                         set(primary_wall_plan(state, state.team_our.roles[0])))
+                        self.assertFalse(wall_built)
+                        self.assertEqual(cmd['name'], 'rocket')
                         state.team_our.gold_num -= 25
                     pos = cmd['targetPos'][0]
                     state.team_our.roles.append(make_role(100+len(state.team_our.roles), pos['x'], pos['y'], cmd['name'], level=1, attack_range=10))
@@ -139,12 +145,12 @@ class OpeningTests(unittest.TestCase):
             if role.id in assignments:
                 weapon = assignments[role.id]
                 self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 1)
-        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
-        self.assertEqual(walls, set(primary_wall_plan(state, state.team_our.roles[0])))
         kinds = [r.role_type for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
-        self.assertEqual(sorted(kinds), ['gatling', 'railgun', 'rocket'])
-        rocket_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'rocket')
-        railgun_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'railgun')
-        gatling_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'gatling')
-        self.assertGreaterEqual(rocket_x, railgun_x)
-        self.assertGreaterEqual(railgun_x, gatling_x)
+        self.assertEqual(sorted(kinds), ['rocket', 'rocket', 'rocket'])
+        xs = [r.pos.x for r in state.team_our.roles if r.role_type == 'rocket']
+        self.assertEqual(len(set(xs)), 1)
+        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
+        primary = set(primary_wall_plan(state, state.team_our.roles[0]))
+        self.assertTrue(walls <= primary)
+        self.assertGreaterEqual(len(walls), 7)
+        self.assertLessEqual(len(walls), 8)

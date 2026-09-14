@@ -18,6 +18,8 @@ def begin_round(state):
         state.policy_memory['summon_attempts'] = []
     state.tactical_purchases = set()
     state.bombed_robots = set()
+    from .world_intel import ingest_news
+    ingest_news(state)
     from .brain import own_station
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)

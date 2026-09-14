@@ -9,6 +9,7 @@ SELL_VALUE = 10
 SELL_COUNT = 6
 SELL_FILL_RATIO = 0.20
 BUILD_STONE_RESERVE = 4
+VOUCHER_FUND_TARGET = 130
 
 
 THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
@@ -73,19 +74,26 @@ def ore_prices(state):
 
 def sellable_ores(role, state):
     from .brain import own_station
-    from .opening import active_wall_plan
+    from .opening import staged_wall_plan
     ores = Counter(i for i in role.backpack if i in ('stone', 'iron', 'copper'))
     base = own_station(state)
     reserve = 0
     if base and role.role_type == 'worker':
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
-        missing = len(set(active_wall_plan(state, base)) - walls)
+        missing = len(set(staged_wall_plan(state, base)) - walls)
         workers = max(1, sum(r.role_type == 'worker' and r.health > 0 for r in state.team_our.roles))
         reserve = min(BUILD_STONE_RESERVE, (missing + workers - 1) // workers)
         from .brain import max_health
         if base.health < max_health(base) * 0.7:
             reserve = min(reserve, 1)
     ores['stone'] = max(0, ores['stone'] - reserve)
+    from .world_intel import ores_in_spike, ores_to_stockpile
+    backpack_tight = bool(role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * 0.9)
+    if not backpack_tight:
+        spike = ores_in_spike(state)
+        for name in ores_to_stockpile(state):
+            if name not in spike:
+                ores[name] = 0
     return +ores
 
 
@@ -105,24 +113,39 @@ def liquidate(role, state, blocked, reserved):
     vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor']
     adjacent = any(chebyshev(role.pos, z.pos) <= 1 for z in vendors)
     triggers = []
-    if value >= SELL_VALUE:
-        triggers.append('可出售矿石估值达到10金币')
-    if sum(ores.values()) >= SELL_COUNT:
-        triggers.append('可出售矿石达到6个')
-    if role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * SELL_FILL_RATIO:
-        triggers.append('背包达到20%')
-    if role.health < max_health(role) * 0.6:
-        triggers.append('低血量携矿风险')
-    if 40 <= cycle_round < 70:
-        triggers.append('天黑前提前变现')
-    if 20 <= cycle_round < 50:
-        triggers.append('白天中段提前清仓，为防守消费留时间')
-    from .brain import own_station
-    base = own_station(state)
-    if base and base.health < max_health(base) * 0.8:
-        triggers.append('基地受损，提前变现用于防守')
-    if not (triggers or adjacent or role.id in committed):
-        return False, None
+    from .brain import item_cost, should_upgrade_weapon
+    waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
+    need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
+    voucher_need = item_cost('WeaponUpgradeVoucher1', state)
+    if (state.round_no or 0) < 70:
+        if need_voucher and state.team_our.gold_num < voucher_need and state.team_our.gold_num + value >= VOUCHER_FUND_TARGET:
+            triggers.append('筹集约130金币购买武器升级券')
+        elif role.id not in committed:
+            return False, None
+    else:
+        if value >= SELL_VALUE:
+            triggers.append('可出售矿石估值达到10金币')
+        if sum(ores.values()) >= SELL_COUNT:
+            triggers.append('可出售矿石达到6个')
+        if role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * SELL_FILL_RATIO:
+            triggers.append('背包达到20%')
+        if role.health < max_health(role) * 0.6:
+            triggers.append('低血量携矿风险')
+        if 40 <= cycle_round < 70:
+            triggers.append('天黑前提前变现')
+        if 20 <= cycle_round < 50:
+            triggers.append('白天中段提前清仓，为防守消费留时间')
+        from .brain import own_station
+        base = own_station(state)
+        if base and base.health < max_health(base) * 0.8:
+            triggers.append('基地受损，提前变现用于防守')
+        if need_voucher and state.team_our.gold_num < voucher_need and state.team_our.gold_num + value >= VOUCHER_FUND_TARGET:
+            triggers.append('筹集购买武器升级券')
+        from .world_intel import ores_in_spike
+        if ores_in_spike(state) & set(ores):
+            triggers.append('官方消息涨价窗口，优先卖出对应矿石')
+        if not (triggers or adjacent or role.id in committed):
+            return False, None
     choices = []
     for vendor in vendors:
         path = adjacent_path(role, vendor.pos, blocked | reserved, state)
@@ -157,6 +180,7 @@ def liquidate(role, state, blocked, reserved):
 def profitable_mine(role, state, blocked, reserved):
     """按一批10次采集的报价/行程估算选择可达矿点；不按纯距离挑矿。"""
     from .opening import adjacent_path, move_on_path
+    from .world_intel import ore_blocked, ores_to_stockpile
     if len(role.backpack) >= role.back_pack_capability:
         trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
         return None
@@ -166,11 +190,15 @@ def profitable_mine(role, state, blocked, reserved):
     for mine in state.map_info.zones:
         if mine.neutral_type not in ('stone', 'iron', 'copper'):
             continue
+        if ore_blocked(state, mine.neutral_type):
+            continue
         path = adjacent_path(role, mine.pos, blocked | reserved, state)
         if path is None:
             continue
         return_distance = min((chebyshev(mine.pos, v.pos) for v in vendors), default=0)
         score = 10 * prices.get(mine.neutral_type, 1) / (len(path) + 10 + return_distance + 1)
+        if mine.neutral_type in ores_to_stockpile(state):
+            score *= 3
         candidates.append((score, -len(path), mine, path))
     if not candidates:
         trace(state, role.id, 'no_reachable_mine', '当前没有可达矿点')

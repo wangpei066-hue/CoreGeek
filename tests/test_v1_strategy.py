@@ -130,7 +130,7 @@ class V1StrategyDayTests(unittest.TestCase):
         self.strategy = V1Strategy(self.validator)
 
     def test_worker_moves_toward_nearest_mine(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(15, 10), neutral_type="stone")])
         worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
@@ -139,7 +139,7 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010]["action"], "move")
 
     def test_worker_collects_when_adjacent_to_mine(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="stone")])
         worker = make_role(10010, 10, 10, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
@@ -282,7 +282,7 @@ class SelfHealTests(unittest.TestCase):
         self.assertEqual(commands[10020]['action'], 'attack')
 
     def test_wall_material_collection_preempts_self_heal(self):
-        state = minimal_state(round_no=5)
+        state = minimal_state(round_no=135)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="stone")])
         hurt_worker = make_role(10010, 10, 10, "worker", health=50, backpack=["Medicine"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], hurt_worker]

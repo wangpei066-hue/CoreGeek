@@ -17,8 +17,10 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         commands = self.decide(state)
         self.assertEqual(commands[3], {'action': 'acceptTask'})
         for worker in (1, 2):
-            self.assertEqual(commands[worker]['action'], 'move')
-        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '围墙' for e in state.decision_events))
+            self.assertIn(commands[worker]['action'], ('move', 'build'))
+            if commands[worker]['action'] == 'build':
+                self.assertEqual(commands[worker]['name'], 'rocket')
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '武器' for e in state.decision_events))
 
     def test_opening_active_task_yields_at_muster_time(self):
         for round_no in (0, 69):

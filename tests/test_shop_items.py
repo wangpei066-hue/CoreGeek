@@ -105,25 +105,36 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
         self.assertEqual(job["kind"], "weapon")
 
-    def test_weapon_upgrade_order_is_rocket_then_railgun_then_gatling(self):
+    def test_weapon_upgrade_picks_frontmost_lowest_level(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
-        gatling = make_role(21, 10, 8, "gatling", level=1)
-        railgun = make_role(22, 11, 8, "railgun", level=1)
-        rocket = make_role(23, 12, 8, "rocket", level=2)
-        state.team_our.roles += [gatling, railgun, rocket]
+        rear = make_role(21, 10, 8, "rocket", level=1)
+        mid = make_role(22, 11, 8, "rocket", level=1)
+        front = make_role(23, 12, 8, "rocket", level=2)
+        state.team_our.roles += [rear, mid, front]
         worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (11, 8))
+        self.assertEqual(state.worker_item_jobs[1]["item"], "WeaponUpgradeVoucher1")
+        state.worker_item_jobs.clear()
+        mid.level = 2
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (10, 8))
+        state.worker_item_jobs.clear()
+        rear.level = 2
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["target"], (12, 8))
         self.assertEqual(state.worker_item_jobs[1]["item"], "WeaponUpgradeVoucher2")
-        state.worker_item_jobs.clear()
-        rocket.level = 3
+
+    def test_unbought_rear_upgrade_yields_to_front_rocket(self):
+        state = minimal_state(gold_num=1000)
+        rear = make_role(21, 10, 8, "rocket", level=1)
+        front = make_role(23, 12, 8, "rocket", level=1)
+        state.team_our.roles += [rear, front]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        state.worker_item_jobs[1] = {"item": "WeaponUpgradeVoucher1", "target": (10, 8), "kind": "weapon"}
         maybe_start_shop_item_job(worker, state)
-        self.assertEqual(state.worker_item_jobs[1]["target"], (11, 8))
-        state.worker_item_jobs.clear()
-        railgun.level = 3
-        maybe_start_shop_item_job(worker, state)
-        self.assertEqual(state.worker_item_jobs[1]["target"], (10, 8))
+        self.assertEqual(state.worker_item_jobs[1]["target"], (12, 8))
 
     def test_weapon_upgrade_beats_repair(self):
         state = minimal_state(gold_num=1000)

@@ -143,6 +143,11 @@ class GameServer:
             started = perf_counter()
             role_command_map = self.strategy.decide(self.match_state)
             prompt, execute_cmd = self.task_solver.step(self.match_state, role_command_map)
+            if not prompt:
+                from .world_intel import maybe_prompt
+                news_prompt, news_cmd = maybe_prompt(self.match_state)
+                prompt = prompt or news_prompt
+                execute_cmd = execute_cmd or news_cmd
             diagnostic_cmd = task_diagnostics(
                 self.match_state, role_command_map, previous_commands,
                 self.task_solver.session.get('stage', 'idle'),
