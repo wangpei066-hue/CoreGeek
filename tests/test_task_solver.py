@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from src.agent import GameServer
-from src.agent.task_solver import extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT
+from src.agent.task_solver import extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT, task_context
 
 
 class TaskSolverTests(unittest.TestCase):
@@ -29,6 +29,15 @@ class TaskSolverTests(unittest.TestCase):
     def post(self):
         response = self.client.post('/', json=self.payload)
         self.assertEqual(response.status_code, 200)
+        exchanges = [record for line in self.output.getvalue().splitlines()
+                     if line.startswith('{')
+                     and (record := json.loads(line)).get('marker') == 'PIONEER_TASK_EXCHANGE']
+        received, sent = exchanges[-2:]
+        self.assertEqual(received['event'], 'request')
+        self.assertEqual(sent['event'], 'response')
+        self.assertEqual(received['sequence'], sent['sequence'])
+        self.assertEqual(received['payload'], self.payload)
+        self.assertEqual(sent['payload'], response.json)
         return response.json
 
     def next_round(self, **values):
@@ -75,8 +84,131 @@ class TaskSolverTests(unittest.TestCase):
         self.assertNotIn('10011', sixth['roleCommandMap'])
         self.assertEqual(sixth['prompt'], '')
         final = self.next_round(phaseTask='')
-        self.assertEqual(final['executeCmd'], '')
+        # 任务结束后，空闲沙盒可继续回传 main 的新闻诊断。
+        if final['executeCmd']:
+            record = json.loads(self.sandbox(final['executeCmd']).split('\n', 1)[1])
+            self.assertEqual(record['marker'], 'NEWS_INFER')
         self.assertEqual(self.server.task_solver.session, {})
+
+    def test_workspace_execution_survives_restart(self):
+        workspace = self.root / 'project with spaces'
+        workspace.mkdir()
+        (workspace / 'task.md').write_text('将 result.txt 写入 done，再检查文件内容。')
+        (self.root / 'task.md').write_text('错误目录的任务')
+        self.payload['phaseTask'] = f'工作区路径：`{workspace}`，读取 `task.md` 并完成任务'
+        first = self.post()
+        prompt = self.next_round(lastCmdResult=self.sandbox(first['executeCmd']))['prompt']
+        self.assertIn('将 result.txt', prompt)
+        self.assertNotIn('错误目录的任务', prompt)
+        self.assertEqual(self.server.task_solver.session['taskKind'], 'workspace')
+        action = self.next_round(llmResp=json.dumps(dict(action='execute', command='printf done > result.txt')))
+        feedback = self.sandbox(action['executeCmd'])
+        self.assertEqual((workspace / 'result.txt').read_text(), 'done')
+        self.assertFalse((self.root / 'result.txt').exists())
+        self.server = GameServer(self.root)
+        self.client = self.server.app.test_client()
+        self.next_round(lastCmdResult=feedback)
+        verify = self.next_round(llmResp=json.dumps(dict(action='execute', command='cat result.txt')))
+        result = self.sandbox(verify['executeCmd'])
+        self.assertIn('done', result)
+
+    def test_workspace_missing_document_does_not_search_other_projects(self):
+        workspace = self.root / 'project'
+        workspace.mkdir()
+        (self.root / 'task.md').write_text('unrelated')
+        feedback = self.sandbox(sandbox_command(READ_SCRIPT, dict(
+            requestId='scoped', path='task.md', workspace=str(workspace))))
+        result = json.loads(feedback.split('\n', 1)[1])
+        self.assertIn('error', result)
+        self.assertNotIn('content', result)
+
+    def test_api_context_and_explicit_workspace(self):
+        self.assertEqual(task_context('调用API http://service/query'), dict(taskKind='api', workspace=None))
+        self.assertEqual(task_context('工作区路径：/app/project，任务描述 task.md')['workspace'], '/app/project')
+        self.payload['phaseTask'] = '调用API查询天气，接口说明已在任务中给出'
+        self.assertIn('"taskKind": "api"', self.post()['prompt'])
+        workspace = self.root / 'api'
+        workspace.mkdir()
+        action = self.next_round(llmResp=json.dumps(dict(
+            action='execute', command='pwd', workspace=str(workspace))))
+        self.assertIn(str(workspace), self.sandbox(action['executeCmd']))
+        self.assertEqual(self.server.task_solver.session['workspace'], str(workspace))
+
+    def test_gamma_deployment_example(self):
+        task = ('修复应用gamma部署，任务背景是：应用gamma的部署环境在本任务文件所在目录的'
+                r'ws\_3/ /tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws\_3/ 中，'
+                '请完成修复。任务要求是进入工作区，阅读spec.md修复所有问题，运行./check验证，'
+                '当./check全部通过并输出TOKEN:xxx时，任务完成，提交为{"token":"xxx"}')
+        self.assertEqual(task_context(task), dict(taskKind='workspace',
+            workspace='/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_3/'))
+        self.assertEqual(extract_md_paths(task), ['spec.md'])
+        workspace = self.root / 'ws_3'
+        workspace.mkdir()
+        (workspace / 'spec.md').write_text('修复deployment.txt，使其内容为ready，然后运行./check。')
+        checker = workspace / 'check'
+        checker.write_text('#!/bin/sh\n[ "$(cat deployment.txt)" = ready ] || exit 1\nprintf "All passed\\nTOKEN:gamma-verified\\n"\n')
+        checker.chmod(0o755)
+        self.payload['phaseTask'] = task.replace(
+            r'/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws\_3/', str(workspace) + '/')
+        response = self.post()
+        prompt = self.next_round(lastCmdResult=self.sandbox(response['executeCmd']))['prompt']
+        self.assertIn('修复deployment.txt', prompt)
+        action = self.next_round(llmResp=json.dumps(dict(action='execute', command='./check')))
+        feedback = self.sandbox(action['executeCmd'])
+        self.assertEqual(json.loads(feedback.split('\n', 1)[1])['exitCode'], 1)
+        self.next_round(lastCmdResult=feedback)
+        action = self.next_round(llmResp=json.dumps(dict(
+            action='execute', command='printf ready > deployment.txt && ./check')))
+        feedback = self.sandbox(action['executeCmd'])
+        self.assertIn('TOKEN:gamma-verified', feedback)
+        self.next_round(lastCmdResult=feedback)
+        response = self.next_round(llmResp=json.dumps(dict(
+            action='submit', taskAnswer=json.dumps({'token': 'gamma-verified'}))))
+        answer = response['roleCommandMap']['10011']['taskAnswer']
+        self.assertEqual(json.loads(answer), {'token': 'gamma-verified'})
+
+    def test_ambiguous_workspace_and_api_url_are_not_guessed(self):
+        self.assertIsNone(task_context('部署环境可能位于 /tmp/one/ 或 /tmp/two/ ，进入工作区阅读spec.md')['workspace'])
+        self.assertIsNone(task_context('修复API，地址 https://service/api/')['workspace'])
+
+    def test_discovered_text_instructions_and_custom_submission(self):
+        workspace = self.root / 'delta release'
+        workspace.mkdir()
+        (workspace / 'repair.txt').write_text(
+            '写入 deployed 文件，再运行 python3 verify.py，成功后提交 {"receipt":"实际回执"}。' + ' ' * 6000 + '不要提交token。')
+        (workspace / 'verify.py').write_text(
+            'from pathlib import Path\nassert Path("deployed").read_text() == "yes"\nprint("RECEIPT=delta-ok")\n')
+        self.payload['phaseTask'] = f'工作目录：`{workspace}`。根据目录中的说明修复应用。'
+        self.assertTrue(self.post()['prompt'])
+        action = self.next_round(llmResp=json.dumps(dict(action='execute', command='ls')))
+        prompt = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))['prompt']
+        self.assertIn('repair.txt', prompt)
+        action = self.next_round(llmResp=json.dumps(dict(action='read', path='repair.txt')))
+        page = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))
+        self.assertTrue(page['executeCmd'])
+        prompt = self.next_round(lastCmdResult=self.sandbox(page['executeCmd']))['prompt']
+        self.assertIn('不要提交token', prompt)
+        action = self.next_round(llmResp=json.dumps(dict(action='execute',
+            command='printf yes > deployed && python3 verify.py')))
+        prompt = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))['prompt']
+        self.assertIn('RECEIPT=delta-ok', prompt)
+        result = self.next_round(llmResp=json.dumps(dict(action='submit',
+            taskAnswer=json.dumps({'receipt': 'delta-ok'}))))
+        self.assertEqual(json.loads(result['roleCommandMap']['10011']['taskAnswer']), {'receipt': 'delta-ok'})
+
+    def test_unresolved_workspace_defers_relative_document_read(self):
+        self.payload['phaseTask'] = '在本任务文件所在目录的工程内修复应用，阅读instructions.md'
+        first = self.post()
+        self.assertTrue(first['prompt'])
+        self.assertEqual(self.server.task_solver.session['stage'], 'wait_llm')
+        workspace = self.root / 'resolved'
+        workspace.mkdir()
+        (workspace / 'instructions.md').write_text('真实任务说明')
+        action = self.next_round(llmResp=json.dumps(dict(action='read',
+            path='instructions.md', workspace=str(workspace))))
+        prompt = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))['prompt']
+        self.assertIn('真实任务说明', prompt)
+        self.assertEqual(Path(self.server.task_solver.session['workspace']).resolve(), workspace.resolve())
 
     def test_paged_read(self):
         doc = self.root / 'long.md'
@@ -104,6 +236,31 @@ class TaskSolverTests(unittest.TestCase):
         self.assertEqual(submit['roleCommandMap']['10011']['taskAnswer'], '2')
         retry = self.next_round(errors=[{'errorCode': 2, 'description': '答案不完全正确'}])
         self.assertIn('答案不完全正确', retry['prompt'])
+
+    def test_raw_llm_response_goes_to_stderr_not_local_logs(self):
+        self.post()
+        replies = [
+            ('请计算1+1，仅返回数字', '非法响应' * 2000),
+            ('新的题目', '{"action":"submit","taskAnswer":"旧答案"}'),
+            ('新的题目', '{"action":"submit","taskAnswer":"新答案"}'),
+            ('', '任务结束时的响应'),
+        ]
+        for seq, (task, reply) in enumerate(replies, start=2):
+            with self.subTest(seq=seq):
+                self.next_round(phaseTask=task, llmResp=reply)
+                record = json.loads((self.root / f'logs/request_{seq:06d}.json').read_text())
+                self.assertNotIn('llmResp', record)
+                if seq == 2:
+                    for path in (*self.root.glob('logs/*.json'),
+                                 *self.root.glob('state/*.json')):
+                        self.assertNotIn(reply, path.read_text())
+                diagnostics = [json.loads(line) for line in self.output.getvalue().splitlines()
+                               if line.startswith('{')]
+                self.assertTrue(any(item.get('marker') == 'PIONEER_TASK_EXCHANGE'
+                                    and item.get('event') == 'request'
+                                    and item.get('payload', {}).get('llmResp') == reply
+                                    and item.get('roundNo') == self.payload['roundNo']
+                                    for item in diagnostics))
 
     def test_wrong_sandbox_correlation_does_not_feed_llm(self):
         self.payload['phaseTask'] = '阅读 `/task.md`'

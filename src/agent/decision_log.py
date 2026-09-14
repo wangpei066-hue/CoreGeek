@@ -268,6 +268,9 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "diagnostics": metrics,
         "phase": phase, "phase_basis": "策略按roundNo从0起算；官方起点尚待核验",
+        # phaseTask 是 pioneer 接取任务后由系统返回的任务原文；写入决策日志，
+        # 使接取动作与后续收到的任务内容可以在同一日志序列中关联。
+        "phase_task": state.phase_task,
         "decision_ms": round(elapsed_ms, 3),
         "summary": {"gold": before["gold"], "weapons": sum(counts[t] for t in ("gatling", "railgun", "rocket")),
                     "walls": counts["wall"], "bases": [asdict(r) for r in roles if r.role_type == "station"],

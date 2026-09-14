@@ -1,10 +1,22 @@
 """任务诊断：进程 stderr + 判题器沙盒输出（下一回合 lastCmdResult）。"""
 import json
 import shlex
+import sys
 
 from .log_format import emit_stderr
 
 MARKER = "PIONEER_TASK"
+
+
+def log_task_exchange(event, sequence, payload, session, round_no):
+    """完整记录平台收发数据；不截断、不落盘，request/response以sequence配对。"""
+    print(json.dumps({
+        "marker": "PIONEER_TASK_EXCHANGE", "event": event,
+        "sequence": sequence, "roundNo": round_no,
+        "solverStage": session.get("stage", "idle"),
+        "requestId": session.get("requestId"),
+        "payload": payload,
+    }, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def task_diagnostics(state, commands, previous_commands, solver_stage="idle"):

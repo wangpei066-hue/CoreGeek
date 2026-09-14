@@ -61,7 +61,11 @@ class PioneerTaskTests(unittest.TestCase):
             data = self.payload()
             response = client.post('/', json=data)
             self.assertEqual(response.json['roleCommandMap']['10011'], {'action': 'acceptTask'})
-            self.assertEqual(response.json['executeCmd'], '')
+            # 接取尚未生效时不能运行解题命令，但允许新闻诊断。
+            if response.json['executeCmd']:
+                news = subprocess.run(['sh', '-c', response.json['executeCmd']],
+                                      capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(news.stdout)['marker'], 'NEWS_INFER')
             data.update(roundNo=11, phaseTask="查询天气：'；$(exit 9) `exit 8`\n下一行",
                         lastRoundRoleActionResults={'10011': True})
             response = client.post('/', json=data)
@@ -81,7 +85,11 @@ class PioneerTaskTests(unittest.TestCase):
             data.update(roundNo=13, phaseTask='')
             for task in data['teamOur']['playerTasks']:
                 task.update(isValid=False, coldDownRounds=30)
-            self.assertEqual(client.post('/', json=data).json['executeCmd'], '')
+            final = client.post('/', json=data).json
+            if final['executeCmd']:
+                news = subprocess.run(['sh', '-c', final['executeCmd']],
+                                      capture_output=True, text=True, check=True)
+                self.assertEqual(json.loads(news.stdout)['marker'], 'NEWS_INFER')
 
 
 if __name__ == '__main__':
