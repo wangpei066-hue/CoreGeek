@@ -14,7 +14,9 @@ STONE_BATCH = 6  # 墙阶段两名工人各备半圈，减少往返。
 MUSTER_BUFFER = 3
 DAY1_WALL_TARGET = 8
 DAY2_WALL_TARGET = 12
-WALL_AFTER_UPGRADE_ROUNDS = 32
+VOUCHER_USE_SLACK = 4  # 买券后走到最前火箭并使用的余量，不是官方耗时。
+WALL_STEP_SLACK = 1    # 每段墙在建造外再留1回合走位。
+FALLBACK_TRAVEL = 8
 
 
 def path_to_any(start, goals, blocked, width, height):
@@ -105,6 +107,96 @@ def primary_wall_plan(state, base):
 
 def day_index(state):
     return (state.round_no or 0) // 130
+
+
+def _shortest_adjacent(roles, targets, blocked, state):
+    best = None
+    for role in roles:
+        for target in targets:
+            path = adjacent_path(role, target, blocked, state)
+            if path is None:
+                continue
+            cost = len(path)
+            if best is None or cost < best:
+                best = cost
+    return FALLBACK_TRAVEL if best is None else best
+
+
+def wall_finish_rounds(state, missing, blocked):
+    """两名工人补完当前阶段墙的回合下界：缺石采集 + 走到缺口 + 每段建造。"""
+    n = len(missing)
+    if n <= 0:
+        return 0
+    workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
+    hands = max(1, len(workers))
+    stones = sum(r.backpack.count('stone') for r in workers)
+    collect = max(0, n - stones)
+    mines = [z.pos for z in state.map_info.zones if z.neutral_type == 'stone']
+    mine_travel = _shortest_adjacent(workers, mines, blocked, state) if collect and mines else 0
+    gaps = [Pos(*p) for p in missing]
+    gap_travel = _shortest_adjacent(workers, gaps, blocked, state) if gaps else 0
+    return mine_travel + -(-collect // hands) + gap_travel + n * WALL_STEP_SLACK + -(-n // hands)
+
+
+def voucher_trip_rounds(state, blocked, gold, need_sell):
+    """买并使用一张武器升级券的路程估计；需要卖矿时计入小贩往返。"""
+    from .brain import item_cost
+    workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
+    shops = [z.pos for z in state.map_info.zones if z.neutral_type == 'weaponShop']
+    shop_travel = _shortest_adjacent(workers, shops, blocked, state) if shops else FALLBACK_TRAVEL
+    trip = shop_travel + 1 + VOUCHER_USE_SLACK
+    if gold >= item_cost('WeaponUpgradeVoucher1', state) or any(
+            'WeaponUpgradeVoucher1' in r.backpack for r in workers):
+        return trip
+    if not need_sell:
+        return trip
+    vendors = [z.pos for z in state.map_info.zones if z.neutral_type == 'vendor']
+    if not vendors:
+        return None
+    return _shortest_adjacent(workers, vendors, blocked, state) + 3 + trip
+
+
+def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked):
+    """首日切换点：剩下的回合必须够修完7-8段墙；若再买券就会误工则先修墙。"""
+    wall_need = wall_finish_rounds(state, missing, blocked)
+    wall_deadline = wall_need + muster_need
+    can_finish_walls = remaining > wall_deadline
+    has_voucher = any('WeaponUpgradeVoucher1' in r.backpack
+                      for r in state.team_our.roles if r.role_type in ('worker', 'pioneer'))
+    from .brain import item_cost
+    voucher_cost = item_cost('WeaponUpgradeVoucher1', state)
+    gold_ready = gold >= voucher_cost or has_voucher
+    sell_trip = voucher_trip_rounds(state, blocked, gold, need_sell=not gold_ready)
+    if upgraded_once:
+        return {
+            'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
+            'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
+            'can_finish_walls': can_finish_walls,
+        }
+    if remaining <= wall_deadline:
+        # 只够修墙和回防，不再卖矿或绕路买券。
+        return {
+            'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
+            'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
+            'can_finish_walls': can_finish_walls,
+        }
+    if gold_ready:
+        return {
+            'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
+            'allow_walls': True, 'allow_upgrade': True, 'allow_sell': False, 'allow_mine': False,
+            'can_finish_walls': can_finish_walls,
+        }
+    if sell_trip is None or remaining <= wall_deadline + sell_trip:
+        return {
+            'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
+            'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
+            'can_finish_walls': can_finish_walls,
+        }
+    return {
+        'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
+        'allow_walls': False, 'allow_upgrade': True, 'allow_sell': True, 'allow_mine': True,
+        'can_finish_walls': can_finish_walls,
+    }
 
 
 def staged_wall_plan(state, base):
@@ -283,18 +375,26 @@ def plan_opening(state):
     remaining = 70 - state.round_no
     travel = [station_path(r, assignments[r.id], blocked - {(a.pos.x, a.pos.y) for a in fighters}, state)
               for r in fighters if r.id in assignments]
-    muster = bool(weapons) and (remaining <= max([len(p) for p in travel if p is not None] + [0]) + MUSTER_BUFFER)
+    muster_need = max([len(p) for p in travel if p is not None] + [0]) + MUSTER_BUFFER
+    muster = bool(weapons) and remaining <= muster_need
     upgraded_once = any((w.level or 1) >= 2 for w in weapons)
     has_three = len(weapons) >= 3
-    allow_walls = has_three and (upgraded_once or remaining <= WALL_AFTER_UPGRADE_ROUNDS)
+    gold, builds = state.team_our.gold_num, 0
+    budget = opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked)
+    allow_walls = has_three and budget['allow_walls']
+    allow_upgrade = has_three and budget['allow_upgrade']
+    allow_sell = has_three and budget['allow_sell']
+    allow_mine = has_three and budget['allow_mine']
     if muster:
         phase = '就位'
     elif not has_three:
         phase = '武器'
-    elif not upgraded_once and remaining > WALL_AFTER_UPGRADE_ROUNDS:
+    elif allow_upgrade and not allow_walls:
         phase = '筹资升级'
-    elif missing:
+    elif missing and allow_walls:
         phase = '围墙'
+    elif allow_upgrade:
+        phase = '筹资升级'
     else:
         phase = '就位'
     trace(state, None, 'opening_phase', '第一天阶段计划', phase=phase, weapons=len(weapons),
@@ -302,11 +402,14 @@ def plan_opening(state):
           geometry_note='先三座火箭，再升最前一门，迎敌墙约8段；格子合法性由执行反馈确认',
           rounds_to_night=remaining,
           attack_from='右侧' if attack_direction(state, base) == 1 else '左侧', direction_source='用户确认的刷新规则')
+    trace(state, None, 'opening_time_budget', '按剩余回合判断能否买券并修完7-8段墙',
+          remaining=remaining, wall_need=budget['wall_need'], wall_deadline=budget['wall_deadline'],
+          sell_trip=budget['sell_trip'], allow_walls=allow_walls, allow_upgrade=allow_upgrade,
+          allow_sell=allow_sell, gold=gold, upgraded=upgraded_once)
     trace(state, None, 'funnel_layout', '实验性双层防线；外层留口，己方从后方通行',
           gap=funnel_gap(state, base), layers=2 if outer_wall_ready(state) and funnel_gap(state, base) else 1,
           outer_unlocked=outer_wall_ready(state),
           effect_note='机器人可能直接攻击墙，分流效果需回放验证')
-    gold, builds = state.team_our.gold_num, 0  # 保留plan_pioneer_tasks已经生成的指令。
     claimed = set()
     # 开拓者先规划撤离，避免继续占住墙线和工人施工邻接格。
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
@@ -322,22 +425,23 @@ def plan_opening(state):
         budget_state.team_our.gold_num = gold
         trace(state, role.id, 'opening_rockets_first', '首日先三座火箭，再筹资升最前一门，再补迎敌7-8段墙')
         if has_three and not muster:
-            cmd = decide_shop_item_job(role, budget_state, blocked, reserved)
-            if not cmd and should_upgrade_weapon(budget_state):
-                maybe_start_shop_item_job(role, budget_state)
+            if allow_upgrade:
                 cmd = decide_shop_item_job(role, budget_state, blocked, reserved)
-            if cmd:
-                if cmd['action'] == 'buy':
-                    gold -= item_cost(cmd['name'], state)
-                commands[role.id] = cmd
-                continue
-            if any(z.neutral_type == 'vendor' for z in state.map_info.zones):
+                if not cmd and should_upgrade_weapon(budget_state):
+                    maybe_start_shop_item_job(role, budget_state)
+                    cmd = decide_shop_item_job(role, budget_state, blocked, reserved)
+                if cmd:
+                    if cmd['action'] == 'buy':
+                        gold -= item_cost(cmd['name'], state)
+                    commands[role.id] = cmd
+                    continue
+            if allow_sell and any(z.neutral_type == 'vendor' for z in state.map_info.zones):
                 handled, cmd = liquidate(role, budget_state, blocked, reserved)
                 if handled:
                     if cmd:
                         commands[role.id] = cmd
                     continue
-            if not allow_walls:
+            if allow_mine and not allow_walls:
                 cmd = profitable_mine(role, budget_state, blocked, reserved)
                 if cmd:
                     commands[role.id] = cmd

@@ -2,7 +2,7 @@
 import unittest
 
 from src.agent.brain import V1Strategy, BasicActionValidator, pick_weapon_name
-from src.agent.opening import wall_ring, primary_wall_plan, assign_weapons, safe_wall
+from src.agent.opening import wall_ring, primary_wall_plan, assign_weapons, safe_wall, opening_time_budget
 from src.agent.grid import build_blocked_set
 from src.agent.protocol import Pos, Zone, RobotRole
 from test_shop_items import minimal_state, make_role
@@ -70,6 +70,56 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(phase['phase'], '围墙')
         self.assertEqual(phase['walls_completed'], 0)
         self.assertTrue(failed)
+
+    def test_late_day_skips_selling_to_finish_walls(self):
+        state = opening_state()
+        state.round_no = 52
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(8, 9)
+        worker.backpack = ['copper'] * 26 + ['stone'] * 4
+        state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
+        from src.agent.protocol import ShopItem
+        state.vendor_shop_list = [ShopItem('copper', 5)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(c['action'] == 'sell' for c in commands.values()))
+        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_sell'] is False
+                            for e in state.decision_events))
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '围墙' for e in state.decision_events))
+
+    def test_enough_gold_buys_voucher_before_walls(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(8, 9)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c.get('name') == 'WeaponUpgradeVoucher1' for c in commands.values())
+                        or any(e['code'] == 'opening_time_budget' and e['allow_upgrade'] for e in state.decision_events))
+        buys = [c for c in commands.values() if c['action'] == 'buy']
+        if buys:
+            self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher1')
+
+    def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
+        state = opening_state()
+        state.round_no = 55
+        state.team_our.gold_num = 0
+        missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
+        budget = opening_time_budget(state, missing, 15, 3, 0, False, build_blocked_set(state))
+        self.assertTrue(budget['allow_walls'])
+        self.assertFalse(budget['allow_sell'])
+        self.assertFalse(budget['allow_upgrade'])
 
     def test_right_base_faces_left_after_switching_sides(self):
         state = opening_state()
