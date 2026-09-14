@@ -130,11 +130,21 @@ class DecisionLoggingTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
             emit_console_report(report)
-        record = json.loads(output.getvalue())
-        self.assertEqual(record['marker'], CONSOLE_MARKER)
-        self.assertEqual(record['summary']['gold'], 75)
+        lines = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+        markers = [row['marker'] for row in lines]
+        self.assertIn(CONSOLE_MARKER, markers)
+        self.assertIn('BUILD_WEAPON', markers)
+        self.assertIn('BUILD_WALL', markers)
+        self.assertIn('PIONEER_TASK', markers)
+        record = next(row for row in lines if row['marker'] == CONSOLE_MARKER)
+        self.assertEqual(record['event'], 'round')
+        self.assertEqual(record['gold'], 75)
         self.assertEqual(record['roles'][0]['id'], 1)
-        self.assertTrue(record['roles'][0]['reasons'])
+        self.assertIn('title', record)
+        self.assertNotIn('reasons', record['roles'][0])
+        weapon = next(row for row in lines if row['marker'] == 'BUILD_WEAPON')
+        self.assertEqual(weapon['event'], 'status')
+        self.assertIn('standing', weapon)
 
     def test_server_emits_console_strategy_record(self):
         output = io.StringIO()

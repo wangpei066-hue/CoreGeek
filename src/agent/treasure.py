@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .decision_log import selected, trace
+from .news_logging import log_news_event
 from .grid import build_blocked_set, chebyshev, move_towards
 from .news_memory import NewsMemory, game_day
 from .protocol import MatchState, Pos, Role
@@ -110,6 +111,11 @@ def handle_summon_result(state: MatchState, memory: NewsMemory) -> None:
     if not summoned and code not in (SUMMON_OK, SUMMON_EMPTY):
         return
     trace(state, None, "summon_result", "处理召唤宝藏结果码", result_code=code)
+    log_news_event(
+        event="summon_result", roundNo=state.round_no,
+        title=f"【宝藏】召唤结果码 {code}",
+        resultCode=code,
+    )
     if code == SUMMON_OK or code == SUMMON_EMPTY:
         memory.data["treasureEmpty"] = True
         memory.data["treasureStage"] = "done"

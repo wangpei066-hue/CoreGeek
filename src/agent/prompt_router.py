@@ -77,33 +77,54 @@ class PromptRouter:
         # 同回合重试：不重复消费
         if self.memory.data.get("pendingRound") == state.round_no:
             return
+        prompt_text = self.memory.data.get("pendingPrompt") or ""
         text = (state.llm_resp or "").strip()
         if not text:
             if state.round_no is not None and self.memory.data.get("pendingRound") is not None:
                 if state.round_no > self.memory.data["pendingRound"]:
                     trace(state, None, "llm_empty", "等待中的新闻/宝藏 LLM 响应为空，清除 pending 以便重试",
                           consumer=pending)
-                    log_news_event(event="llm_empty", roundNo=state.round_no, consumer=pending)
+                    log_news_event(
+                        event="llm_empty", roundNo=state.round_no,
+                        title=f"【LLM】{pending} 响应为空",
+                        consumer=pending, promptText=prompt_text,
+                    )
                     self.memory.clear_pending()
             return
         try:
             payload = parse_json_object(text)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             trace(state, None, "llm_parse_failed", "新闻/宝藏 LLM 输出无法解析", error=str(exc), consumer=pending)
-            log_news_event(event="llm_parse_failed", roundNo=state.round_no, consumer=pending, error=str(exc))
+            log_news_event(
+                event="llm_output", roundNo=state.round_no,
+                title=f"【LLM】{pending} 输出无法解析",
+                consumer=pending, promptText=prompt_text, llmRespRaw=text,
+                parsedJson=None, parseOk=False, applied=False, error=str(exc),
+            )
             self.memory.clear_pending()
             return
         if pending == "treasure":
             self.memory.apply_treasure_llm(payload)
             hyp = self.memory.data.get("treasureHypothesis")
             trace(state, None, "treasure_decoded", "民间传闻 LLM 解码完成", hypothesis=hyp)
-            log_news_event(event="treasure_decoded", roundNo=state.round_no, hypothesis=hyp)
+            log_news_event(
+                event="llm_output", roundNo=state.round_no,
+                title=f"【LLM】宝藏解码完成 ready={bool((hyp or {}).get('ready'))}",
+                consumer="treasure", promptText=prompt_text, llmRespRaw=text,
+                parsedJson=payload, parseOk=True, applied=True, hypothesis=hyp,
+            )
         elif pending == "ore":
             day = self.memory.data.get("officialDay") or game_day(state.round_no)
             self.memory.apply_ore_llm(payload, day)
             effects = self.memory.data.get("oreEffects")
             trace(state, None, "ore_decoded", "官方消息 LLM 解码完成", effects=effects)
-            log_news_event(event="ore_decoded", roundNo=state.round_no, effects=effects)
+            ore = payload.get("affectedOre")
+            log_news_event(
+                event="llm_output", roundNo=state.round_no,
+                title=f"【LLM】矿价解码完成 {ore or '?'}",
+                consumer="ore", promptText=prompt_text, llmRespRaw=text,
+                parsedJson=payload, parseOk=True, applied=True, effects=effects,
+            )
         self.memory.clear_pending()
 
     def request_prompt(self, state: MatchState) -> str:
@@ -121,8 +142,11 @@ class PromptRouter:
             prompt = make_treasure_prompt(state, self.memory)
             self.memory.mark_pending("treasure", state.round_no, prompt)
             trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])
-            log_news_event(event="llm_request", consumer="treasure", roundNo=state.round_no,
-                           used=self.memory.data["llmUsed"])
+            log_news_event(
+                event="prompt_sent", consumer="treasure", roundNo=state.round_no,
+                title="【LLM】发送宝藏解码 prompt",
+                promptText=prompt, used=self.memory.data["llmUsed"],
+            )
             return prompt
 
         if self.memory.data.get("needOreParse"):
@@ -132,8 +156,11 @@ class PromptRouter:
             self.memory.data["lastOreParseDay"] = game_day(state.round_no)
             self.memory.save()
             trace(state, None, "llm_request", "申请矿价新闻 LLM", used=self.memory.data["llmUsed"])
-            log_news_event(event="llm_request", consumer="ore", roundNo=state.round_no,
-                           used=self.memory.data["llmUsed"])
+            log_news_event(
+                event="prompt_sent", consumer="ore", roundNo=state.round_no,
+                title="【LLM】发送矿价解析 prompt",
+                promptText=prompt, used=self.memory.data["llmUsed"],
+            )
             return prompt
 
         return ""

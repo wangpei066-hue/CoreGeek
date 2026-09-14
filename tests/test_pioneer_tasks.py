@@ -73,7 +73,8 @@ class PioneerTaskTests(unittest.TestCase):
             data.update(roundNo=12, lastCmdResult='[exitCode:0]\n' + result.stdout)
             self.assertEqual(client.post('/', json=data).status_code, 200)
             records = [record for line in stderr.getvalue().splitlines()
-                       if (record := json.loads(line)).get('marker') == 'PIONEER_TASK']
+                       if (record := json.loads(line)).get('marker') == 'PIONEER_TASK'
+                       and record.get('event') in ('accept_requested', 'task_active')]
             self.assertEqual(records[1]['pioneers'][0]['previousCommand'], {'action': 'acceptTask'})
             self.assertTrue(records[1]['pioneers'][0]['lastActionLegal'])
             self.assertIn('PIONEER_TASK', records[2]['lastCmdResult'])
