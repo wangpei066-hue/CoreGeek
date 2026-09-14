@@ -97,14 +97,36 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapon_positions_are_range_ordered_on_both_sides(self):
-        state = defended()
+    def test_weapons_sit_on_front_column_and_both_flanks(self):
+        state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            positions = [weapon_candidates(state, base, kind)[0][0]*direction for kind in ('gatling', 'railgun', 'rocket')]
-            self.assertLess(positions[0], positions[1])
-            self.assertLess(positions[1], positions[2])
+            rocket = weapon_candidates(state, base, 'rocket')[0]
+            railgun = weapon_candidates(state, base, 'railgun')[0]
+            gatling = weapon_candidates(state, base, 'gatling')[0]
+            self.assertEqual(rocket[0], railgun[0])
+            self.assertEqual(rocket[0], gatling[0])
+            state.team_our.roles.append(make_role(50, rocket[0], rocket[1], 'rocket'))
+            rail = weapon_candidates(state, base, 'railgun')[0]
+            state.team_our.roles.append(make_role(51, rail[0], rail[1], 'railgun'))
+            gat = weapon_candidates(state, base, 'gatling')[0]
+            self.assertGreater(abs(rail[1] - 10), abs(rocket[1] - 10))
+            self.assertLess((gat[1] - rocket[1]) * (rail[1] - rocket[1]), 0)
+            state.team_our.roles.pop()
+            state.team_our.roles.pop()
+
+    def test_rebuild_missing_wall_beats_weapon_upgrade(self):
+        state = defended()
+        state.team_our.gold_num = 200
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        worker = state.team_our.roles[1]
+        worker.backpack = ['stone'] * 4
+        commands = self.decide(state)
+        self.assertNotEqual(commands[1].get('name'), 'WeaponUpgradeVoucher1')
+        self.assertIn(commands[1]['action'], ('build', 'move', 'collect'))
+        if commands[1]['action'] == 'build':
+            self.assertEqual(commands[1]['name'], 'wall')
 
     def test_primary_side_walls_reach_short_range_weapon_column(self):
         state = defended()
@@ -120,7 +142,7 @@ class DefensePriorityTests(unittest.TestCase):
         state = defended()
         for building in state.team_our.roles:
             if building.role_type in ('gatling', 'railgun', 'rocket'):
-                building.level = 2
+                building.level = 3
         for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
             state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1000, level=1))
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
@@ -129,6 +151,19 @@ class DefensePriorityTests(unittest.TestCase):
         self.assertFalse(outer_wall_ready(state))
         self.assertEqual(commands[1], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 1})
         self.assertEqual(active_wall_plan(state, state.team_our.roles[0]), primary_wall_plan(state, state.team_our.roles[0]))
+
+    def test_level_two_weapons_upgrade_before_walls(self):
+        state = defended()
+        state.team_our.gold_num = 200
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
+        for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
+            state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1000, level=1))
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        commands = self.decide(state)
+        self.assertEqual(commands[1]['action'], 'buy')
+        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher2')
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
         from src.agent.brain import maybe_start_shop_item_job

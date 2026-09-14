@@ -172,6 +172,18 @@ class TacticalTests(unittest.TestCase):
         begin_round(state)
         self.assertEqual(tactical_action(role, state, build_blocked_set(state), set())['action'], 'use')
 
+    def test_dizzy_used_only_under_pressure(self):
+        state, role = defended_state()
+        role.backpack = ['DizzyWeapon']
+        state.round_no = 140
+        self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set(), allow_travel=False))
+        state.round_no = 200
+        state.robot.roles = [RobotRole(i, Pos(15+i%2, 10+i//2), 'smallRobot', 40, target_team=state.team_our.type) for i in range(4)]
+        cmd = tactical_action(role, state, build_blocked_set(state), set(), allow_travel=False)
+        self.assertEqual(cmd['action'], 'use')
+        self.assertEqual(cmd['name'], 'DizzyWeapon')
+        BasicActionValidator().validate(cmd, state)
+
     def test_pressure_bomb_hits_cluster_and_avoids_duplicate_bomb(self):
         state, role = defended_state()
         state.round_no = 200

@@ -3,7 +3,7 @@ from .grid import chebyshev
 from .protocol import Pos
 from .decision_log import trace, selected
 
-ITEM_COSTS = {'Bomb': 100, 'SmallRobotSummonOrder': 20, 'MiddleRobotSummonOrder': 30,
+ITEM_COSTS = {'Bomb': 100, 'DizzyWeapon': 100, 'SmallRobotSummonOrder': 20, 'MiddleRobotSummonOrder': 30,
               'LargeRobotSummonOrder': 100, 'BossRobotSummonOrder': 200}
 DAILY_SUMMON_LIMIT = 10
 DEFENSE_RESERVE = 100
@@ -64,6 +64,27 @@ def bomb_target(state):
     return best if best and (best[0] >= 2 or best[1] >= 200 or (front_breached(state) and best[3])) else None
 
 
+def dizzy_target(state):
+    """高压下的眩晕落点：3×3 命中尽量多的威胁机器人。"""
+    robots = [r for r in threat_robots(state) if r.id not in state.bombed_robots]
+    if not robots or not state.map_info:
+        return None
+    candidates = {(r.pos.x + dx, r.pos.y + dy) for r in robots for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+    best = None
+    for x, y in sorted(candidates):
+        if not (0 <= x < state.map_info.width and 0 <= y < state.map_info.height):
+            continue
+        hits = [r for r in robots if chebyshev(Pos(x, y), r.pos) <= 1]
+        if best is None or len(hits) > len(best[0]):
+            best = (hits, Pos(x, y))
+    if not best:
+        return None
+    hits, point = best
+    if len(hits) >= 2 or front_breached(state) or pressure(state):
+        return hits, point
+    return None
+
+
 def tactical_action(role, state, blocked, reserved, allow_travel=True):
     from .brain import own_station, max_health, item_cost
     from .opening import adjacent_path, move_on_path
@@ -79,6 +100,12 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
         state.bombed_robots.update(r.id for r in hits)
         trace(state, role.id, 'emergency_bomb', '高防守压力下使用3×3炸弹，不把范围炸弹当作全图清除', expected_damage=damage, targets=[r.id for r in hits])
         return selected(state, role.id, {'action': 'use', 'name': 'Bomb', 'targetPos': [{'x': point.x, 'y': point.y}]}, '对密集机器人使用范围炸弹')
+    stun = dizzy_target(state) if urgent else None
+    if 'DizzyWeapon' in role.backpack and stun:
+        hits, point = stun
+        state.bombed_robots.update(r.id for r in hits)
+        trace(state, role.id, 'emergency_dizzy', '高防守压力下使用眩晕法宝，不在平时消耗', targets=[r.id for r in hits])
+        return selected(state, role.id, {'action': 'use', 'name': 'DizzyWeapon', 'targetPos': [{'x': point.x, 'y': point.y}]}, '高压下眩晕附近机器人')
     if breached and 'WallFixer' in role.backpack:
         damaged = [r for r in state.team_our.roles if r.role_type == 'wall' and 0 < r.health < max_health(r)*0.8
                    and chebyshev(role.pos, r.pos) <= 1 and ('repair', r.id) not in state.tactical_purchases]
@@ -102,6 +129,8 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     all_backpacks = [i for r in state.team_our.roles for i in r.backpack]
     if urgent and target and 'Bomb' not in all_backpacks and 'Bomb' not in state.tactical_purchases:
         item = 'Bomb'
+    elif urgent and stun and 'DizzyWeapon' not in all_backpacks and 'DizzyWeapon' not in state.tactical_purchases:
+        item = 'DizzyWeapon'
     elif (cycle_round < 70 and (state.round_no or 0) < 1240 and base and base.health >= max_health(base)*0.7
           and len(weapons) >= 3 and sum(r.role_type == 'wall' for r in state.team_our.roles) >= 6
           and all((r.level or 1) >= 2 for r in weapons)
@@ -121,11 +150,16 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     if not choices:
         return None
     path, _ = min(choices, key=lambda pair: len(pair[0]))
+    labels = {
+        'Bomb': ('前往商店购买应急炸弹', '购买应急炸弹'),
+        'DizzyWeapon': ('前往商店购买眩晕法宝', '购买眩晕法宝'),
+    }
+    travel_reason, buy_reason = labels.get(item, ('防守预算充足，前往商店购买干扰道具', '购买机器人召唤令干扰对手'))
     if path:
         # 正在防守的操控者不离炮购物；白天也不在临夜发动长途购物。
         if not allow_travel or cycle_round >= 70 or len(path)*2+5 >= 70-cycle_round:
             return None
-        return move_on_path(state, role, path, reserved, '前往商店购买应急炸弹' if item == 'Bomb' else '防守预算充足，前往商店购买干扰道具')
+        return move_on_path(state, role, path, reserved, travel_reason)
     state.tactical_purchases.add(item)
     trace(state, role.id, 'tactical_purchase', '战术消费', item=item, cost=item_cost(item, state), defense_reserve=reserve, pressure=urgent)
-    return selected(state, role.id, {'action': 'buy', 'name': item, 'num': 1}, '购买应急炸弹' if item == 'Bomb' else '购买机器人召唤令干扰对手')
+    return selected(state, role.id, {'action': 'buy', 'name': item, 'num': 1}, buy_reason)

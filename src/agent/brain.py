@@ -15,6 +15,9 @@ DAY_ROUNDS = 70
 NIGHT_ROUNDS = 60
 DAY_NIGHT_CYCLE = DAY_ROUNDS + NIGHT_ROUNDS
 WEAPON_TYPES = ("gatling", "railgun", "rocket")
+# 用户确认编制：三种武器各一座。火箭最前先手消耗，升级顺序火箭 > 电磁炮 > 加特林。
+WANTED_WEAPONS = ("rocket", "railgun", "gatling")
+_WEAPON_UPGRADE_ORDER = {"rocket": 0, "railgun": 1, "gatling": 2}
 MAX_WEAPONS = 3
 WEAPON_GOLD_COST = 25
 ORE_TYPES = ("stone", "iron", "copper")
@@ -123,12 +126,15 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
     return None
 
 
-def pick_weapon_name(state: "MatchState") -> str:
-    counts = Counter(r.role_type for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
-    for name in WEAPON_TYPES:
-        if counts.get(name, 0) == 0:
+def pick_weapon_name(state: "MatchState", extra_names=()) -> str:
+    """按编制补齐：火箭、电磁炮、加特林各一座。extra_names计入本回合已规划建造。"""
+    have = Counter(r.role_type for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
+    have.update(name for name in extra_names if name in WEAPON_TYPES)
+    wanted = Counter(WANTED_WEAPONS)
+    for name in WANTED_WEAPONS:
+        if have[name] < wanted[name]:
             return name
-    return min(WEAPON_TYPES, key=lambda n: counts.get(n, 0))
+    return "rocket"
 
 
 def voucher_for(kind: str, level: int):
@@ -202,7 +208,11 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda r: r.level or 1)
+    return min(candidates, key=lambda r: (
+        _WEAPON_UPGRADE_ORDER.get(r.role_type, 99),
+        r.level or 1,
+        r.id,
+    ))
 
 
 def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
@@ -213,16 +223,58 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
     trace(state, role.id, "shop_job_check", "检查维修与升级任务（预算为本回合尚未分配余额）",
           available_gold=state.team_our.gold_num, reserved_target_count=len(pending_targets))
 
-    # 三级夜晚前，尚未购券的城墙/基地升级任务必须让位于一级武器。
+    # 未购入任务按 升级武器 > 修墙 > 升墙/基地 让位。已买到手的道具继续用完。
     old_job = state.worker_item_jobs.get(role.id)
-    if old_job and old_job.get('kind') in ('wall', 'station') and old_job.get('item') not in role.backpack:
-        weapon_due = _pick_upgradeable(state, WEAPON_TYPES, pending_targets - {tuple(old_job['target'])}, max_current_level=1)
-        if weapon_due:
-            trace(state, role.id, 'upgrade_job_preempted', '未购入的低优先级升级任务让位于武器二级目标',
+    item_name = old_job.get('item', '') if old_job else ''
+    if old_job and item_name not in role.backpack:
+        remaining = pending_targets - {tuple(old_job['target'])}
+        weapon_due = _pick_upgradeable(state, WEAPON_TYPES, remaining, max_current_level=2)
+        is_repair = item_name == 'WallFixer'
+        wall_or_station_upgrade = (
+            old_job.get('kind') == 'station'
+            or (old_job.get('kind') == 'wall' and 'Upgrade' in item_name)
+        )
+        if is_repair and weapon_due:
+            trace(state, role.id, 'upgrade_job_preempted', '未购入的修墙任务让位于武器升级',
                   old_kind=old_job.get('kind'), weapon_id=weapon_due.id)
             del state.worker_item_jobs[role.id]
             pending_targets.discard(tuple(old_job['target']))
+        elif wall_or_station_upgrade and weapon_due:
+            trace(state, role.id, 'upgrade_job_preempted', '未购入的低优先级升级任务让位于未满级武器',
+                  old_kind=old_job.get('kind'), weapon_id=weapon_due.id)
+            del state.worker_item_jobs[role.id]
+            pending_targets.discard(tuple(old_job['target']))
+        elif old_job.get('kind') == 'weapon' and weapon_due:
+            current = next((r for r in state.team_our.roles
+                            if (r.pos.x, r.pos.y) == tuple(old_job['target']) and r.role_type in WEAPON_TYPES), None)
+            if current and _WEAPON_UPGRADE_ORDER.get(weapon_due.role_type, 99) < _WEAPON_UPGRADE_ORDER.get(current.role_type, 99):
+                trace(state, role.id, 'upgrade_job_preempted', '未购入的低优先级武器升级让位于火箭/电磁炮',
+                      old_kind=current.role_type, weapon_id=weapon_due.id)
+                del state.worker_item_jobs[role.id]
+                pending_targets.discard(tuple(old_job['target']))
     if role.id in state.worker_item_jobs:
+        return
+
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=2)
+    if weapon:
+        name, cost = voucher_for("weapon", weapon.level or 1)
+        if name in role.backpack:
+            adjacent = [
+                r for r in state.team_our.roles
+                if r.role_type in WEAPON_TYPES
+                and (r.pos.x, r.pos.y) not in pending_targets
+                and (r.level or 1) <= 2
+                and voucher_for("weapon", r.level or 1)[0] == name
+                and chebyshev(role.pos, r.pos) <= 1
+            ]
+            if adjacent:
+                weapon = min(adjacent, key=lambda r: (_WEAPON_UPGRADE_ORDER.get(r.role_type, 99), r.id))
+        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
+        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
+            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定武器升级目标，当前金币不足，禁止改做低优先级消费',
+                  weapon_id=weapon.id, current_level=weapon.level or 1,
+                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
+                  next_level=(weapon.level or 1) + 1)
         return
 
     damaged_wall = _pick_damaged_wall(state, pending_targets)
@@ -230,17 +282,6 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState") -> None:
         state.worker_item_jobs[role.id] = {
             "item": "WallFixer", "target": (damaged_wall.pos.x, damaged_wall.pos.y), "kind": "wall",
         }
-        return
-
-    weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=1)
-    if weapon:
-        name, cost = voucher_for("weapon", weapon.level or 1)
-        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
-        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
-            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定武器升级目标，当前金币不足，禁止改做低优先级消费',
-                  weapon_id=weapon.id, current_level=weapon.level or 1,
-                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
-                  rounds_to_third_night=max(0, 330-(state.round_no or 0)))
         return
 
     wall = _pick_upgradeable(state, ("wall",), pending_targets, min_health_ratio=WALL_REPAIR_RATIO)
@@ -312,7 +353,7 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
 
     if state.team_our.gold_num < item_cost(item, state):
         trace(state, role.id, "insufficient_gold", "道具任务购买资金不足，释放任务", available_gold=state.team_our.gold_num, required_gold=item_cost(item, state), item=item)
-        if job.get('kind') == 'weapon' and (state.round_no or 0) < 330:
+        if job.get('kind') == 'weapon':
             trace(state, role.id, 'weapon_upgrade_job_waiting_funds', '保留武器升级目标并继续筹资，不改做城墙/基地升级')
             return None
         del state.worker_item_jobs[role.id]
@@ -452,13 +493,13 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     handled, cmd = liquidate(worker, state, blocked, reserved)
     if handled:
         return cmd
+    maybe_start_shop_item_job(worker, state)
+    cmd = decide_shop_item_job(worker, state, blocked, reserved)
+    if cmd:
+        return cmd
     if sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True)
         if handled:
-            return cmd
-        maybe_start_shop_item_job(worker, state)
-        cmd = decide_shop_item_job(worker, state, blocked, reserved)
-        if cmd:
             return cmd
         handled, cmd = replenish_walls(worker, state, blocked, reserved)
         if handled:

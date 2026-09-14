@@ -1,7 +1,7 @@
 """首日阶段与夜间分工；合成地图不代表官方建造区已确认。"""
 import unittest
 
-from src.agent.brain import V1Strategy, BasicActionValidator
+from src.agent.brain import V1Strategy, BasicActionValidator, pick_weapon_name
 from src.agent.opening import wall_ring, primary_wall_plan, assign_weapons, safe_wall
 from src.agent.grid import build_blocked_set
 from src.agent.protocol import Pos, Zone, RobotRole
@@ -19,6 +19,15 @@ def opening_state():
 
 
 class OpeningTests(unittest.TestCase):
+    def test_wanted_loadout_is_rocket_railgun_gatling(self):
+        state = opening_state()
+        self.assertEqual(pick_weapon_name(state), 'rocket')
+        state.team_our.roles.append(make_role(20, 12, 10, 'rocket', level=1))
+        self.assertEqual(pick_weapon_name(state), 'railgun')
+        state.team_our.roles.append(make_role(21, 11, 10, 'railgun', level=1))
+        self.assertEqual(pick_weapon_name(state), 'gatling')
+        self.assertEqual(pick_weapon_name(state, ('gatling',)), 'rocket')
+
     def test_initial_workers_gather_wall_material_before_weapons(self):
         state = opening_state()
         commands = V1Strategy(BasicActionValidator()).decide(state)
@@ -132,3 +141,10 @@ class OpeningTests(unittest.TestCase):
                 self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 1)
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
         self.assertEqual(walls, set(primary_wall_plan(state, state.team_our.roles[0])))
+        kinds = [r.role_type for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
+        self.assertEqual(sorted(kinds), ['gatling', 'railgun', 'rocket'])
+        rocket_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'rocket')
+        railgun_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'railgun')
+        gatling_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'gatling')
+        self.assertGreaterEqual(rocket_x, railgun_x)
+        self.assertGreaterEqual(railgun_x, gatling_x)

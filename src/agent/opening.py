@@ -161,15 +161,38 @@ def station_path(role, weapon, blocked, state):
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
 
 
-def weapon_candidates(state, base, name):
-    """按一级射程10/6/3分层选址，长程靠迎敌侧，全部置于内墙后。"""
+def weapon_candidates(state, base, name, extra_names=(), extra_positions=()):
+    """三座武器都尽量贴内墙前列，分列基地上下两侧，先手消耗血量。
+
+    火箭占迎敌中线前列；电磁炮和加特林同样靠前，但错开到基地两侧。
+    extra_names 保留与建造规划接口兼容。
+    """
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front = right if direction == 1 else left
-    depth = {'rocket': 1, 'railgun': 2, 'gatling': 3}[name]
-    ideal_x = front - direction * depth
-    return sorted(((x, y) for x in range(left+1, right) for y in range(bottom+1, top)),
-                  key=lambda p: (abs(p[0]-ideal_x), abs(p[1]-base.pos.y), p))
+    ideal_x = front - direction * 1
+    existing = [(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
+    existing.extend((p[0], p[1]) for p in extra_positions)
+
+    def score(point):
+        x, y = point
+        forward = abs(x - ideal_x)
+        flank = abs(y - base.pos.y)
+        if name == 'rocket':
+            return (forward, abs(y - base.pos.y), point)
+        if existing:
+            mid_y = sum(ey for _, ey in existing) / len(existing)
+            return (forward, -abs(y - mid_y), -flank, point)
+        return (forward, -flank, point)
+
+    ranked = sorted(((x, y) for x in range(left + 1, right) for y in range(bottom + 1, top)), key=score)
+    frontish = [p for p in ranked if abs(p[0] - ideal_x) <= 1]
+
+    def crowded(point):
+        return sum(max(abs(point[0] - ex), abs(point[1] - ey)) <= 1 for ex, ey in existing)
+
+    openish = [p for p in frontish if crowded(p) < 2]
+    return openish or frontish or ranked
 
 
 def replenish_walls(role, state, blocked, reserved, primary_only=False):
@@ -217,7 +240,7 @@ def safe_wall(state, point, blocked, assignments):
 
 
 def plan_opening(state):
-    from .brain import WEAPON_TYPES, decide_self_heal, item_cost, own_station, plan_pioneer_tasks
+    from .brain import WEAPON_TYPES, WANTED_WEAPONS, decide_self_heal, item_cost, own_station, plan_pioneer_tasks, pick_weapon_name
     base = own_station(state)
     if base is None:
         return {}
@@ -277,7 +300,8 @@ def plan_opening(state):
             weapon = assignments.get(role.id)
             if weapon:
                 trace(state, role.id, 'weapon_assignment', '夜间一人一炮，提前就位', weapon_id=weapon.id)
-                cmd = move_on_path(state, role, station_path(role, weapon, blocked | reserved, state), reserved, '前往分配武器')
+                walkable = (blocked - {(r.pos.x, r.pos.y) for r in fighters}) | reserved
+                cmd = move_on_path(state, role, station_path(role, weapon, walkable, state), reserved, '前往分配武器')
                 if cmd:
                     commands[role.id] = cmd
             continue
@@ -286,8 +310,18 @@ def plan_opening(state):
             left, right, bottom, top = defense_bounds(state, base)
             goals = {(x, y) for x in range(left+1, right) for y in range(bottom+1, top)
                      if (x, y) not in blocked | reserved or (x, y) == (role.pos.x, role.pos.y)}
-            # 优先基地旁、避开正在使用的工人交互位置。
+            hot = set()
+            planned = []
+            for n in WANTED_WEAPONS:
+                spots = weapon_candidates(state, base, n, planned)[:4]
+                planned.append(n)
+                hot.update(spots)
+                for sx, sy in spots:
+                    hot.update((p.x, p.y) for p in neighbors8(Pos(sx, sy), state.map_info.width, state.map_info.height))
+            goals = {p for p in goals if p not in hot}
             goals = {p for p in goals if all(chebyshev(Pos(*p), w.pos) > 1 for w in workers)} or goals
+            if not goals:
+                continue
             path = path_to_any(role.pos, goals, blocked | reserved, state.map_info.width, state.map_info.height)
             cmd = move_on_path(state, role, path, reserved, '开拓者退出墙线并在基地内侧避让施工')
             if cmd:
@@ -298,9 +332,9 @@ def plan_opening(state):
                 trace(state, role.id, 'opening_no_gold', '武器资金不足；首日不切换到卖矿流程，等待资金或第二天变现')
                 continue
             # 三种武器置于墙线内侧；不在未来墙位上试建。
-            weapon_name = next((t for t in WEAPON_TYPES if t not in [w.role_type for w in weapons]
-                               and t not in [c.get('name') for c in commands.values()]), 'gatling')
-            candidates = weapon_candidates(state, base, weapon_name)
+            pending = [c.get('name') for c in commands.values() if c.get('action') == 'build']
+            weapon_name = pick_weapon_name(state, pending)
+            candidates = weapon_candidates(state, base, weapon_name, pending, claimed)
             kind = 'weapon'
         elif not missing and len(weapons) < 3:
             trace(state, role.id, 'await_weapons', '等待本回合武器建造结果，不提前转入围墙')
@@ -336,16 +370,16 @@ def plan_opening(state):
             if path is None:
                 continue
             claimed.add(point)
+            if kind == 'weapon':
+                builds += 1
             if path:
                 cmd = move_on_path(state, role, path, reserved, '前往武器施工位' if kind == 'weapon' else '优先补齐迎敌正面，其次侧翼')
             else:
-                name = next((t for t in WEAPON_TYPES if t not in [w.role_type for w in weapons]
-                             and t not in [c.get('name') for c in commands.values()]), 'gatling') if kind == 'weapon' else 'wall'
+                name = pick_weapon_name(state, [c.get('name') for c in commands.values() if c.get('action') == 'build']) if kind == 'weapon' else 'wall'
                 cmd = selected(state, role.id, {'action': 'build', 'name': name, 'targetPos': [{'x': point[0], 'y': point[1]}]}, '建造武器' if kind == 'weapon' else '建造迎敌防线')
                 reserved.add(point)
                 if kind == 'weapon':
                     gold -= 25
-                    builds += 1
                 else:
                     blocked.add(point)
             if cmd:

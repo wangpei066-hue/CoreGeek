@@ -105,6 +105,67 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
         self.assertEqual(job["kind"], "weapon")
 
+    def test_weapon_upgrade_order_is_rocket_then_railgun_then_gatling(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        gatling = make_role(21, 10, 8, "gatling", level=1)
+        railgun = make_role(22, 11, 8, "railgun", level=1)
+        rocket = make_role(23, 12, 8, "rocket", level=2)
+        state.team_our.roles += [gatling, railgun, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (12, 8))
+        self.assertEqual(state.worker_item_jobs[1]["item"], "WeaponUpgradeVoucher2")
+        state.worker_item_jobs.clear()
+        rocket.level = 3
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (11, 8))
+        state.worker_item_jobs.clear()
+        railgun.level = 3
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (10, 8))
+
+    def test_weapon_upgrade_beats_repair(self):
+        state = minimal_state(gold_num=1000)
+        wall = make_role(30, 13, 10, "wall", health=100, level=1)
+        rocket = make_role(23, 12, 8, "rocket", level=1)
+        state.team_our.roles += [wall, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["kind"], "weapon")
+        self.assertEqual(state.worker_item_jobs[1]["item"], "WeaponUpgradeVoucher1")
+
+    def test_unbought_repair_yields_to_weapon_upgrade(self):
+        state = minimal_state(gold_num=1000)
+        wall = make_role(30, 13, 10, "wall", health=100, level=1)
+        rocket = make_role(23, 12, 8, "rocket", level=1)
+        state.team_our.roles += [wall, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        state.worker_item_jobs[1] = {"item": "WallFixer", "target": (13, 10), "kind": "wall"}
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["kind"], "weapon")
+
+    def test_unbought_gatling_upgrade_yields_to_rocket(self):
+        state = minimal_state(gold_num=1000)
+        gatling = make_role(21, 10, 8, "gatling", level=1)
+        rocket = make_role(23, 12, 8, "rocket", level=1)
+        state.team_our.roles += [gatling, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        state.worker_item_jobs[1] = {"item": "WeaponUpgradeVoucher1", "target": (10, 8), "kind": "weapon"}
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (12, 8))
+
+    def test_level_two_weapon_starts_third_tier_upgrade(self):
+        state = minimal_state(gold_num=200)
+        state.team_our.roles[0].level = 3
+        gatling = make_role(10020, 12, 10, "gatling", level=2)
+        state.team_our.roles.append(gatling)
+        worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[10010]
+        self.assertEqual(job["item"], "WeaponUpgradeVoucher2")
+        self.assertEqual(job["kind"], "weapon")
+
     def test_wall_upgrade_as_lowest_priority(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
