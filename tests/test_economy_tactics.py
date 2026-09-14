@@ -53,17 +53,53 @@ class EconomyTests(unittest.TestCase):
         self.assertTrue(any(e['code'] == 'income_muster' and e['role_id'] == role.id
                             for e in state.decision_events))
 
-    def test_high_value_small_backpack_goes_to_vendor_before_building(self):
+    def test_mid_day_near_gun_keeps_working(self):
+        """去掉第50回合一刀切后，离炮很近的工人白天中段仍可继续干活。"""
+        state, role = defended_state()
+        state.round_no = 185
+        role.pos = Pos(9, 10)
+        role.backpack = ['copper'] * 3
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(e['code'] == 'income_muster' and e.get('role_id') == role.id
+                             for e in state.decision_events))
+        if role.id in commands:
+            self.assertNotEqual(commands[role.id].get('action'), 'attack')
+
+    def test_dusk_distant_enemy_does_not_delay_night_defense(self):
+        state, role = defended_state()
+        state.round_no = 198
+        role.pos = Pos(1, 1)
+        role.backpack = ['copper'] * 3
+        state.robot.roles = [RobotRole(id=30001, pos=Pos(30, 10), role_type='smallRobot', health=40)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(e['code'] == 'income_muster' and e.get('role_id') == role.id
+                            for e in state.decision_events))
+        self.assertEqual(commands[role.id]['action'], 'move')
+
+    def test_small_ore_pile_does_not_run_to_vendor(self):
         state, role = economy_state(gold=75)
         role.backpack = ['copper'] * 5
-        commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertEqual(commands[1]['action'], 'move')
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_voucher_gap_sends_backpack_to_vendor(self):
+        state, role = defended_state(gold=75)
+        role.backpack = ['copper'] * 5
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertTrue(handled)
         self.assertTrue(any(e['code'] == 'cashout_priority' for e in state.decision_events))
-        self.assertFalse(any(e['code'] == 'build_conditions' for e in state.decision_events))
+
+    def test_batch_fill_goes_to_vendor(self):
+        state, role = economy_state()
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 6
+        self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
 
     def test_sale_commitment_survives_price_drop_and_restart(self):
         state, role = economy_state()
-        role.backpack = ['copper'] * 5
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 6
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
         with tempfile.TemporaryDirectory() as root:
             save_build_memory(state, Path(root))
@@ -74,10 +110,17 @@ class EconomyTests(unittest.TestCase):
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
         self.assertIn(role.id, state.policy_memory['selling_roles'])
 
-    def test_keeps_only_small_stone_reserve_and_never_sells_items(self):
+    def test_keeps_wall_stones_after_first_night_and_never_sells_items(self):
         state, role = economy_state()
         state.team_our.roles[0].health = 1500
         role.backpack = ['stone']*20 + ['Medicine', 'Bomb', 'WeaponUpgradeVoucher1']
+        self.assertEqual(sellable_ores(role, state), {'stone': 8})
+
+    def test_day1_still_uses_small_stone_reserve(self):
+        state, role = economy_state()
+        state.round_no = 20
+        state.team_our.roles[0].health = 1500
+        role.backpack = ['stone'] * 20
         self.assertEqual(sellable_ores(role, state), {'stone': 16})
 
     def test_low_health_triggers_sale_before_normal_threshold(self):
@@ -102,6 +145,7 @@ class EconomyTests(unittest.TestCase):
     def test_multiround_ore_is_converted_to_gold(self):
         state, role = economy_state()
         role.backpack = ['copper']*5 + ['iron']*3
+        role.back_pack_capability = 10
         sold_value = 0
         for turn in range(140, 160):
             state.round_no = turn
@@ -148,6 +192,25 @@ class EconomyTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         state.map_info.zones.append(Zone(Pos(7, 9), 'weaponShop'))
         from src.agent.protocol import ShopItem
+        state.vendor_shop_list = [ShopItem('copper', 5)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c['action'] == 'sell' for c in commands.values())
+                        or any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_first_day_sells_when_cash_plus_ore_covers_actual_voucher(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 90
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        role = state.team_our.roles[1]
+        role.pos = Pos(8, 9)
+        role.backpack = ['copper'] * 3
+        state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
+        state.map_info.zones.append(Zone(Pos(7, 9), 'weaponShop'))
         state.vendor_shop_list = [ShopItem('copper', 5)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertTrue(any(c['action'] == 'sell' for c in commands.values())

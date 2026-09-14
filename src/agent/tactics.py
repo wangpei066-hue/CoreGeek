@@ -5,6 +5,8 @@ from .decision_log import trace, selected
 
 ITEM_COSTS = {'Bomb': 100, 'DizzyWeapon': 100, 'SmallRobotSummonOrder': 20, 'MiddleRobotSummonOrder': 30,
               'LargeRobotSummonOrder': 100, 'BossRobotSummonOrder': 200}
+WAVE_LOCAL_STREAK = 3   # 连续空窗后允许院内就近施工，不是官方清波。
+WAVE_CLEAR_STREAK = 8   # 连续空窗后才按清波外出；仍不能证明不会再刷。
 DAILY_SUMMON_LIMIT = 10
 DEFENSE_RESERVE = 100
 
@@ -20,7 +22,19 @@ def begin_round(state):
     state.bombed_robots = set()
     from .world_intel import ingest_news
     ingest_news(state)
-    from .brain import own_station
+    from .brain import is_day_round, own_station
+    if is_day_round(state.round_no):
+        state.policy_memory.pop('night_saw_threat', None)
+        state.policy_memory['night_empty_streak'] = 0
+    else:
+        living = threat_robots(state)
+        if living:
+            state.policy_memory['night_saw_threat'] = True
+            state.policy_memory['night_empty_streak'] = 0
+        elif state.policy_memory.get('night_saw_threat'):
+            state.policy_memory['night_empty_streak'] = int(state.policy_memory.get('night_empty_streak') or 0) + 1
+        from .opening import update_wall_time_overrun
+        update_wall_time_overrun(state)
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)
     if base:
@@ -29,6 +43,7 @@ def begin_round(state):
         known = {tuple(p) for p in state.policy_memory.get('front_wall_seen', [])} | (standing & front)
         state.policy_memory['front_wall_seen'] = [list(p) for p in sorted(known & front)]
         state.policy_memory['front_wall_breaches'] = [list(p) for p in sorted((known & front) - standing)]
+    _note_respawns(state)
 
 
 def front_breached(state):
@@ -43,12 +58,150 @@ def threat_robots(state):
             if r.health > 0 and (not r.target_team or r.target_team == state.team_our.type)]
 
 
+def night_empty_streak(state):
+    return int(state.policy_memory.get('night_empty_streak') or 0)
+
+
+def imminent_contact(state):
+    """敌人已贴到基地、炮、墙或人员，视为正在受攻击。"""
+    from .brain import WEAPON_TYPES, own_station
+    robots = threat_robots(state)
+    if not robots:
+        return False
+    spots = []
+    base = own_station(state)
+    if base:
+        spots.append(base.pos)
+    for role in (state.team_our.roles if state.team_our else []):
+        if role.health > 0 and role.role_type in (*WEAPON_TYPES, 'wall', 'worker', 'pioneer'):
+            spots.append(role.pos)
+    return any(chebyshev(spot, robot.pos) <= 1 for robot in robots for spot in spots)
+
+
+def night_wave_cleared(state):
+    """见过本夜威胁后连续空窗，只作为试探外出条件，不是官方清波。当前有存活敌人立即撤销。"""
+    from .brain import is_day_round
+    if is_day_round(state.round_no):
+        return False
+    living = threat_robots(state)
+    if living:
+        state.policy_memory['night_saw_threat'] = True
+        state.policy_memory['night_empty_streak'] = 0
+        return False
+    return bool(state.policy_memory.get('night_saw_threat')) and night_empty_streak(state) >= WAVE_CLEAR_STREAK
+
+
+def night_near_work_allowed(state):
+    """清波未确认时，只允许能马上回炮的院内补墙/就近维修。"""
+    from .brain import is_day_round
+    if is_day_round(state.round_no) or threat_robots(state):
+        return False
+    if night_wave_cleared(state):
+        return False
+    return bool(state.policy_memory.get('night_saw_threat')) and night_empty_streak(state) >= WAVE_LOCAL_STREAK
+
+
 def pressure(state):
     from .brain import own_station, max_health
     base = own_station(state)
     robots = threat_robots(state)
     nearby = [r for r in robots if base and chebyshev(base.pos, r.pos) <= 7]
     return bool(base and (front_breached(state) or len(nearby) >= 4 or (nearby and base.health < max_health(base) * 0.6)))
+
+
+def _note_respawns(state):
+    """阵亡后次日复活：清掉该角色旧建造目标、商店任务和炮位记忆，避免沿用上一世分配。"""
+    prev = state.policy_memory.get('role_alive') or {}
+    alive = {}
+    assignment = dict(state.policy_memory.get('weapon_assignment') or {})
+    wall_targets = dict(state.policy_memory.get('opening_wall_targets') or {})
+    for role in state.team_our.roles:
+        if role.role_type not in ('worker', 'pioneer'):
+            continue
+        key = str(role.id)
+        alive[key] = role.health > 0
+        if prev.get(key) is False and role.health > 0:
+            state.worker_build_targets.pop(role.id, None)
+            state.worker_item_jobs.pop(role.id, None)
+            assignment.pop(key, None)
+            wall_targets.pop(key, None)
+            trace(state, role.id, 'role_respawned', '角色复活，清除旧炮位与建造目标后重新分配')
+    state.policy_memory['role_alive'] = alive
+    state.policy_memory['weapon_assignment'] = assignment
+    if wall_targets:
+        state.policy_memory['opening_wall_targets'] = wall_targets
+    else:
+        state.policy_memory.pop('opening_wall_targets', None)
+
+
+def threat_eta_to_base(state):
+    """安全截止时间：min(入夜剩余, 可见敌人首次贴近关键目标的切比雪夫下界)。
+    切比雪夫不是官方移动耗时，也未计入射程；找不到可见威胁时白天用入夜剩余，夜间为未知。"""
+    from .brain import WEAPON_TYPES, own_station, is_day_round
+    cycle = (state.round_no or 0) % 130
+    etas = []
+    if is_day_round(state.round_no):
+        etas.append(max(0, 70 - cycle))
+    robots = threat_robots(state)
+    if robots:
+        spots = []
+        base = own_station(state)
+        if base:
+            spots.append(base.pos)
+        weapons = []
+        for role in (state.team_our.roles if state.team_our else []):
+            if role.health <= 0:
+                continue
+            if role.role_type in (*WEAPON_TYPES, 'wall'):
+                spots.append(role.pos)
+                if role.role_type in WEAPON_TYPES:
+                    weapons.append(role)
+        # 只把已经在院内/炮旁的人当成关键目标，远处采矿的人不会把全局截止时间压成贴身威胁。
+        if base:
+            for role in (state.team_our.roles if state.team_our else []):
+                if role.health > 0 and role.role_type in ('worker', 'pioneer'):
+                    if chebyshev(role.pos, base.pos) <= 3 or any(chebyshev(role.pos, w.pos) <= 1 for w in weapons):
+                        spots.append(role.pos)
+        if spots:
+            etas.append(min(chebyshev(spot, robot.pos) for robot in robots for spot in spots))
+    if not etas:
+        return None
+    return min(etas)
+
+
+def two_guns_can_hold(state):
+    """两门炮能否守住当前可见波次。看不见敌人时，不能从「三炮二级」推出可少一人。"""
+    from .brain import WEAPON_TYPES, own_station, max_health, is_day_round
+    if is_day_round(state.round_no):
+        return False
+    if pressure(state) or front_breached(state):
+        return False
+    if not state.team_our:
+        return False
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
+    gunners = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
+    if len(weapons) < 2 or len(gunners) < 2:
+        return False
+    from .opening import assign_weapons
+    assignments = assign_weapons(state)
+    manning = sum(1 for g in gunners if assignments.get(g.id)
+                  and chebyshev(g.pos, assignments[g.id].pos) <= 1
+                  and (assignments[g.id].attack_range or 0) > 0)
+    if manning < 2:
+        return False
+    robots = threat_robots(state)
+    if not robots:
+        return False
+    base = own_station(state)
+    if base is None:
+        return False
+    eta = threat_eta_to_base(state)
+    if eta is not None and eta <= 8:
+        return False
+    if any(r.role_type == 'bossRobot' for r in robots) or len(robots) >= 2:
+        return False
+    healthy = [w for w in weapons if w.health >= max_health(w) * 0.5]
+    return len(healthy) >= 2
 
 
 def bomb_target(state):

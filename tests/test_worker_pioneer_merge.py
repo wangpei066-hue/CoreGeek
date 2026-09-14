@@ -11,11 +11,13 @@ class WorkerPioneerMergeTests(unittest.TestCase):
     def decide(self, state):
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_opening_workers_prepare_walls_while_pioneer_accepts(self):
+    def test_opening_pioneer_does_not_collect_or_build(self):
         state = opening_state()
         state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
         commands = self.decide(state)
-        self.assertEqual(commands[3], {'action': 'acceptTask'})
+        self.assertIn(3, commands)
+        self.assertIn(commands[3]['action'], ('move', 'acceptTask'))
+        self.assertNotIn(commands[3]['action'], ('collect', 'build', 'remove'))
         for worker in (1, 2):
             self.assertIn(commands[worker]['action'], ('move', 'build'))
             if commands[worker]['action'] == 'build':
@@ -63,3 +65,97 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 self.assertEqual(allocations[0]['role_id'], 3)
                 self.assertEqual(commands[20]['controllerId'], '3')
                 self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
+
+    def test_pioneer_buys_voucher_instead_of_new_task_when_gold_enough(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 130
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        from src.agent.protocol import Zone
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(8, 9)
+        commands = self.decide(state)
+        self.assertEqual(commands[pioneer.id]['action'], 'buy')
+        self.assertEqual(commands[pioneer.id]['name'], 'WeaponUpgradeVoucher1')
+        self.assertNotEqual(commands[pioneer.id]['action'], 'acceptTask')
+
+    def test_worker_buys_voucher_when_pioneer_is_next_to_task(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 130
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        from src.agent.protocol import Zone
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(11, 13)
+        state.team_our.roles[1].pos = Pos(8, 9)
+        commands = self.decide(state)
+        self.assertEqual(commands[1]['action'], 'buy')
+        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+        self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
+        self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
+
+    def test_busy_pioneer_does_not_leave_task_to_buy_voucher(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 130
+        state.phase_task = '任务进行中'
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        from src.agent.protocol import Zone
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.team_our.roles[1].pos = Pos(8, 9)
+        commands = self.decide(state)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'buy')
+        self.assertEqual(commands[1]['action'], 'buy')
+        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+
+    def test_workers_build_front_walls_early_day(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=2),
+            make_role(21, 12, 8, 'rocket', level=2),
+            make_role(22, 12, 12, 'rocket', level=2),
+        ]
+        for worker_id, pos in ((1, Pos(12, 7)), (2, Pos(12, 8))):
+            worker = next(r for r in state.team_our.roles if r.id == worker_id)
+            worker.backpack = ['stone'] * 8
+            worker.pos = pos
+        early = self.decide(state)
+        self.assertTrue(any(c.get('action') == 'build' and c.get('name') == 'wall' for c in early.values()))
+        self.assertFalse(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
+
+    def test_workers_hold_stones_when_only_flanks_missing(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=2),
+            make_role(21, 12, 8, 'rocket', level=2),
+            make_role(22, 12, 12, 'rocket', level=2),
+        ]
+        for y in range(7, 13):
+            state.team_our.roles.append(make_role(40 + y, 13, y, 'wall', health=1000, level=1))
+        for worker_id in (1, 2):
+            worker = next(r for r in state.team_our.roles if r.id == worker_id)
+            worker.backpack = ['stone'] * 8
+            worker.pos = Pos(12, 10)
+        early = self.decide(state)
+        self.assertFalse(any(c.get('action') == 'build' for c in early.values()))
+        self.assertTrue(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))

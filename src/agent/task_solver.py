@@ -114,19 +114,34 @@ class PioneerTaskSolver:
         except (OSError, ValueError):
             self.session = {}
 
+    def reset(self):
+        self.session = {}
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         tmp.write_text(json.dumps(self.session, ensure_ascii=False), encoding='utf-8')
         tmp.replace(self.path)
 
+    def _holding_for_output(self, state, commands):
+        """解题会话与角色移动分开：回防不清空已读文档和答案。
+        开拓者正在离开或操炮时不提交、不新开沙盒/LLM；仍消费本回合 llmResp/沙盒回传。"""
+        pioneer = next((r for r in state.team_our.roles if r.role_type == 'pioneer' and r.health > 0), None)
+        if pioneer is None:
+            return False, None
+        cmd = commands.get(pioneer.id) or {}
+        action = cmd.get('action')
+        if action in ('move', 'attack', 'buy', 'sell', 'drop'):
+            return False, pioneer
+        if any(c.get('controllerId') == str(pioneer.id) for c in commands.values()):
+            return False, pioneer
+        return True, pioneer
+
     def step(self, state, commands):
-        if state.team_our and state.map_info:
-            from .economy import defense_due
-            from .grid import build_blocked_set
-            pioneer = next((r for r in state.team_our.roles if r.role_type == 'pioneer' and r.health > 0), None)
-            if pioneer and defense_due(pioneer, state, build_blocked_set(state)):
-                return '', ''  # 不让解题器或重试缓存覆盖回防、占用武器操控者。
         key = [state.team_our.team_id, state.team_our.type, state.phase_task] if state.team_our else None
         s = self.session
         if not state.phase_task or not state.team_our:
@@ -200,10 +215,11 @@ class PioneerTaskSolver:
                                      'errors': [e.description for e in state.errors]})
                 s['stage'] = 'ask'
 
+        holding, pioneer = self._holding_for_output(state, commands) if state.map_info else (False, None)
         if not execute:
             if s['stage'] == 'read' and s['index'] >= len(s['paths']):
                 s['stage'] = 'ask'
-            if s['stage'] in ('read', 'tool'):
+            if holding and s['stage'] in ('read', 'tool'):
                 rid = hashlib.sha256((str(key) + str(state.round_no) + s['stage']).encode()).hexdigest()[:16]
                 s['requestId'] = rid
                 if s['stage'] == 'read':
@@ -213,15 +229,14 @@ class PioneerTaskSolver:
                     execute = sandbox_command(EXEC_SCRIPT, dict(requestId=rid, command=s.pop('tool')))
                     s['stage'] = 'wait_tool'
                 s['pendingCommand'] = execute
-            elif s['stage'] == 'ask':
+            elif holding and s['stage'] == 'ask':
                 if s['calls'] < 12:
                     prompt = self.make_prompt(state)
                     s['calls'] += 1
                     s['stage'] = 'wait_llm'
                 else:
                     s['stage'] = 'exhausted'
-            elif s['stage'] == 'submit':
-                pioneer = next((r for r in state.team_our.roles if r.role_type == 'pioneer' and r.health > 0), None)
+            elif holding and s['stage'] == 'submit':
                 if pioneer and pioneer.id not in commands:
                     submission[pioneer.id] = {'action': 'submitAnswer', 'taskAnswer': s['answer']}
                     commands.update(submission)
@@ -230,6 +245,7 @@ class PioneerTaskSolver:
         s['round'] = state.round_no
         s['response'] = dict(prompt=prompt, executeCmd=execute, submission=submission)
         self.save()
+        state.task_session = dict(s)
         return prompt, execute
 
     def make_prompt(self, state):

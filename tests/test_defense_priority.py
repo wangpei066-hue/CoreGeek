@@ -22,9 +22,8 @@ class DefensePriorityTests(unittest.TestCase):
     def decide(self, state):
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_task_pioneer_does_not_take_weapon_slot_when_weapons_already_upgraded(self):
-        """用户确认的门控：前两夜（round<330）且三座武器都已二级以上时，进行中的任务撑到
-        自然结束，不因夜间回防被打断——先锋不参与武器分配。"""
+    def test_task_pioneer_returns_when_cannot_submit_before_nearby_threat(self):
+        """三炮二级不能单独推出少一人防守：近敌且答案未就绪时开拓者回炮，不能空转在任务点。"""
         state = defended()
         state.round_no = 200
         state.phase_task = '仍在解题'
@@ -34,24 +33,69 @@ class DefensePriorityTests(unittest.TestCase):
             role.pos = pos
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        self.assertEqual({c['controllerId'] for c in commands.values() if c['action'] == 'attack'}, {'1', '2'})
-        self.assertNotIn(3, commands)  # 原地保持任务；健康值正常所以也不会触发自救指令
+        self.assertIn('3', {c['controllerId'] for c in commands.values() if c['action'] == 'attack'})
+
+    def test_task_pioneer_stays_to_submit_when_answer_ready_before_threat(self):
+        """答案已就绪且敌人还来不及打到基地时，留在任务点提交。"""
+        state = defended()
+        state.round_no = 200
+        state.phase_task = '仍在解题'
+        state.task_session = {'stage': 'submit', 'answer': '42'}
+        for weapon in state.team_our.roles[-3:]:
+            weapon.level = 2
+        for role, pos in zip(state.team_our.roles[1:4], (Pos(8, 8), Pos(10, 7), Pos(12, 8))):
+            role.pos = pos
+        state.robot.roles = [RobotRole(100, Pos(18, 8), 'smallRobot', 40)]
+        commands = self.decide(state)
+        self.assertNotIn('3', {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'})
         with tempfile.TemporaryDirectory() as root:
             solver = PioneerTaskSolver(Path(root))
-            before = dict(commands)
-            self.assertEqual(solver.step(state, commands), ('', ''))
-            self.assertEqual(commands, before)
+            solver.session = {
+                'key': [state.team_our.team_id, state.team_our.type, state.phase_task],
+                'stage': 'submit', 'answer': '42', 'paths': [], 'documents': [],
+                'history': [], 'index': 0, 'offset': 0, 'calls': 0, 'retries': 0, 'round': 199,
+            }
+            prompt, execute = solver.step(state, commands)
+            self.assertEqual((prompt, execute), ('', ''))
+            self.assertEqual(commands[3], {'action': 'submitAnswer', 'taskAnswer': '42'})
+            self.assertEqual(solver.session.get('answer'), '42')
 
-    def test_dusk_task_pioneer_holds_position_through_muster_window_when_weapons_upgraded(self):
-        """同一门控：白天回防窗口（第50回合起）里，武器已全部升级时任务也不会被打断去返程。"""
+    def test_solver_keeps_answer_when_pioneer_returns_to_guns(self):
+        """回防不清解题会话：开拓者去操炮时不提交，但已得到的答案仍保留。"""
         state = defended()
-        state.round_no = 180
+        state.round_no = 200
         state.phase_task = '仍在解题'
         for weapon in state.team_our.roles[-3:]:
             weapon.level = 2
-        state.team_our.roles[3].pos = Pos(25, 10)
+        for role, pos in zip(state.team_our.roles[1:4], (Pos(8, 8), Pos(10, 7), Pos(12, 8))):
+            role.pos = pos
+        state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        self.assertNotIn(3, commands)
+        with tempfile.TemporaryDirectory() as root:
+            solver = PioneerTaskSolver(Path(root))
+            solver.session = {
+                'key': [state.team_our.team_id, state.team_our.type, state.phase_task],
+                'stage': 'submit', 'answer': '保留答案', 'paths': [], 'documents': [],
+                'history': [], 'index': 0, 'offset': 0, 'calls': 0, 'retries': 0, 'round': 199,
+            }
+            self.assertEqual(solver.step(state, commands), ('', ''))
+            self.assertEqual(solver.session.get('answer'), '保留答案')
+            self.assertEqual(solver.session.get('stage'), 'submit')
+            self.assertNotIn(3, commands)
+
+    def test_dusk_task_pioneer_returns_when_answer_not_ready(self):
+        """白天回防窗口里，没有现成答案则回炮，不再仅因武器已升级而留在任务点。"""
+        state = defended()
+        state.round_no = 198
+        state.phase_task = '仍在解题'
+        for weapon in state.team_our.roles[-3:]:
+            weapon.level = 2
+        state.team_our.roles[3].pos = Pos(16, 10)
+        commands = self.decide(state)
+        self.assertTrue(any(e['code'] in ('income_muster', 'task_yields_to_defense') and e.get('role_id') == 3
+                            for e in state.decision_events))
+        if 3 in commands:
+            self.assertEqual(commands[3]['action'], 'move')
 
     def test_task_pioneer_yields_when_weapons_not_yet_upgraded(self):
         """门控的另一半：武器还没全部升级到二级时，哪怕在前两夜窗口内，防守也优先于任务（方案A）。"""
@@ -97,7 +141,7 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapons_sit_on_front_column_and_both_flanks(self):
+    def test_weapons_occupy_rear_rank_and_one_forward_flank(self):
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
@@ -108,9 +152,9 @@ class DefensePriorityTests(unittest.TestCase):
             state.team_our.roles.append(make_role(51, second[0], second[1], 'rocket'))
             third = weapon_candidates(state, base, 'rocket')[0]
             self.assertEqual(first[0], second[0])
-            self.assertEqual(first[0], third[0])
-            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10))
-            self.assertLess((third[1] - first[1]) * (second[1] - first[1]), 0)
+            self.assertEqual(third[0], first[0] + direction)
+            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10) - 4)
+            self.assertNotEqual(first[1], second[1])
             state.team_our.roles.pop()
             state.team_our.roles.pop()
 
@@ -121,6 +165,7 @@ class DefensePriorityTests(unittest.TestCase):
         weapons[0].level = 2
         weapons[1].level = 2
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.round_no = 185
         worker = state.team_our.roles[1]
         worker.backpack = ['stone'] * 4
         commands = self.decide(state)
@@ -162,9 +207,13 @@ class DefensePriorityTests(unittest.TestCase):
         for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
             state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1000, level=1))
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(8, 9)
         commands = self.decide(state)
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher2')
+        buys = [c for c in commands.values() if c.get('action') == 'buy']
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher2')
+        self.assertNotEqual(commands.get(pioneer.id, {}).get('name'), 'WeaponUpgradeVoucher2')
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
         from src.agent.brain import maybe_start_shop_item_job

@@ -9,6 +9,7 @@ from .protocol import (
 )
 from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
+from .news_memory import vendor_prices
 
 
 DAY_ROUNDS = 70
@@ -24,7 +25,10 @@ ORE_TYPES = ("stone", "iron", "copper")
 BACKPACK_SELL_RATIO = 0.8
 BUILD_RING_MIN_RADIUS = 2
 BUILD_RING_MAX_RADIUS = 6
-BUILD_RETRY_ROUNDS = 30  # 经验性重试间隔，不是官方规则。
+BUILD_RETRY_ROUNDS = 30  # 地形非法或多次不明失败后的长冷却，不是官方规则。
+BUILD_RETRY_OCCUPIED = 2
+BUILD_RETRY_UNKNOWN = 5
+BUILD_RETRY_UNKNOWN_LIMIT = 3
 
 WALL_FIXER_GOLD_COST = 10
 WALL_REPAIR_RATIO = 0.8
@@ -42,6 +46,8 @@ MAX_HEALTH = {
     "pioneer": {None: 200},
 }
 HEAL_HP_RATIO = 0.5
+EMERGENCY_HP_RATIO = 0.15
+EMERGENCY_HP_ABS = 30
 MEDICINE_GOLD_COST = 10
 
 _ROBOT_PRIORITY = {"bossRobot": 4, "largeRobot": 3, "middleRobot": 2, "smallRobot": 1}
@@ -86,13 +92,32 @@ def find_zone(state: "MatchState", neutral_type: str):
     return None
 
 
-def nearest_mine(state: "MatchState", worker: Role):
+def nearest_mine(state: "MatchState", worker: Role, banned_ores=None, boosted_ores=None):
+    """选择可采且价高优先的最近矿；banned_ores 来自新闻记忆的停工日程。"""
     if not state.map_info:
         return None
-    candidates = [z for z in state.map_info.zones if z.neutral_type in ORE_TYPES]
+    banned = banned_ores or set()
+    boosted = boosted_ores or set()
+    prices = vendor_prices(state)
+    candidates = [z for z in state.map_info.zones if z.neutral_type in ORE_TYPES and z.neutral_type not in banned]
     if not candidates:
         return None
-    return min(candidates, key=lambda z: chebyshev(worker.pos, z.pos))
+    return min(
+        candidates,
+        key=lambda z: (
+            0 if z.neutral_type in boosted else 1,
+            -prices.get(z.neutral_type, 0),
+            chebyshev(worker.pos, z.pos),
+        ),
+    )
+
+
+def best_ore_to_sell(ore_in_backpack: list, state: "MatchState") -> tuple:
+    """按小贩实价优先出售单价最高的矿种。"""
+    prices = vendor_prices(state)
+    counts = Counter(ore_in_backpack)
+    name = max(counts.keys(), key=lambda n: (prices.get(n, 0), counts[n]))
+    return name, counts[name]
 
 
 def own_station(state: "MatchState"):
@@ -105,7 +130,10 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
     """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。"""
     width, height = state.map_info.width, state.map_info.height
     if kind == "wall":
-        from .opening import staged_wall_plan, active_wall_plan, safe_wall, assign_weapons
+        from .opening import (
+            staged_wall_plan, active_wall_plan, safe_wall, assign_weapons,
+            full_wall_build_window, wall_priority,
+        )
         base = own_station(state)
         if base is None:
             return None
@@ -113,6 +141,8 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
         existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
         if not set(plan) - existing:
             plan = active_wall_plan(state, base)
+        if not full_wall_build_window(state):
+            plan = [p for p in plan if wall_priority(state, base, p) == 0]
         return next((Pos(x, y) for x, y in plan
                      if (x, y) not in blocked and (x, y, kind) not in state.failed_build_spots
                      and safe_wall(state, (x, y), blocked, assign_weapons(state))), None)
@@ -162,10 +192,30 @@ def max_health(role: Role) -> int:
 
 
 def decide_self_heal(role: Role):
-    """生命药剂使用者回满血、无需目标坐标（任务书4.6.3）；优先级高于经济/战斗动作。"""
+    """半血以下用药；普通自救仍排在经济/战斗之后。"""
     if "Medicine" not in role.backpack:
         return None
     if role.health >= max_health(role) * HEAL_HP_RATIO:
+        return None
+    return {"action": "use", "name": "Medicine"}
+
+
+def lethal_next_round(role: Role, state: "MatchState") -> bool:
+    """近敌且低血（≤30 或低于满血 15%）时视为紧急治疗。没有可靠伤害数据，不称为下一击致死。"""
+    if role.health <= 0:
+        return False
+    from .tactics import threat_robots
+    nearby = [r for r in threat_robots(state) if chebyshev(role.pos, r.pos) <= 2]
+    if not nearby:
+        return False
+    return role.health <= EMERGENCY_HP_ABS or role.health < max_health(role) * EMERGENCY_HP_RATIO
+
+
+def decide_emergency_heal(role: Role, state: "MatchState"):
+    """低血紧急治疗：近敌且低于阈值、背包有药时抢占当前动作。"""
+    if "Medicine" not in role.backpack:
+        return None
+    if not lethal_next_round(role, state):
         return None
     return {"action": "use", "name": "Medicine"}
 
@@ -229,10 +279,8 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
     ))
 
 
-def should_upgrade_weapon(state: "MatchState") -> bool:
-    """按日程控制升级节奏：同一时刻只锁一门；首日只升最前一门，次日先再升一门并补墙，再依次升三级。"""
-    if any(job.get("kind") == "weapon" for job in state.worker_item_jobs.values()):
-        return False
+def weapon_upgrade_due(state: "MatchState") -> bool:
+    """日程上是否还该升武器；不看当前是否已有人锁定买券任务。"""
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     if not weapons:
         return False
@@ -251,7 +299,15 @@ def should_upgrade_weapon(state: "MatchState") -> bool:
     return any((w.level or 1) < 3 for w in weapons)
 
 
-def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: bool = True) -> None:
+def should_upgrade_weapon(state: "MatchState") -> bool:
+    """按日程控制升级节奏：同一时刻只锁一门；首日只升最前一门，次日先再升一门并补墙，再依次升三级。"""
+    if any(job.get("kind") == "weapon" for job in state.worker_item_jobs.values()):
+        return False
+    return weapon_upgrade_due(state)
+
+
+def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: bool = True,
+                              allow_structure_upgrade: bool = True) -> None:
     """给空闲角色机会性分配一个"买道具->用道具"任务。"""
     if not state.team_our:
         return
@@ -324,14 +380,15 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
         return
 
     wall = _pick_upgradeable(state, ("wall",), pending_targets, min_health_ratio=WALL_REPAIR_RATIO)
-    if wall:
+    if wall and allow_structure_upgrade:
         name, cost = voucher_for("wall", wall.level or 1)
         if name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
             state.worker_item_jobs[role.id] = {"item": name, "target": (wall.pos.x, wall.pos.y), "kind": "wall"}
             return
 
     station = own_station(state)
-    if station and (station.level or 1) < 3 and (station.pos.x, station.pos.y) not in pending_targets:
+    if (allow_structure_upgrade and station and (station.level or 1) < 3
+            and (station.pos.x, station.pos.y) not in pending_targets):
         name, cost = voucher_for("station", station.level or 1)
         if name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
             state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
@@ -344,6 +401,15 @@ def _job_target_still_exists(state: "MatchState", job: dict) -> bool:
     x, y = job["target"]
     role_types = _JOB_KIND_ROLE_TYPES.get(job.get("kind"), ())
     return any(r.pos.x == x and r.pos.y == y and r.role_type in role_types for r in state.team_our.roles)
+
+
+def _droppable_for_purchase(role: Role):
+    """买券前丢掉矿石腾空位，不丢升级券和药剂。"""
+    for name in ("copper", "iron", "stone"):
+        if name in role.backpack:
+            return name
+    return next((item for item in role.backpack
+                 if isinstance(item, str) and "Voucher" not in item and item != "Medicine"), None)
 
 
 def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved: set):
@@ -366,7 +432,6 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             job = state.worker_item_jobs.get(role.id)
             if not job:
                 return None
-    width, height = state.map_info.width, state.map_info.height
     item = job["item"]
     x, y = job["target"]
     target = Pos(x, y)
@@ -380,15 +445,13 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             return None
         job.pop("awaiting_use", None)
 
+    from .opening import adjacent_path, mobile_walkable, move_on_path
+    walkable = mobile_walkable(state, blocked, reserved)
     if item in role.backpack:
         if chebyshev(role.pos, target) <= 1:
             job["awaiting_use"] = True
             return selected(state, role.id, {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}, '执行维修/升级道具任务')
-        step = traced_move(state, role.id, role.pos, target, blocked | reserved, width, height)
-        if step:
-            reserved.add((step.x, step.y))
-            return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
-        return None
+        return move_on_path(state, role, adjacent_path(role, target, walkable, state), reserved, '执行维修/升级道具任务')
 
     if state.team_our.gold_num < item_cost(item, state):
         trace(state, role.id, "insufficient_gold", "道具任务购买资金不足，释放任务", available_gold=state.team_our.gold_num, required_gold=item_cost(item, state), item=item)
@@ -404,15 +467,14 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         return None
     if chebyshev(role.pos, shop.pos) <= 1:
         if len(role.backpack) >= role.back_pack_capability:
-            trace(state, role.id, "backpack_full", "背包已满，无法购买道具")
-            del state.worker_item_jobs[role.id]
+            drop = _droppable_for_purchase(role)
+            if drop:
+                trace(state, role.id, "backpack_full_drop", "背包已满，先丢掉矿石再购买升级券", drop=drop, item=item)
+                return selected(state, role.id, {"action": "drop", "name": drop}, '腾出背包空位购买升级道具')
+            trace(state, role.id, "backpack_full", "背包已满且没有可丢弃矿石，无法购买道具")
             return None
         return selected(state, role.id, {"action": "buy", "name": item, "num": 1}, '执行维修/升级道具任务')
-    step = traced_move(state, role.id, role.pos, shop.pos, blocked | reserved, width, height)
-    if step:
-        reserved.add((step.x, step.y))
-        return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
-    return None
+    return move_on_path(state, role, adjacent_path(role, shop.pos, walkable, state), reserved, '执行维修/升级道具任务')
 
 
 
@@ -435,32 +497,75 @@ def item_cost(name: str, state: "MatchState") -> int:
     return 0
 
 
+def _build_failure_reason(state: "MatchState", role_id, prev: dict) -> str:
+    """根据占位、资源和错误描述分类建造失败；原因不明时只做短退避。"""
+    targets = prev.get("targetPos") or []
+    if not targets:
+        return "unknown"
+    pos = targets[0]
+    cell = (pos["x"], pos["y"])
+    occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.health > 0}
+    if cell in occupied:
+        return "occupied"
+    role = next((r for r in state.team_our.roles if r.id == role_id), None)
+    if prev.get("name") == "wall" and role and "stone" not in role.backpack:
+        return "resource"
+    text = " ".join(e.description or "" for e in (state.errors or []))
+    if any(token in text for token in ("非法", "不可建造", "禁止建造", "黄区", "蓝区", "超出建造")):
+        return "illegal"
+    return "unknown"
+
+
 def learn_from_last_round(state: "MatchState") -> None:
-    """失败只代表暂时不可用；按建筑类型冷却30回合，不能推断永久非法。"""
+    """建造失败按原因冷却：占位短退避，缺资源不封格，非法或多次不明失败才长冷却。"""
     now = state.round_no or 0
     state.build_retry_after = {k: v for k, v in state.build_retry_after.items() if v > now}
     state.failed_build_spots = set(state.build_retry_after)
+    counts = dict(state.policy_memory.get("build_fail_counts") or {})
     for role_id, success in state.last_round_role_action_results.items():
         prev = state.last_sent_command.get(role_id, {})
         if success or prev.get("action") != "build":
             continue
         kind = "wall" if prev.get("name") == "wall" else "weapon"
+        reason = _build_failure_reason(state, role_id, prev)
         for pos in prev.get("targetPos", []):
             key = (pos["x"], pos["y"], kind)
-            state.build_retry_after[key] = now + BUILD_RETRY_ROUNDS
+            stamp = f"{key[0]},{key[1]},{kind}"
+            if reason == "resource":
+                counts.pop(stamp, None)
+                continue
+            if reason == "occupied":
+                delay, counts[stamp] = BUILD_RETRY_OCCUPIED, 0
+            elif reason == "illegal":
+                delay, counts[stamp] = BUILD_RETRY_ROUNDS, BUILD_RETRY_UNKNOWN_LIMIT
+            else:
+                counts[stamp] = int(counts.get(stamp, 0)) + 1
+                delay = BUILD_RETRY_ROUNDS if counts[stamp] >= BUILD_RETRY_UNKNOWN_LIMIT else BUILD_RETRY_UNKNOWN
+            state.build_retry_after[key] = now + delay
             state.failed_build_spots.add(key)
+            trace(state, role_id, "build_retry", "建造失败已按原因退避",
+                  reason=reason, cell=list(key), retry_after=state.build_retry_after[key])
+    if counts:
+        state.policy_memory["build_fail_counts"] = counts
+    else:
+        state.policy_memory.pop("build_fail_counts", None)
 
 
 def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
-    """机会性建造：优先补齐3座武器位，其次消耗背包里的石头建围墙。"""
+    """机会性建造：优先补齐3座武器位，其次消耗背包里的石头建围墙。仅工人可 build。"""
+    if worker.role_type != "worker":
+        return None
     base = own_station(state)
     if base is None or state.map_info is None:
         return None
 
     pending = state.worker_build_targets.get(worker.id)
     if pending and pending[2] == "wall":
-        from .opening import active_wall_plan
+        from .opening import active_wall_plan, full_wall_build_window, wall_priority
         if pending[:2] not in active_wall_plan(state, base):
+            del state.worker_build_targets[worker.id]
+            pending = None
+        elif not full_wall_build_window(state, worker) and wall_priority(state, base, pending[:2]) != 0:
             del state.worker_build_targets[worker.id]
             pending = None
     if pending:
@@ -482,6 +587,10 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                         return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '先离开施工格再建造')
                 return None
             if dist == 1:
+                if kind == "wall":
+                    from .opening import worker_should_build_walls
+                    if not worker_should_build_walls(state, worker):
+                        return None
                 del state.worker_build_targets[worker.id]
                 if kind == "weapon":
                     if state.team_our.gold_num < WEAPON_GOLD_COST:
@@ -509,7 +618,8 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
 
     weapon_count = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
     can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count + getattr(state, "planned_weapons", 0) < MAX_WEAPONS
-    can_wall = "stone" in worker.backpack
+    from .opening import worker_should_build_walls
+    can_wall = "stone" in worker.backpack and worker_should_build_walls(state, worker)
     trace(state, worker.id, "build_conditions", "本回合建造条件；满足武器条件时优先武器", available_gold=state.team_our.gold_num, weapon_count=weapon_count, planned_weapons=getattr(state, "planned_weapons", 0), can_weapon=can_weapon, stone_count=worker.backpack.count("stone"), can_wall=can_wall)
     if can_weapon:
         kind = "weapon"
@@ -546,36 +656,90 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
 
 
 
+def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
+    """开拓者专责买/用武器升级券：任务金币够了就去商店，不走工人卖矿路径。进行中的任务不中断。"""
+    if pioneer.role_type != "pioneer" or pioneer.health <= 0:
+        return None
+    if state.phase_task:
+        return None
+    job = state.worker_item_jobs.get(pioneer.id)
+    has_voucher = any(isinstance(item, str) and "WeaponUpgradeVoucher" in item for item in pioneer.backpack)
+    if job and job.get("kind") != "weapon" and not has_voucher:
+        return None
+    if has_voucher or (job and job.get("kind") == "weapon"):
+        if has_voucher and (not job or job.get("kind") != "weapon"):
+            maybe_start_shop_item_job(pioneer, state, allow_weapon=True)
+        cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+        if cmd:
+            trace(state, pioneer.id, "pioneer_voucher_job",
+                  "开拓者执行武器升级券任务（购买或使用）", action=cmd.get("action"))
+        return cmd
+    from .economy import pick_weapon_voucher_buyer
+    buyer = pick_weapon_voucher_buyer(state, blocked)
+    if buyer is None or buyer.id != pioneer.id:
+        return None
+    if not should_upgrade_weapon(state):
+        return None
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=2)
+    if weapon is None:
+        return None
+    name, _ = voucher_for("weapon", weapon.level or 1)
+    cost = item_cost(name, state)
+    if state.team_our.gold_num < cost:
+        trace(state, pioneer.id, "pioneer_voucher_wait_gold",
+              "开拓者等任务金币凑够再买武器升级券", available_gold=state.team_our.gold_num, required_gold=cost)
+        return None
+    maybe_start_shop_item_job(pioneer, state, allow_weapon=True)
+    cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+    if cmd:
+        trace(state, pioneer.id, "pioneer_buys_voucher", "任务金币已够，开拓者去买武器升级券",
+              item=name, available_gold=state.team_our.gold_num, required_gold=cost)
+    return cmd
+
+
 def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set):
-    from .economy import liquidate, profitable_mine, muster_for_night
+    from .economy import liquidate, profitable_mine, muster_for_night, worker_should_shop_weapon_voucher
     from .tactics import tactical_action
+    from .opening import replenish_walls, staged_walls_incomplete, worker_should_build_walls, emergency_front_seal
+    heal = decide_emergency_heal(worker, state)
+    if heal:
+        return selected(state, worker.id, heal, '低血紧急治疗')
     handled, cmd = muster_for_night(worker, state, blocked, reserved)
     if handled:
         return cmd
-    from .opening import replenish_walls
+    seal = emergency_front_seal(worker, state, blocked, reserved)
+    if seal:
+        return seal
+    allow_build = worker_should_build_walls(state, worker)
+    allow_weapon = worker_should_shop_weapon_voucher(worker, state, blocked)
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
     if cmd:
         return cmd
-    if should_upgrade_weapon(state):
-        maybe_start_shop_item_job(worker, state)
+    if allow_weapon:
+        maybe_start_shop_item_job(worker, state, allow_weapon=True)
         cmd = decide_shop_item_job(worker, state, blocked, reserved)
         if cmd:
             return cmd
         handled, cmd = liquidate(worker, state, blocked, reserved)
         if cmd:
             return cmd
-    handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True)
+    handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True, allow_build=allow_build)
     if cmd:
         return cmd
     handled, cmd = liquidate(worker, state, blocked, reserved)
     if cmd:
         return cmd
-    maybe_start_shop_item_job(worker, state, allow_weapon=should_upgrade_weapon(state))
+    defer_upgrades = (weapon_upgrade_due(state)
+                      or ((state.round_no or 0) >= 70 and staged_walls_incomplete(state) and not allow_build))
+    maybe_start_shop_item_job(
+        worker, state, allow_weapon=allow_weapon,
+        allow_structure_upgrade=allow_weapon or not defer_upgrades,
+    )
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
     if cmd:
         return cmd
     if sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
-        handled, cmd = replenish_walls(worker, state, blocked, reserved)
+        handled, cmd = replenish_walls(worker, state, blocked, reserved, allow_build=allow_build)
         if cmd:
             return cmd
     cmd = tactical_action(worker, state, blocked, reserved)
@@ -590,29 +754,44 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if build_cmd:
         return build_cmd
 
-    maybe_start_shop_item_job(worker, state, allow_weapon=should_upgrade_weapon(state))
-    item_job_cmd = decide_shop_item_job(worker, state, blocked, reserved)
-    if item_job_cmd:
-        return item_job_cmd
-
     return profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
 
 
 
 def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """用户确认的门控：前两夜（round_no<330）里，只要三座武器都已升到二级以上，进行中的任务
-    撑到自然结束（完成/超时/判题器判定离开），不因回防时段主动放弃——中途弃任务大概率被判成
-    "离开任务点"直接失败，白白浪费已花的时间、金币和 LLM 额度。武器还没全部升级、或已进入
-    第三夜及以后，生存权重更高，防守优先，任务必须让路（方案A）。
-    "还没开始、仍在候选中"的任务则始终受 defense_due 约束，不会在回防期新接。"""
+    """回防窗内是否留在任务点由 pioneer_should_hold_task 决定，不再用「三炮二级」一刀切。
+    未开始的任务始终受 defense_due 约束，不会在回防期新接。"""
     if pioneer.health <= 0:
         return True, None
-    from .economy import defense_due, task_defense_override
+    from .economy import defense_due, pioneer_available_to_buy_voucher, pioneer_should_hold_task
+    job = state.worker_item_jobs.get(pioneer.id)
+    if job and job.get("kind") == "weapon" and not state.phase_task:
+        return False, None
+    if (not state.phase_task and pioneer_available_to_buy_voucher(state)
+            and should_upgrade_weapon(state)):
+        from .economy import pick_weapon_voucher_buyer
+        buyer = pick_weapon_voucher_buyer(state, blocked)
+        if buyer is not None and buyer.id == pioneer.id:
+            weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=2)
+            if weapon is not None:
+                name, _ = voucher_for("weapon", weapon.level or 1)
+                if state.team_our.gold_num >= item_cost(name, state) or any(
+                        isinstance(item, str) and "WeaponUpgradeVoucher" in item for item in pioneer.backpack):
+                    trace(state, pioneer.id, "task_yields_to_voucher",
+                          "买券完整代价最低的是开拓者，先去商店，不新接任务")
+                    return False, None
     if state.phase_task:
-        if defense_due(pioneer, state, blocked) and task_defense_override(state):
-            trace(state, pioneer.id, 'task_yields_to_defense', '回防时段已到，且武器未全部升级或已进入第三夜，防守优先，任务让路')
+        if defense_due(pioneer, state, blocked) and not pioneer_should_hold_task(pioneer, state):
+            trace(state, pioneer.id, 'task_yields_to_defense',
+                  '无法在威胁到达前提交，或两门炮守不住当前波次，回炮；题目会话保留')
             return False, None
-        return True, decide_self_heal(pioneer)
+        return True, decide_emergency_heal(pioneer, state) or decide_self_heal(pioneer)
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .treasure import decide_treasure_action, treasure_should_claim_pioneer
+        if treasure_should_claim_pioneer(state, pioneer, memory):
+            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+            return True, cmd
     if defense_due(pioneer, state, blocked):
         trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务')
         return False, None
@@ -623,15 +802,28 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         key=lambda t: (chebyshev(pioneer.pos, t.task_position), t.task_type),
     )
     if not candidates:
+        if memory is not None:
+            from .treasure import decide_treasure_action
+            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+            if cmd:
+                return True, cmd
         return False, None
     for task in candidates:
-        from .opening import adjacent_path, assign_weapons
+        from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
+        from .tactics import night_wave_cleared, threat_eta_to_base
         route = adjacent_path(pioneer, task.task_position, blocked | reserved, state)
-        weapon = assign_weapons(state).get(pioneer.id)
-        return_distance = chebyshev(task.task_position, weapon.pos) if weapon else 8
-        required = (len(route) if route is not None else 10000) + (task.timeout_rounds or 15) + return_distance + 8
-        if required >= 70 - (state.round_no or 0) % 130:
-            trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取', required_rounds=required)
+        if route is None:
+            continue
+        back = station_return_steps(pioneer, state, blocked, from_pos=task.task_position)
+        if back is None:
+            trace(state, pioneer.id, 'task_not_enough_time', '任务点回炮找不到路，不接这单',
+                  task_type=task.task_type)
+            continue
+        required = len(route) + (task.timeout_rounds or 15) + back + MUSTER_BUFFER
+        arrival = threat_eta_to_base(state)
+        if not night_wave_cleared(state) and (arrival is None or required >= arrival):
+            trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取',
+                  required_rounds=required, threat_eta=arrival)
             continue
         if chebyshev(pioneer.pos, task.task_position) <= 1:
             return True, {"action": "acceptTask"}
@@ -644,11 +836,17 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
 
 
 def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """先锋自救、回防、变现优先，再执行白天任务与补给。"""
+    """先锋紧急自救、回防、买券优先，再执行白天任务与补给。"""
     from .economy import liquidate, muster_for_night
     from .tactics import tactical_action
+    heal = decide_emergency_heal(pioneer, state)
+    if heal:
+        return selected(state, pioneer.id, heal, '低血紧急治疗')
     handled, cmd = muster_for_night(pioneer, state, blocked, reserved)
     if handled:
+        return cmd
+    cmd = decide_pioneer_voucher(pioneer, state, blocked, reserved)
+    if cmd:
         return cmd
     handled, cmd = liquidate(pioneer, state, blocked, reserved)
     if handled:
@@ -668,11 +866,18 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
     if item_job_cmd:
         return item_job_cmd
 
-    maybe_start_shop_item_job(pioneer, state)
+    maybe_start_shop_item_job(pioneer, state, allow_weapon=False)
     cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+    if cmd:
+        return cmd
+    heal = decide_self_heal(pioneer) or decide_buy_medicine(pioneer, state)
+    if heal:
+        return heal
+    from .opening import pioneer_stay_clear
+    cmd = pioneer_stay_clear(pioneer, state, blocked, reserved)
     if cmd is None:
         trace(state, pioneer.id, "no_pioneer_action", "当前没有可用任务，也未产生治疗、补给或维修升级动作", available_gold=state.team_our.gold_num)
-    return cmd or decide_self_heal(pioneer) or decide_buy_medicine(pioneer, state)
+    return cmd
 
 
 def plan_day(state: "MatchState") -> dict:
@@ -686,13 +891,13 @@ def plan_day(state: "MatchState") -> dict:
     from .opening import movement_avoid
     blocked = build_blocked_set(state) | movement_avoid(state)
     reserved = set()
-    for role in state.team_our.roles:
+    order = [r for r in state.team_our.roles if r.role_type == "pioneer"]
+    order += [r for r in state.team_our.roles if r.role_type == "worker"]
+    for role in order:
         if role.role_type == "worker":
             cmd = decide_worker_day(role, state, blocked, reserved)
-        elif role.role_type == "pioneer":
-            cmd = decide_pioneer_day(role, state, blocked, reserved)
         else:
-            continue
+            cmd = decide_pioneer_day(role, state, blocked, reserved)
         if cmd:
             cost = 0
             if cmd["action"] == "buy":
@@ -738,34 +943,82 @@ def plan_pioneer_tasks(state, blocked, reserved):
 
 
 def plan_night(state: "MatchState") -> dict:
-    from .opening import assign_weapons, adjacent_path, move_on_path, movement_avoid
-    from .tactics import tactical_action
+    from .opening import assign_weapons, move_on_path, movement_avoid, weapon_approach_path, _fighter_layer
+    from .tactics import (
+        tactical_action, night_wave_cleared, night_near_work_allowed,
+        threat_robots, pressure, front_breached,
+    )
     commands = {}
     if not state.team_our or not state.map_info:
         return commands
     state = copy(state)
     state.team_our = copy(state.team_our)
     blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
-    from .economy import task_defense_override
-    task_pioneers = ({r.id for r in state.team_our.roles
-                       if r.role_type == 'pioneer' and r.health > 0 and state.phase_task}
-                      if not task_defense_override(state) else set())
-    assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
-    from .tactics import threat_robots
     robots = threat_robots(state)
-    for fighter in sorted(state.team_our.roles, key=lambda r: r.id):
-        if fighter.role_type not in ("worker", "pioneer"):
+    if night_wave_cleared(state):
+        trace(state, None, 'night_wave_cleared', '连续空窗达到试探外出条件，不是官方清波；转为任务、采矿和修墙')
+        for role in state.team_our.roles:
+            if role.role_type == 'worker':
+                cmd = decide_worker_day(role, state, blocked, reserved)
+            elif role.role_type == 'pioneer':
+                cmd = decide_pioneer_day(role, state, blocked, reserved)
+            else:
+                continue
+            if cmd:
+                if cmd.get('action') == 'buy':
+                    cost = item_cost(cmd['name'], state) * cmd.get('num', 1)
+                    if cost > state.team_our.gold_num:
+                        continue
+                    state.team_our.gold_num -= cost
+                commands[role.id] = cmd
+        return commands
+    commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
+    assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
+    urgent = pressure(state) or front_breached(state)
+    fighters = [r for r in state.team_our.roles
+                if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in task_pioneers]
+    fighters.sort(key=lambda r: (
+        0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
+        _fighter_layer(state, r),
+    ))
+    for fighter in fighters:
+        heal = decide_emergency_heal(fighter, state)
+        if heal:
+            commands[fighter.id] = selected(state, fighter.id, heal, '低血紧急治疗')
             continue
-        if fighter.id in task_pioneers:
-            trace(state, fighter.id, 'pioneer_task_active_at_night', '自进化任务仍在进行，夜间原地保持，不参与武器分配')
-            continue
-        cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
-        if cmd:
-            if cmd['action'] == 'buy':
-                state.team_our.gold_num -= item_cost(cmd['name'], state)
-            commands[fighter.id] = cmd
-            continue
+        if urgent:
+            cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
+            if cmd:
+                if cmd['action'] == 'buy':
+                    state.team_our.gold_num -= item_cost(cmd['name'], state)
+                commands[fighter.id] = cmd
+                continue
         weapon = assignments.get(fighter.id)
+        if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
+            ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
+            target = pick_attack_target(weapon, robots) if ready else None
+            if target:
+                trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
+                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
+                                       "targetPos": target_positions_for_weapon(weapon, target)}
+                continue
+            trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+            if fighter.role_type == 'worker' and night_near_work_allowed(state) and not robots:
+                from .opening import adjacent_critical_build
+                near = adjacent_critical_build(fighter, state, blocked, reserved)
+                if near:
+                    commands[fighter.id] = near
+                    continue
+                cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
+                if cmd:
+                    if cmd['action'] == 'buy':
+                        state.team_our.gold_num -= item_cost(cmd['name'], state)
+                    commands[fighter.id] = cmd
+                    continue
+            trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
+                  "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
+            continue
         if weapon is None:
             trace(state, fighter.id, "no_free_weapon", "没有可分配的独立武器")
             from .economy import muster_for_night
@@ -773,22 +1026,13 @@ def plan_night(state: "MatchState") -> dict:
             if cmd:
                 commands[fighter.id] = cmd
             continue
-        trace(state, fighter.id, "weapon_assignment", "一人一炮；冷却和移动期间也保留分配", weapon_id=weapon.id)
-        if chebyshev(fighter.pos, weapon.pos) <= 1:
-            ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-            target = pick_attack_target(weapon, robots) if ready else None
-            if target:
-                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
-                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
-                                       "targetPos": target_positions_for_weapon(weapon, target)}
-            else:
-                trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
-                      "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
-        else:
-            cmd = move_on_path(state, fighter, adjacent_path(fighter, weapon.pos, blocked | reserved, state), reserved, "前往独立分配的武器")
-            if cmd:
-                commands[fighter.id] = cmd
+        trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+        cmd = move_on_path(state, fighter, weapon_approach_path(fighter, weapon, blocked, reserved, state), reserved, "前往独立分配的武器")
+        if cmd:
+            commands[fighter.id] = cmd
     for fighter in state.team_our.roles:
+        if fighter.id in task_pioneers:
+            continue
         controlling = any(c.get('controllerId') == str(fighter.id) for c in commands.values())
         if fighter.role_type in ('worker', 'pioneer') and fighter.id not in commands and not controlling:
             heal = decide_self_heal(fighter)
@@ -840,6 +1084,37 @@ class BasicActionValidator(ActionValidator):
             raise ValueError(f"{action} requires name")
 
 
+def command_actor_id(key, command):
+    if command.get('action') == 'attack':
+        try:
+            return int(command.get('controllerId'))
+        except (TypeError, ValueError):
+            return None
+    return key
+
+
+def resolve_actor_conflicts(commands: dict, state: "MatchState") -> dict:
+    """同一执行角色只能有一条指令：紧急治疗覆盖其操炮及其它动作。计划阶段的预算副本会丢弃，不改活状态金币。"""
+    if not commands or not state.team_our:
+        return commands
+    roles = {r.id: r for r in state.team_our.roles}
+    healers = set()
+    for key, command in commands.items():
+        role = roles.get(key)
+        if (command.get('action') == 'use' and command.get('name') == 'Medicine'
+                and role and decide_emergency_heal(role, state)):
+            healers.add(role.id)
+    kept = {}
+    for key, command in commands.items():
+        actor = command_actor_id(key, command)
+        if actor in healers and not (
+                command.get('action') == 'use' and command.get('name') == 'Medicine' and key == actor):
+            trace(state, actor, 'emergency_heal_preempts', '低血紧急治疗覆盖该角色的操炮或其它动作', dropped=command)
+            continue
+        kept[key] = command
+    return kept
+
+
 class V1Strategy(Strategy):
     """V1：白天经济+机会性建造，夜晚武器操控战斗。"""
 
@@ -847,7 +1122,12 @@ class V1Strategy(Strategy):
         self.validator = validator
 
     def decide(self, state: "MatchState") -> dict:
-        state.decision_events = []
+        news_codes = {
+            "ore_heuristic", "legend_appended", "ore_decoded", "treasure_decoded",
+            "llm_request", "llm_empty", "llm_parse_failed", "summon_result",
+        }
+        kept = [e for e in (state.decision_events or []) if e.get("code") in news_codes]
+        state.decision_events = kept
         from .tactics import begin_round
         begin_round(state)
         learn_from_last_round(state)
@@ -869,13 +1149,25 @@ class V1Strategy(Strategy):
                     heal = decide_self_heal(role)
                     if heal:
                         commands[role.id] = selected(state, role.id, heal, '所有更高优先级分支均无行动，最后自救')
+        commands = resolve_actor_conflicts(commands, state)
         commands = self._filter_valid(commands, state)
         state.last_sent_command = commands
         return commands
 
     def _filter_valid(self, commands: dict, state: "MatchState") -> dict:
         valid = {}
+        roles = {r.id: r for r in (state.team_our.roles if state.team_our else [])}
         for role_id, command in commands.items():
+            role = roles.get(role_id)
+            action = command.get("action")
+            if role and action in ("build", "remove", "collect") and role.role_type != "worker":
+                trace(state, role_id, "role_action_forbidden",
+                      "采集、建造、拆除仅工人可用，已丢弃开拓者非法指令", command=command)
+                continue
+            if role and action in ("acceptTask", "submitAnswer") and role.role_type != "pioneer":
+                trace(state, role_id, "role_action_forbidden",
+                      "接取与提交任务仅开拓者可用，已丢弃非法指令", command=command)
+                continue
             try:
                 self.validator.validate(command, state)
             except ValueError as exc:
