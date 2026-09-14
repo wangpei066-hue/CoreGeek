@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import shlex
 
+from .task_sop import DEPLOYMENT_SOP
+
 
 MARKER = 'PIONEER_TASK'
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
@@ -319,7 +321,7 @@ class PioneerTaskSolver:
 或 {"action":"read","path":"说明文件路径"}
 或 {"action":"submit","taskAnswer":"本题要求的最终答案字符串"}
 若答案要求JSON，将其序列化为taskAnswer字符串；提交必须有充分依据，需要执行或验证时应先取得真实结果。
-''' + json.dumps({'requestId': self.session.get('requestId'),
+''' + DEPLOYMENT_SOP + '\n当前任务与执行证据：\n' + json.dumps({'requestId': self.session.get('requestId'),
                    'task': state.phase_task,
                    'taskKind': self.session.get('taskKind', 'unknown'),
                    'workspace': self.session.get('workspace'),
