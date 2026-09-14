@@ -62,8 +62,24 @@ def night_empty_streak(state):
     return int(state.policy_memory.get('night_empty_streak') or 0)
 
 
+def imminent_contact(state):
+    """敌人已贴到基地、炮、墙或人员，视为正在受攻击。"""
+    from .brain import WEAPON_TYPES, own_station
+    robots = threat_robots(state)
+    if not robots:
+        return False
+    spots = []
+    base = own_station(state)
+    if base:
+        spots.append(base.pos)
+    for role in (state.team_our.roles if state.team_our else []):
+        if role.health > 0 and role.role_type in (*WEAPON_TYPES, 'wall', 'worker', 'pioneer'):
+            spots.append(role.pos)
+    return any(chebyshev(spot, robot.pos) <= 1 for robot in robots for spot in spots)
+
+
 def night_wave_cleared(state):
-    """见过本夜威胁后，连续多回合快照里没有存活敌人才按清波处理。官方未保证一夜单波。"""
+    """见过本夜威胁后连续空窗，只作为试探外出条件，不是官方清波。当前有存活敌人立即撤销。"""
     from .brain import is_day_round
     if is_day_round(state.round_no):
         return False
@@ -119,15 +135,38 @@ def _note_respawns(state):
 
 
 def threat_eta_to_base(state):
-    """可见敌人到基地的切比雪夫距离；白天无怪时用当天剩余昼回合作下界。夜间无可见敌人则未知。"""
-    from .brain import own_station, is_day_round
-    base = own_station(state)
-    robots = threat_robots(state)
-    if robots and base:
-        return min(chebyshev(base.pos, r.pos) for r in robots)
+    """安全截止时间：min(入夜剩余, 可见敌人首次贴近关键目标的切比雪夫下界)。
+    切比雪夫不是官方移动耗时，也未计入射程；找不到可见威胁时白天用入夜剩余，夜间为未知。"""
+    from .brain import WEAPON_TYPES, own_station, is_day_round
+    cycle = (state.round_no or 0) % 130
+    etas = []
     if is_day_round(state.round_no):
-        return max(0, 70 - (state.round_no or 0) % 130)
-    return None
+        etas.append(max(0, 70 - cycle))
+    robots = threat_robots(state)
+    if robots:
+        spots = []
+        base = own_station(state)
+        if base:
+            spots.append(base.pos)
+        weapons = []
+        for role in (state.team_our.roles if state.team_our else []):
+            if role.health <= 0:
+                continue
+            if role.role_type in (*WEAPON_TYPES, 'wall'):
+                spots.append(role.pos)
+                if role.role_type in WEAPON_TYPES:
+                    weapons.append(role)
+        # 只把已经在院内/炮旁的人当成关键目标，远处采矿的人不会把全局截止时间压成贴身威胁。
+        if base:
+            for role in (state.team_our.roles if state.team_our else []):
+                if role.health > 0 and role.role_type in ('worker', 'pioneer'):
+                    if chebyshev(role.pos, base.pos) <= 3 or any(chebyshev(role.pos, w.pos) <= 1 for w in weapons):
+                        spots.append(role.pos)
+        if spots:
+            etas.append(min(chebyshev(spot, robot.pos) for robot in robots for spot in spots))
+    if not etas:
+        return None
+    return min(etas)
 
 
 def two_guns_can_hold(state):
@@ -142,6 +181,13 @@ def two_guns_can_hold(state):
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     gunners = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
     if len(weapons) < 2 or len(gunners) < 2:
+        return False
+    from .opening import assign_weapons
+    assignments = assign_weapons(state)
+    manning = sum(1 for g in gunners if assignments.get(g.id)
+                  and chebyshev(g.pos, assignments[g.id].pos) <= 1
+                  and (assignments[g.id].attack_range or 0) > 0)
+    if manning < 2:
         return False
     robots = threat_robots(state)
     if not robots:

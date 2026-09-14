@@ -65,6 +65,17 @@ class EconomyTests(unittest.TestCase):
         if role.id in commands:
             self.assertNotEqual(commands[role.id].get('action'), 'attack')
 
+    def test_dusk_distant_enemy_does_not_delay_night_defense(self):
+        state, role = defended_state()
+        state.round_no = 198
+        role.pos = Pos(1, 1)
+        role.backpack = ['copper'] * 3
+        state.robot.roles = [RobotRole(id=30001, pos=Pos(30, 10), role_type='smallRobot', health=40)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(e['code'] == 'income_muster' and e.get('role_id') == role.id
+                            for e in state.decision_events))
+        self.assertEqual(commands[role.id]['action'], 'move')
+
     def test_small_ore_pile_does_not_run_to_vendor(self):
         state, role = economy_state(gold=75)
         role.backpack = ['copper'] * 5
@@ -181,6 +192,25 @@ class EconomyTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         state.map_info.zones.append(Zone(Pos(7, 9), 'weaponShop'))
         from src.agent.protocol import ShopItem
+        state.vendor_shop_list = [ShopItem('copper', 5)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c['action'] == 'sell' for c in commands.values())
+                        or any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_first_day_sells_when_cash_plus_ore_covers_actual_voucher(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 90
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1),
+            make_role(21, 12, 8, 'rocket', level=1),
+            make_role(22, 12, 12, 'rocket', level=1),
+        ]
+        role = state.team_our.roles[1]
+        role.pos = Pos(8, 9)
+        role.backpack = ['copper'] * 3
+        state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
+        state.map_info.zones.append(Zone(Pos(7, 9), 'weaponShop'))
         state.vendor_shop_list = [ShopItem('copper', 5)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertTrue(any(c['action'] == 'sell' for c in commands.values())

@@ -210,8 +210,10 @@ class DefensePriorityTests(unittest.TestCase):
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(8, 9)
         commands = self.decide(state)
-        self.assertEqual(commands[pioneer.id]['action'], 'buy')
-        self.assertEqual(commands[pioneer.id]['name'], 'WeaponUpgradeVoucher2')
+        buys = [c for c in commands.values() if c.get('action') == 'buy']
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher2')
+        self.assertNotEqual(commands.get(pioneer.id, {}).get('name'), 'WeaponUpgradeVoucher2')
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
         from src.agent.brain import maybe_start_shop_item_job

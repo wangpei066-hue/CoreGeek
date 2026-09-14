@@ -13,9 +13,6 @@ NEAR_CAP_SLOTS = 2
 WORKER_WALL_OPPORTUNITY = 6
 PIONEER_TASK_OPPORTUNITY = 8
 BUILD_STONE_RESERVE = 4
-VOUCHER_FUND_TARGET = 130
-
-
 THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
 
 
@@ -102,7 +99,8 @@ def _voucher_opportunity(role, state, at_shop=False):
 def _voucher_trip_parts(role, state, blocked, weapon, cost):
     """返回(实际回合, 综合代价)；走不通或钱凑不够则 None。"""
     from .brain import find_zone
-    from .opening import adjacent_path
+    from .opening import adjacent_path, mobile_walkable
+    blocked = mobile_walkable(state, blocked, set())
     if weapon is None:
         return None
     if _voucher_holder(role):
@@ -113,6 +111,7 @@ def _voucher_trip_parts(role, state, blocked, weapon, cost):
         return time_needed, time_needed + _voucher_opportunity(role, state)
     gold = state.team_our.gold_num if state.team_our else 0
     sell_extra = 0
+    start = role
     if gold < cost:
         if role.role_type != 'worker':
             return None
@@ -121,54 +120,82 @@ def _voucher_trip_parts(role, state, blocked, weapon, cost):
             return None
         ores = sellable_ores(role, state)
         vendors = [z.pos for z in state.map_info.zones if z.neutral_type == 'vendor']
-        vendor_paths = [adjacent_path(role, pos, blocked, state) for pos in vendors]
-        vendor_lens = [len(p) for p in vendor_paths if p is not None]
-        if not vendor_lens:
+        vendor_choices = []
+        for pos in vendors:
+            path = adjacent_path(role, pos, blocked, state)
+            if path is not None:
+                vendor_choices.append((len(path), path, pos))
+        if not vendor_choices:
             return None
-        sell_extra = min(vendor_lens) + max(1, len(ores))
+        _, vendor_path, vendor_pos = min(vendor_choices, key=lambda c: (c[0], c[2].x, c[2].y))
+        sell_extra = len(vendor_path) + max(1, len(ores))
+        sell_at = vendor_path[-1] if vendor_path else vendor_pos
+        start = Role(role.id, sell_at, role.role_type, role.health)
     shop = find_zone(state, 'weaponShop')
     if shop is None:
         return None
-    if chebyshev(role.pos, shop.pos) <= 1:
+    if chebyshev(start.pos, shop.pos) <= 1:
         shop_steps = 0
-        at_shop = True
+        to_shop = []
+        at_shop = chebyshev(role.pos, shop.pos) <= 1 and gold >= cost
     else:
-        to_shop = adjacent_path(role, shop.pos, blocked, state)
+        to_shop = adjacent_path(start, shop.pos, blocked, state)
         if to_shop is None:
             return None
         shop_steps = len(to_shop)
         at_shop = False
-    use_travel = chebyshev(shop.pos, weapon.pos)
-    time_needed = sell_extra + shop_steps + 1 + use_travel + 1
+    shop_stand = start.pos if not to_shop else to_shop[-1]
+    stand = Role(role.id, shop_stand, role.role_type, role.health)
+    use_path = adjacent_path(stand, weapon.pos, blocked, state)
+    if use_path is None:
+        return None
+    time_needed = sell_extra + shop_steps + 1 + len(use_path) + 1
     return time_needed, time_needed + _voucher_opportunity(role, state, at_shop=at_shop)
 
 
 def pick_weapon_voucher_buyer(state, blocked=None):
-    """在能按时完成的人里选综合代价最低的；已持券优先。不按「开拓者空闲」一刀切。"""
+    """在能按时完成的人里选综合代价最低的；已持券优先。执行中任务保持稳定，除非阵亡、不可达或赶不上截止。"""
     if not state.team_our or not state.map_info:
         return None
     from .brain import item_cost, voucher_for, weapon_upgrade_due
     from .grid import build_blocked_set
-    from .opening import MUSTER_BUFFER, movement_avoid
+    from .opening import MUSTER_BUFFER, mobile_walkable, movement_avoid, station_return_steps
     from .tactics import night_wave_cleared, threat_eta_to_base
     if blocked is None:
         blocked = build_blocked_set(state) | movement_avoid(state)
+    blocked = mobile_walkable(state, blocked, set())
+    weapon = _upgrade_target_weapon(state)
+    name, _ = voucher_for('weapon', (weapon.level or 1) if weapon else 1)
+    cost = item_cost(name, state)
+    arrival = None if night_wave_cleared(state) else threat_eta_to_base(state)
+
+    def still_ok(role):
+        if role is None or role.health <= 0:
+            return False
+        parts = _voucher_trip_parts(role, state, blocked, weapon, cost)
+        if parts is None:
+            return False
+        time_needed, _ = parts
+        gun_back = station_return_steps(role, state, blocked, from_pos=weapon.pos if weapon else None)
+        if gun_back is None:
+            return False
+        total = time_needed + gun_back
+        if arrival is not None and total + MUSTER_BUFFER >= arrival:
+            return False
+        return True
+
     existing = next((j for j in state.worker_item_jobs.values() if j.get('kind') == 'weapon'), None)
     if existing:
         owner = next((r for r in state.team_our.roles
                       if r.id in state.worker_item_jobs
                       and state.worker_item_jobs[r.id].get('kind') == 'weapon'
                       and r.health > 0), None)
-        if owner:
+        if still_ok(owner):
             return owner
-    if not weapon_upgrade_due(state):
+    if not weapon_upgrade_due(state) and not existing:
         return None
-    weapon = _upgrade_target_weapon(state)
     if weapon is None:
         return None
-    name, _ = voucher_for('weapon', weapon.level or 1)
-    cost = item_cost(name, state)
-    arrival = None if night_wave_cleared(state) else threat_eta_to_base(state)
     best = None
     for role in state.team_our.roles:
         if role.role_type not in ('worker', 'pioneer') or role.health <= 0:
@@ -179,37 +206,42 @@ def pick_weapon_voucher_buyer(state, blocked=None):
         if parts is None:
             continue
         time_needed, score = parts
-        if arrival is not None and time_needed + MUSTER_BUFFER >= arrival:
+        gun_back = station_return_steps(role, state, blocked, from_pos=weapon.pos)
+        if gun_back is None:
+            continue
+        total = time_needed + gun_back
+        if arrival is not None and total + MUSTER_BUFFER >= arrival:
             continue
         holder = 0 if _voucher_holder(role) else 1
         role_rank = 0 if role.role_type == 'pioneer' else 1
-        key = (holder, score, time_needed, role_rank, role.id)
+        key = (holder, score + gun_back, total, role_rank, role.id)
         if best is None or key < best[0]:
-            best = (key, role, time_needed, score)
+            best = (key, role, total, score)
     if best is None:
         return None
     _, role, time_needed, score = best
-    trace(state, role.id, 'voucher_buyer_pick', '按到店、购买、使用与耽误原工作的完整代价派人买券',
+    trace(state, role.id, 'voucher_buyer_pick', '按卖矿绕路、到店、使用和回炮的完整代价派人买券',
           time_needed=time_needed, score=score, weapon_id=weapon.id, required_gold=cost)
     return role
 
 
 def defense_due(role, state, blocked):
-    """安全余量 = 威胁到达时间 − 结束当前动作并到操炮位的时间。不足则回防。
-    夜间未确认清波一律回炮；留任务点由 pioneer_should_hold_task 另判。"""
+    """安全余量不足则回防。高压和正在受攻击优先于历史空窗；找不到回路则停止新外出。"""
     from .opening import MUSTER_BUFFER, station_return_steps
     from .brain import is_day_round
-    from .tactics import night_wave_cleared, pressure, threat_eta_to_base
+    from .tactics import imminent_contact, night_wave_cleared, pressure, threat_eta_to_base
+    if pressure(state) or imminent_contact(state):
+        return True
+    travel = station_return_steps(role, state, blocked)
+    if travel is None:
+        return True
     if night_wave_cleared(state):
         return False
-    if pressure(state):
-        return True
     if not is_day_round(state.round_no):
         return True
     arrival = threat_eta_to_base(state)
     if arrival is None:
         return True
-    travel = station_return_steps(role, state, blocked)
     return travel + MUSTER_BUFFER >= arrival
 
 
@@ -243,8 +275,17 @@ def pioneer_should_hold_task(pioneer, state) -> bool:
     if pressure(state):
         return False
     eta = threat_eta_to_base(state)
-    if solver_ready_to_submit(state) and (eta is None or eta > 1):
-        return True
+    from .grid import build_blocked_set
+    from .opening import MUSTER_BUFFER, movement_avoid, station_return_steps
+    blocked = build_blocked_set(state) | movement_avoid(state)
+    if solver_ready_to_submit(state):
+        back = station_return_steps(pioneer, state, blocked)
+        if back is None:
+            return False
+        need = 1 + back + MUSTER_BUFFER
+        if eta is None or eta > need:
+            return True
+        return False
     if not solver_can_progress(state):
         return False
     return two_guns_can_hold(state)
@@ -344,8 +385,8 @@ def liquidate(role, state, blocked, reserved):
     if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and value >= gap:
         triggers.append('卖掉本包后工人去买武器升级券')
     if (state.round_no or 0) < 70:
-        if need_voucher and gap and state.team_our.gold_num + value >= VOUCHER_FUND_TARGET:
-            triggers.append('筹集约130金币购买武器升级券')
+        if need_voucher and gap and state.team_our.gold_num + value >= next_weapon_voucher_cost(state):
+            triggers.append('现金加本包估值已够本次必要升级券')
         elif not triggers and role.id not in committed:
             return False, None
     else:
@@ -383,6 +424,10 @@ def liquidate(role, state, blocked, reserved):
         return_lengths = [len(p) for p in return_paths if p is not None]
         return_time = min(return_lengths) if return_lengths else (0 if not weapons else 10000)
         sale_rounds = len(path) + len(ores) + return_time + MUSTER_BUFFER
+        if return_time >= 10000:
+            trace(state, role.id, 'sale_too_late', '卖完后找不到回路，不批准这趟外出',
+                  estimated_rounds=sale_rounds, return_time=return_time)
+            return False, None
         if not night_wave_cleared(state):
             arrival = threat_eta_to_base(state)
             if arrival is None or sale_rounds >= arrival:

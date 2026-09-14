@@ -16,7 +16,6 @@ DAY1_WALL_TARGET = 8
 DAY2_WALL_TARGET = 12
 VOUCHER_USE_SLACK = 4  # 买券后走到最前火箭并使用的余量，不是官方耗时。
 WALL_STEP_SLACK = 1    # 每段墙在建造外再留1回合走位。
-FALLBACK_TRAVEL = 8
 LATE_BUILD_SLACK = 2   # 墙工时 overrun 的初值，随后按入夜时是否仍缺墙调整。
 MAX_WALL_OVERRUN = 12
 
@@ -201,7 +200,7 @@ def _shortest_adjacent(roles, targets, blocked, state):
             cost = len(path)
             if best is None or cost < best:
                 best = cost
-    return FALLBACK_TRAVEL if best is None else best
+    return best
 
 
 def wall_finish_rounds(state, missing, blocked):
@@ -214,9 +213,17 @@ def wall_finish_rounds(state, missing, blocked):
     stones = sum(r.backpack.count('stone') for r in workers)
     collect = max(0, n - stones)
     mines = [z.pos for z in state.map_info.zones if z.neutral_type == 'stone']
-    mine_travel = _shortest_adjacent(workers, mines, blocked, state) if collect and mines else 0
+    mine_travel = 0
+    if collect and mines:
+        mine_travel = _shortest_adjacent(workers, mines, blocked, state)
+        if mine_travel is None:
+            return 10 ** 6
     gaps = [Pos(*p) for p in missing]
-    gap_travel = _shortest_adjacent(workers, gaps, blocked, state) if gaps else 0
+    gap_travel = 0
+    if gaps:
+        gap_travel = _shortest_adjacent(workers, gaps, blocked, state)
+        if gap_travel is None:
+            return 10 ** 6
     return mine_travel + -(-collect // hands) + gap_travel + n * WALL_STEP_SLACK + -(-n // hands)
 
 
@@ -225,7 +232,9 @@ def voucher_trip_rounds(state, blocked, gold, need_sell):
     from .brain import item_cost
     workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
     shops = [z.pos for z in state.map_info.zones if z.neutral_type == 'weaponShop']
-    shop_travel = _shortest_adjacent(workers, shops, blocked, state) if shops else FALLBACK_TRAVEL
+    shop_travel = _shortest_adjacent(workers, shops, blocked, state) if shops else None
+    if shop_travel is None:
+        return None
     trip = shop_travel + 1 + VOUCHER_USE_SLACK
     if gold >= item_cost('WeaponUpgradeVoucher1', state) or any(
             'WeaponUpgradeVoucher1' in r.backpack for r in workers):
@@ -235,7 +244,10 @@ def voucher_trip_rounds(state, blocked, gold, need_sell):
     vendors = [z.pos for z in state.map_info.zones if z.neutral_type == 'vendor']
     if not vendors:
         return None
-    return _shortest_adjacent(workers, vendors, blocked, state) + 3 + trip
+    vendor_travel = _shortest_adjacent(workers, vendors, blocked, state)
+    if vendor_travel is None:
+        return None
+    return vendor_travel + 3 + trip
 
 
 def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked):
@@ -299,15 +311,19 @@ def staged_wall_missing(state):
     return [p for p in staged_wall_plan(state, base) if p not in existing]
 
 
-def station_return_steps(role, state, blocked):
-    """该角色走到操炮位（或基地旁）的步数；找不到路时用保守行程。"""
+def station_return_steps(role, state, blocked, from_pos=None):
+    """走到操炮位（或基地旁）的步数；找不到路返回 None，不能当成固定 8 回合可达。"""
+    from dataclasses import replace
+    actor = replace(role, pos=from_pos) if from_pos is not None else role
     weapon = assign_weapons(state).get(role.id)
     if weapon is None:
         base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
-        path = adjacent_path(role, base.pos, blocked, state) if base else None
-        return FALLBACK_TRAVEL if path is None else len(path)
-    path = station_path(role, weapon, blocked, state)
-    return FALLBACK_TRAVEL if path is None else len(path)
+        if base is None:
+            return 0
+        path = adjacent_path(actor, base.pos, blocked, state)
+        return None if path is None else len(path)
+    path = station_path(actor, weapon, blocked, state)
+    return None if path is None else len(path)
 
 
 def wall_overrun_margin(state):
@@ -321,11 +337,15 @@ def update_wall_time_overrun(state):
     overrun = wall_overrun_margin(state)
     front_missing = critical_wall_missing(state)
     stage_missing = staged_wall_missing(state)
+    attempted = bool((state.policy_memory or {}).pop('wall_work_attempted', False))
     still_open = bool(front_missing or stage_missing)
-    if still_open:
+    if still_open and attempted:
         state.policy_memory['wall_time_overrun'] = min(MAX_WALL_OVERRUN, overrun + 2)
-        trace(state, None, 'wall_time_overrun', '入夜时关键或阶段墙未完成，加大施工余量',
+        trace(state, None, 'wall_time_overrun', '已安排施工但入夜仍缺墙，加大工时余量',
               overrun=state.policy_memory['wall_time_overrun'],
+              missing=len(set(front_missing) | set(stage_missing)))
+    elif still_open:
+        trace(state, None, 'wall_unfinished_other', '入夜仍缺墙，但本昼未见施工，不把缺石/采购/非法当成工时低估',
               missing=len(set(front_missing) | set(stage_missing)))
     elif overrun > LATE_BUILD_SLACK:
         state.policy_memory['wall_time_overrun'] = overrun - 1
@@ -351,7 +371,11 @@ def worker_wall_muster_rounds(state, role, missing):
     collect = max(0, share - stones)
     mines = [z.pos for z in state.map_info.zones if z.neutral_type == 'stone']
     mine_roles = [role] if role is not None else workers
-    mine_travel = _shortest_adjacent(mine_roles, mines, blocked, state) if collect and mines else 0
+    mine_travel = 0
+    if collect and mines:
+        mine_travel = _shortest_adjacent(mine_roles, mines, blocked, state)
+        if mine_travel is None:
+            return 10 ** 6
     gaps = [Pos(*p) for p in missing]
     if role is not None and gaps:
         lengths = []
@@ -359,10 +383,14 @@ def worker_wall_muster_rounds(state, role, missing):
             path = wall_approach_path(role, gap, blocked, state)
             if path is not None:
                 lengths.append(len(path))
-        gap_travel = min(lengths) if lengths else FALLBACK_TRAVEL
+        gap_travel = min(lengths) if lengths else None
         gun_travel = station_return_steps(role, state, blocked)
+        if gap_travel is None or gun_travel is None:
+            return 10 ** 6
     else:
         gap_travel = _shortest_adjacent(workers, gaps, blocked, state) if gaps else 0
+        if gaps and gap_travel is None:
+            return 10 ** 6
         gun_travel = MUSTER_BUFFER
     return mine_travel + collect + gap_travel + share * WALL_STEP_SLACK + gun_travel + MUSTER_BUFFER + wall_overrun_margin(state)
 
@@ -653,6 +681,7 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
             return False, None
         cmd = try_build(role, state, blocked, reserved)
         if cmd:
+            state.policy_memory['wall_work_attempted'] = True
             return True, cmd
         return False, None
     paths = [adjacent_path(role, z.pos, blocked | reserved, state) for z in state.map_info.zones if z.neutral_type == 'stone']
@@ -687,6 +716,52 @@ def adjacent_critical_build(role, state, blocked, reserved):
         return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': x, 'y': y}]},
                         '夜间空窗就近补正面墙，不离开操炮位')
     return None
+
+
+def emergency_front_seal(role, state, blocked, reserved):
+    """正面缺口会使关键目标暴露，且工人能在安全窗内封堵时，暂停未买到手的采购。"""
+    from .tactics import threat_eta_to_base, threat_robots
+    if role.role_type != 'worker' or 'stone' not in role.backpack:
+        return None
+    gaps = [Pos(*p) for p in critical_wall_missing(state)]
+    if not gaps:
+        return None
+    near = [g for g in gaps if chebyshev(role.pos, g) <= 2]
+    if not near:
+        return None
+    job = state.worker_item_jobs.get(role.id)
+    if job and job.get('item') in role.backpack:
+        return None
+    travel = station_return_steps(role, state, blocked)
+    arrival = threat_eta_to_base(state)
+    if travel is None:
+        return None
+    if arrival is not None and 1 + travel + MUSTER_BUFFER >= arrival and not threat_robots(state):
+        if min(chebyshev(role.pos, g) for g in near) > 1:
+            return None
+    target = min(near, key=lambda g: (chebyshev(role.pos, g), g.x, g.y))
+    path = wall_approach_path(role, target, blocked | reserved, state)
+    if path is None:
+        retreat = interior_retreat_path(role, blocked | reserved, state)
+        if not retreat:
+            return None
+        state.policy_memory['wall_work_attempted'] = True
+        trace(state, role.id, 'emergency_front_seal', '正面紧急缺口，先回到院内再封堵')
+        return move_on_path(state, role, retreat, reserved, '正面紧急缺口，先回到院内再封堵')
+    if path:
+        state.policy_memory['wall_work_attempted'] = True
+        trace(state, role.id, 'emergency_front_seal', '正面紧急缺口，暂停非紧急采购先封堵')
+        return move_on_path(state, role, path, reserved, '正面紧急缺口，先走到封堵位置')
+    if (target.x, target.y) in blocked | reserved or (target.x, target.y, 'wall') in state.failed_build_spots:
+        return None
+    assignments = assign_weapons(state)
+    if not safe_wall(state, (target.x, target.y), blocked | reserved, assignments):
+        return None
+    reserved.add((target.x, target.y))
+    state.policy_memory['wall_work_attempted'] = True
+    trace(state, role.id, 'emergency_front_seal', '正面紧急缺口，暂停非紧急采购先封堵')
+    return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': target.x, 'y': target.y}]},
+                    '正面紧急缺口，暂停非紧急采购先封堵')
 
 
 def safe_wall(state, point, blocked, assignments):
@@ -746,8 +821,11 @@ def plan_opening(state):
     remaining = 70 - state.round_no
     travel = [weapon_approach_path(r, assignments[r.id], blocked, set(), state)
               for r in fighters if r.id in assignments]
-    lengths = [len(p) if p is not None else FALLBACK_TRAVEL for p in travel]
-    muster_need = max(lengths + [0]) + MUSTER_BUFFER
+    reachable = [len(p) for p in travel if p is not None]
+    if travel and not reachable:
+        muster_need = remaining + MUSTER_BUFFER
+    else:
+        muster_need = max(reachable + [0]) + MUSTER_BUFFER
     muster = bool(weapons) and remaining <= muster_need
     upgraded_once = any((w.level or 1) >= 2 for w in weapons)
     has_three = len(weapons) >= 3
@@ -810,11 +888,17 @@ def plan_opening(state):
             continue
         heal = decide_emergency_heal(role, state)
         if heal:
-            commands[role.id] = selected(state, role.id, heal, '血量过低且近敌，紧急用药')
+            commands[role.id] = selected(state, role.id, heal, '低血紧急治疗')
             continue
         budget_state = copy(state)
         budget_state.team_our = copy(state.team_our)
         budget_state.team_our.gold_num = gold
+        if has_three and role.role_type == 'worker':
+            from .opening import emergency_front_seal
+            seal = emergency_front_seal(role, state, blocked, reserved)
+            if seal:
+                commands[role.id] = seal
+                continue
         if has_three and role.role_type == 'pioneer':
             from .brain import decide_pioneer_voucher
             cmd = decide_pioneer_voucher(role, budget_state, blocked, reserved)

@@ -244,8 +244,11 @@ class OpeningTests(unittest.TestCase):
         state.round_no = 20
         state.team_our.gold_num = 130
         self._rockets(state)
+        for i, y in enumerate(range(7, 13)):
+            state.team_our.roles.append(make_role(40 + i, 13, y, 'wall', level=1, health=1000))
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         state.team_our.roles[1].pos = Pos(8, 9)
+        state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertIn(1, state.worker_item_jobs)
         self.assertEqual(state.worker_item_jobs[1]['kind'], 'weapon')
@@ -385,6 +388,39 @@ class OpeningTests(unittest.TestCase):
         self.assertFalse(any(c['action'] == 'attack' for c in commands.values()))
         self.assertTrue(any(c['action'] in ('move', 'collect', 'build', 'acceptTask') for c in commands.values()))
         self.assertIn(commands[3]['action'], ('move', 'acceptTask', 'collect'))
+
+    def test_night_probe_revoked_when_robots_return(self):
+        state = opening_state()
+        state.round_no = 81
+        self._rockets(state)
+        state.team_our.roles[1].pos = Pos(6, 9)
+        state.team_our.roles[1].backpack = []
+        state.team_our.roles[2].backpack = []
+        state.policy_memory['night_saw_threat'] = True
+        state.policy_memory['night_empty_streak'] = 8
+        state.robot.roles = [RobotRole(30001, Pos(20, 10), 'smallRobot', 40)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(state.policy_memory['night_empty_streak'], 0)
+        self.assertFalse(any(e['code'] == 'night_wave_cleared' for e in state.decision_events))
+        self.assertFalse(any(c['action'] in ('collect', 'acceptTask') for c in commands.values()))
+        self.assertTrue(any(c['action'] in ('attack', 'move') for c in commands.values()))
+
+    def test_front_gap_with_stone_pauses_voucher_buy(self):
+        from src.agent.protocol import PlayerTask
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.phase_task = {'taskType': '自进化类1'}
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        state.team_our.roles[1].pos = Pos(12, 7)
+        state.team_our.roles[1].backpack = ['stone'] * 2
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[1]['action'], 'build')
+        self.assertEqual(commands[1]['name'], 'wall')
+        self.assertTrue(any(e['code'] == 'emergency_front_seal' and e.get('role_id') == 1
+                            for e in state.decision_events))
 
     def test_night_empty_one_round_still_holds_guns(self):
         state = opening_state()

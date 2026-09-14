@@ -297,7 +297,10 @@ class SelfHealTests(unittest.TestCase):
         state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertEqual(commands[10010], {"action": "use", "name": "Medicine"})
-        self.assertNotIn(10020, commands)
+        self.assertFalse(any(str(c.get('controllerId')) == '10010' for c in commands.values()))
+        occupied = [k for k, c in commands.items()
+                    if k == 10010 or str(c.get('controllerId')) == '10010']
+        self.assertEqual(occupied, [10010])
 
     def test_wall_material_collection_preempts_self_heal(self):
         state = minimal_state(round_no=135)

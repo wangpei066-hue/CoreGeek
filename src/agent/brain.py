@@ -201,7 +201,7 @@ def decide_self_heal(role: Role):
 
 
 def lethal_next_round(role: Role, state: "MatchState") -> bool:
-    """近敌且血量可能被下一击打掉时视为紧急。机器人单次伤害未经官方表确认，阈值偏保守。"""
+    """近敌且低血（≤30 或低于满血 15%）时视为紧急治疗。没有可靠伤害数据，不称为下一击致死。"""
     if role.health <= 0:
         return False
     from .tactics import threat_robots
@@ -212,7 +212,7 @@ def lethal_next_round(role: Role, state: "MatchState") -> bool:
 
 
 def decide_emergency_heal(role: Role, state: "MatchState"):
-    """预计下一轮可能阵亡且有药时抢占当前动作。"""
+    """低血紧急治疗：近敌且低于阈值、背包有药时抢占当前动作。"""
     if "Medicine" not in role.backpack:
         return None
     if not lethal_next_round(role, state):
@@ -700,13 +700,16 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
 def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set):
     from .economy import liquidate, profitable_mine, muster_for_night, worker_should_shop_weapon_voucher
     from .tactics import tactical_action
-    from .opening import replenish_walls, staged_walls_incomplete, worker_should_build_walls
+    from .opening import replenish_walls, staged_walls_incomplete, worker_should_build_walls, emergency_front_seal
     heal = decide_emergency_heal(worker, state)
     if heal:
-        return selected(state, worker.id, heal, '血量过低且近敌，紧急用药')
+        return selected(state, worker.id, heal, '低血紧急治疗')
     handled, cmd = muster_for_night(worker, state, blocked, reserved)
     if handled:
         return cmd
+    seal = emergency_front_seal(worker, state, blocked, reserved)
+    if seal:
+        return seal
     allow_build = worker_should_build_walls(state, worker)
     allow_weapon = worker_should_shop_weapon_voucher(worker, state, blocked)
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
@@ -806,12 +809,17 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
                 return True, cmd
         return False, None
     for task in candidates:
-        from .opening import MUSTER_BUFFER, adjacent_path, assign_weapons
+        from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
         from .tactics import night_wave_cleared, threat_eta_to_base
         route = adjacent_path(pioneer, task.task_position, blocked | reserved, state)
-        weapon = assign_weapons(state).get(pioneer.id)
-        return_distance = chebyshev(task.task_position, weapon.pos) if weapon else 8
-        required = (len(route) if route is not None else 10000) + (task.timeout_rounds or 15) + return_distance + MUSTER_BUFFER
+        if route is None:
+            continue
+        back = station_return_steps(pioneer, state, blocked, from_pos=task.task_position)
+        if back is None:
+            trace(state, pioneer.id, 'task_not_enough_time', '任务点回炮找不到路，不接这单',
+                  task_type=task.task_type)
+            continue
+        required = len(route) + (task.timeout_rounds or 15) + back + MUSTER_BUFFER
         arrival = threat_eta_to_base(state)
         if not night_wave_cleared(state) and (arrival is None or required >= arrival):
             trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取',
@@ -833,7 +841,7 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
     from .tactics import tactical_action
     heal = decide_emergency_heal(pioneer, state)
     if heal:
-        return selected(state, pioneer.id, heal, '血量过低且近敌，紧急用药')
+        return selected(state, pioneer.id, heal, '低血紧急治疗')
     handled, cmd = muster_for_night(pioneer, state, blocked, reserved)
     if handled:
         return cmd
@@ -948,7 +956,7 @@ def plan_night(state: "MatchState") -> dict:
     blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
     robots = threat_robots(state)
     if night_wave_cleared(state):
-        trace(state, None, 'night_wave_cleared', '夜间威胁已清空，转为任务、采矿和修墙抢回合')
+        trace(state, None, 'night_wave_cleared', '连续空窗达到试探外出条件，不是官方清波；转为任务、采矿和修墙')
         for role in state.team_our.roles:
             if role.role_type == 'worker':
                 cmd = decide_worker_day(role, state, blocked, reserved)
@@ -976,7 +984,7 @@ def plan_night(state: "MatchState") -> dict:
     for fighter in fighters:
         heal = decide_emergency_heal(fighter, state)
         if heal:
-            commands[fighter.id] = selected(state, fighter.id, heal, '血量过低且近敌，紧急用药')
+            commands[fighter.id] = selected(state, fighter.id, heal, '低血紧急治疗')
             continue
         if urgent:
             cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
@@ -1076,6 +1084,37 @@ class BasicActionValidator(ActionValidator):
             raise ValueError(f"{action} requires name")
 
 
+def command_actor_id(key, command):
+    if command.get('action') == 'attack':
+        try:
+            return int(command.get('controllerId'))
+        except (TypeError, ValueError):
+            return None
+    return key
+
+
+def resolve_actor_conflicts(commands: dict, state: "MatchState") -> dict:
+    """同一执行角色只能有一条指令：紧急治疗覆盖其操炮及其它动作。计划阶段的预算副本会丢弃，不改活状态金币。"""
+    if not commands or not state.team_our:
+        return commands
+    roles = {r.id: r for r in state.team_our.roles}
+    healers = set()
+    for key, command in commands.items():
+        role = roles.get(key)
+        if (command.get('action') == 'use' and command.get('name') == 'Medicine'
+                and role and decide_emergency_heal(role, state)):
+            healers.add(role.id)
+    kept = {}
+    for key, command in commands.items():
+        actor = command_actor_id(key, command)
+        if actor in healers and not (
+                command.get('action') == 'use' and command.get('name') == 'Medicine' and key == actor):
+            trace(state, actor, 'emergency_heal_preempts', '低血紧急治疗覆盖该角色的操炮或其它动作', dropped=command)
+            continue
+        kept[key] = command
+    return kept
+
+
 class V1Strategy(Strategy):
     """V1：白天经济+机会性建造，夜晚武器操控战斗。"""
 
@@ -1110,6 +1149,7 @@ class V1Strategy(Strategy):
                     heal = decide_self_heal(role)
                     if heal:
                         commands[role.id] = selected(state, role.id, heal, '所有更高优先级分支均无行动，最后自救')
+        commands = resolve_actor_conflicts(commands, state)
         commands = self._filter_valid(commands, state)
         state.last_sent_command = commands
         return commands
