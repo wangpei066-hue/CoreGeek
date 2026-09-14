@@ -15,13 +15,63 @@ VOUCHER_FUND_TARGET = 130
 THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
 
 
+def live_pioneer(state):
+    return next((r for r in (state.team_our.roles if state.team_our else [])
+                 if r.role_type == 'pioneer' and r.health > 0), None)
+
+
+def pioneer_available_to_buy_voucher(state):
+    """进行中的任务不中断；空闲开拓者才去买券。"""
+    pioneer = live_pioneer(state)
+    return bool(pioneer and not state.phase_task)
+
+
+def next_weapon_voucher_cost(state):
+    from .brain import item_cost, voucher_for, WEAPON_TYPES, _pick_upgradeable
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, set(), max_current_level=2)
+    if weapon is None:
+        return item_cost('WeaponUpgradeVoucher1', state)
+    name, _ = voucher_for('weapon', weapon.level or 1)
+    return item_cost(name, state)
+
+
+def backpack_ore_value(role, state):
+    ores = sellable_ores(role, state)
+    prices = ore_prices(state)
+    return sum(prices.get(name, 0) * count for name, count in ores.items())
+
+
+def worker_should_shop_weapon_voucher(role, state):
+    """工人买券：开拓者空闲且金币已够时让开拓者买；否则背包估值够缺口或金币已够则工人去买。"""
+    from .brain import should_upgrade_weapon
+    if role.role_type != 'worker' or not should_upgrade_weapon(state):
+        return False
+    cost = next_weapon_voucher_cost(state)
+    if pioneer_available_to_buy_voucher(state) and state.team_our.gold_num >= cost:
+        return False
+    if any(isinstance(item, str) and 'WeaponUpgradeVoucher' in item for item in role.backpack):
+        return True
+    if state.team_our.gold_num >= cost:
+        return True
+    return backpack_ore_value(role, state) >= cost - state.team_our.gold_num
+
+
 def defense_due(role, state, blocked):
     """夜间、白天第50回合或返程余量不足时，防守覆盖任务与经济。"""
-    from .opening import assign_weapons, station_path
-    from .tactics import pressure
+    from .opening import assign_weapons, station_path, staged_walls_incomplete
+    from .tactics import night_wave_cleared, pressure
+    if night_wave_cleared(state):
+        return False
     cycle = (state.round_no or 0) % 130
-    if cycle >= 50 or pressure(state):
+    if pressure(state):
         return True
+    if cycle >= 50:
+        # 第一晚后工人若还要攒石/末段建墙，不按第50回合一刀切回防。
+        if (role.role_type == 'worker' and (state.round_no or 0) >= 70
+                and staged_walls_incomplete(state)):
+            pass
+        else:
+            return True
     weapon = assign_weapons(state).get(role.id)
     if weapon is None:
         return False
@@ -44,8 +94,10 @@ def task_defense_override(state) -> bool:
 def muster_for_night(role, state, blocked, reserved):
     """所有白天都按实际返程距离提前回防，而非仅首日集合。"""
     from .opening import assign_weapons, station_path, move_on_path
+    from .tactics import night_wave_cleared, pressure
+    if night_wave_cleared(state):
+        return False, None
     cycle = (state.round_no or 0) % 130
-    from .tactics import pressure
     if (state.round_no or 0) < 70 and role.role_type == 'worker' and not pressure(state):
         return False, None  # 首日由施工计划按实际武器返程时间集合。
     if not defense_due(role, state, blocked):
@@ -79,11 +131,18 @@ def sellable_ores(role, state):
     base = own_station(state)
     reserve = 0
     if base and role.role_type == 'worker':
-        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
+        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
         missing = len(set(staged_wall_plan(state, base)) - walls)
-        workers = max(1, sum(r.role_type == 'worker' and r.health > 0 for r in state.team_our.roles))
-        reserve = min(BUILD_STONE_RESERVE, (missing + workers - 1) // workers)
+        workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
+        hands = max(1, len(workers))
         from .brain import max_health
+        if (state.round_no or 0) >= 70 and missing:
+            # 第一晚后建墙用石全部留着，只卖超出缺口的部分。
+            others = sum(r.backpack.count('stone') for r in workers if r.id != role.id)
+            still_need = max(0, missing - others)
+            reserve = min(ores['stone'], still_need)
+        else:
+            reserve = min(BUILD_STONE_RESERVE, (missing + hands - 1) // hands)
         if base.health < max_health(base) * 0.7:
             reserve = min(reserve, 1)
     ores['stone'] = max(0, ores['stone'] - reserve)
@@ -117,10 +176,12 @@ def liquidate(role, state, blocked, reserved):
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
     need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
     voucher_need = item_cost('WeaponUpgradeVoucher1', state)
+    if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state):
+        triggers.append('背包矿石估值已够工人去买武器升级券')
     if (state.round_no or 0) < 70:
         if need_voucher and state.team_our.gold_num < voucher_need and state.team_our.gold_num + value >= VOUCHER_FUND_TARGET:
             triggers.append('筹集约130金币购买武器升级券')
-        elif role.id not in committed:
+        elif not triggers and role.id not in committed:
             return False, None
     else:
         if value >= SELL_VALUE:
@@ -178,17 +239,24 @@ def liquidate(role, state, blocked, reserved):
 
 
 def profitable_mine(role, state, blocked, reserved):
-    """按一批10次采集的报价/行程估算选择可达矿点；不按纯距离挑矿。"""
+    """按一批10次采集的报价/行程估算选择可达矿点；不按纯距离挑矿。仅工人可 collect。"""
     from .opening import adjacent_path, move_on_path
     from .world_intel import ore_blocked, ores_to_stockpile
+    if role.role_type != 'worker':
+        trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
+        return None
     if len(role.backpack) >= role.back_pack_capability:
         trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
         return None
     prices = ore_prices(state)
     vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor']
+    from .opening import stones_cover_wall_plan
+    skip_stone = stones_cover_wall_plan(state)
     candidates = []
     for mine in state.map_info.zones:
         if mine.neutral_type not in ('stone', 'iron', 'copper'):
+            continue
+        if skip_stone and mine.neutral_type == 'stone':
             continue
         if ore_blocked(state, mine.neutral_type):
             continue

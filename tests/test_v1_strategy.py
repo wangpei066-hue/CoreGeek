@@ -153,9 +153,8 @@ class V1StrategyDayTests(unittest.TestCase):
         worker = make_role(10010, 10, 10, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        # 保留少量施工石头，出售不用于建墙的矿石。
-        # 第一层缺墙时，施工覆盖顺路出售。
-        self.assertEqual(commands[10010]['action'], 'move')
+        # 第一晚后石头留给建墙，铁可以卖掉。
+        self.assertEqual(commands[10010]['action'], 'sell')
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night

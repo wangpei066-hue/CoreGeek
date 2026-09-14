@@ -74,10 +74,17 @@ class EconomyTests(unittest.TestCase):
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
         self.assertIn(role.id, state.policy_memory['selling_roles'])
 
-    def test_keeps_only_small_stone_reserve_and_never_sells_items(self):
+    def test_keeps_wall_stones_after_first_night_and_never_sells_items(self):
         state, role = economy_state()
         state.team_our.roles[0].health = 1500
         role.backpack = ['stone']*20 + ['Medicine', 'Bomb', 'WeaponUpgradeVoucher1']
+        self.assertEqual(sellable_ores(role, state), {'stone': 8})
+
+    def test_day1_still_uses_small_stone_reserve(self):
+        state, role = economy_state()
+        state.round_no = 20
+        state.team_our.roles[0].health = 1500
+        role.backpack = ['stone'] * 20
         self.assertEqual(sellable_ores(role, state), {'stone': 16})
 
     def test_low_health_triggers_sale_before_normal_threshold(self):

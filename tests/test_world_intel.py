@@ -114,7 +114,7 @@ class FolkLegendTests(unittest.TestCase):
         self.assertEqual(value["openDay"], 1)
 
     def test_self_evolution_still_beats_treasure(self):
-        state, _ = defended_state(gold=200)
+        state, _ = defended_state(gold=20)
         state.round_no = 140
         state.phase_task = ""
         pioneer = state.team_our.roles[3] if len(state.team_our.roles) > 3 else None

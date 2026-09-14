@@ -20,7 +20,9 @@ def begin_round(state):
     state.bombed_robots = set()
     from .world_intel import ingest_news
     ingest_news(state)
-    from .brain import own_station
+    from .brain import is_day_round, own_station
+    if is_day_round(state.round_no):
+        state.policy_memory.pop('night_saw_threat', None)
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)
     if base:
@@ -41,6 +43,18 @@ def front_breached(state):
 def threat_robots(state):
     return [r for r in (state.robot.roles if state.robot else [])
             if r.health > 0 and (not r.target_team or r.target_team == state.team_our.type)]
+
+
+def night_wave_cleared(state):
+    """见过本夜威胁且当前没有存活机器人时，转去采矿/修墙/做任务；开局空波次仍守炮。"""
+    from .brain import is_day_round
+    if is_day_round(state.round_no):
+        return False
+    living = threat_robots(state)
+    if living:
+        state.policy_memory['night_saw_threat'] = True
+        return False
+    return bool(state.policy_memory.get('night_saw_threat'))
 
 
 def pressure(state):

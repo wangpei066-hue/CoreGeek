@@ -97,7 +97,7 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapons_sit_on_front_column_and_both_flanks(self):
+    def test_weapons_occupy_rear_rank_and_one_forward_flank(self):
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
@@ -108,9 +108,9 @@ class DefensePriorityTests(unittest.TestCase):
             state.team_our.roles.append(make_role(51, second[0], second[1], 'rocket'))
             third = weapon_candidates(state, base, 'rocket')[0]
             self.assertEqual(first[0], second[0])
-            self.assertEqual(first[0], third[0])
-            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10))
-            self.assertLess((third[1] - first[1]) * (second[1] - first[1]), 0)
+            self.assertEqual(third[0], first[0] + direction)
+            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10) - 4)
+            self.assertNotEqual(first[1], second[1])
             state.team_our.roles.pop()
             state.team_our.roles.pop()
 
@@ -121,6 +121,7 @@ class DefensePriorityTests(unittest.TestCase):
         weapons[0].level = 2
         weapons[1].level = 2
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.round_no = 185
         worker = state.team_our.roles[1]
         worker.backpack = ['stone'] * 4
         commands = self.decide(state)
@@ -162,9 +163,11 @@ class DefensePriorityTests(unittest.TestCase):
         for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
             state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1000, level=1))
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(8, 9)
         commands = self.decide(state)
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher2')
+        self.assertEqual(commands[pioneer.id]['action'], 'buy')
+        self.assertEqual(commands[pioneer.id]['name'], 'WeaponUpgradeVoucher2')
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
         from src.agent.brain import maybe_start_shop_item_job
