@@ -189,12 +189,34 @@ class TreasureHttpTests(unittest.TestCase):
         effects = self.server.news_memory.banned_ores(2)
         self.assertIn("iron", effects)
 
-    def test_task_solver_owns_prompt_during_phase_task(self):
+    def test_news_diagnostics_via_execute_cmd_when_idle(self):
+        """无自进化任务时，新闻诊断应像 PIONEER_TASK 一样经 executeCmd 回传。"""
+        self.payload["roundNo"] = 200
+        self.payload["phaseTask"] = ""
+        self.payload["worldNews"] = {
+            "officialNews": "今日无重大新闻",
+            "folkLegends": "西部石门需三钥",
+        }
+        for task in self.payload["teamOur"]["playerTasks"]:
+            task["isValid"] = False
+        resp = self.client.post("/", json=self.payload)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertIn("NEWS_INFER", body["executeCmd"])
+        self.assertIn("folkLegends", body["executeCmd"])
+
+    def test_news_diagnostics_yields_sandbox_during_phase_task(self):
         self.payload["phaseTask"] = "请计算1+1"
         self.payload["roundNo"] = 10
         resp = self.client.post("/", json=self.payload)
-        # 任务求解器可能先发 executeCmd 读文档；prompt 不应被新闻路由器占用额度抢先
-        # phaseTask 活跃时新闻 prompt 必须为空让位；任务求解器自己的 prompt 仍可出现
+        cmd = resp.get_json().get("executeCmd") or ""
+        # 任务期间沙盒归自进化诊断/解题，新闻不抢 executeCmd
+        self.assertNotIn("NEWS_INFER", cmd)
+
+    def test_task_solver_owns_prompt_during_phase_task(self):
+        self.payload["phaseTask"] = "请计算1+1"
+        self.payload["roundNo"] = 10
+        self.client.post("/", json=self.payload)
         mem = self.server.news_memory
         self.assertNotEqual(mem.data.get("pendingConsumer"), "treasure")
         self.assertNotEqual(mem.data.get("pendingConsumer"), "ore")

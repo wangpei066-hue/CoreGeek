@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 from typing import Optional
 
 from .protocol import MatchState
 from .decision_log import trace
+from .news_logging import log_news_event
 
 DAY_NIGHT_CYCLE = 130
 ORE_ALIASES = {
@@ -165,11 +165,7 @@ class NewsMemory:
                     self._upsert_ore_effect(weak)
                     if getattr(state, "decision_events", None) is not None:
                         trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程", effect=weak)
-                    print(
-                        json.dumps({"marker": "NEWS_INFER", "event": "ore_heuristic",
-                                    "roundNo": state.round_no, "effect": weak}, ensure_ascii=False),
-                        file=sys.stderr, flush=True,
-                    )
+                    log_news_event(event="ore_heuristic", roundNo=state.round_no, effect=weak)
 
         if folk and folk.strip():
             legends = self.data.setdefault("legends", [])
@@ -181,12 +177,8 @@ class NewsMemory:
                 if getattr(state, "decision_events", None) is not None:
                     trace(state, None, "legend_appended", "民间传闻已累积，等待 LLM 解码",
                           day=day, legendCount=len(legends))
-                print(
-                    json.dumps({"marker": "NEWS_INFER", "event": "legend_appended",
-                                "roundNo": state.round_no, "day": day, "legendCount": len(legends)},
-                               ensure_ascii=False),
-                    file=sys.stderr, flush=True,
-                )
+                log_news_event(event="legend_appended", roundNo=state.round_no, day=day,
+                               legendCount=len(legends), text=folk[:500])
 
         self.save()
 

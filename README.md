@@ -171,7 +171,9 @@ pioneer 按距离选择 `teamOur.playerTasks` 中 `isValid=true` 且 `coldDownRo
 
 任务日志标记为 `PIONEER_TASK`。读取文件和执行工具时，平台沙盒输出包含 `requestId`、`event`、正文或结果的 JSON，下一回合进入 `lastCmdResult`。未使用沙盒解题的任务回合补充 `printf` 诊断，包含 `solverStage`、角色反馈、任务原文分片。诊断不会覆盖读文件或工具命令。程序 stderr 同时记录任务、阶段、`llmResp` 和 `lastCmdResult`。
 
-在平台运行结束后，从系统下载对局日志，搜索 `PIONEER_TASK`、`read_document`、`execute_tool`、`submitAnswer`、`prompt` 或 `llmResp`。发出接取或提交指令不代表成功，应结合系统下一回合的动作结果、任务原文与错误核对。此日志回传不依赖下载选手容器中的本地 `logs/` 目录。
+世界新闻日志标记为 `NEWS_INFER`，通道与自进化相同：stderr 始终写入；无自进化 `phaseTask` 且沙盒空闲时，经 `executeCmd` 的 `printf` 回传到下一回合 `lastCmdResult`（含 `worldNews` 摘要、`oreEffects`、传闻条数、`treasureHypothesis`、本回合 `inferEvents`）。有自进化任务时不抢沙盒，仅保留 stderr。
+
+在平台运行结束后，从系统下载对局日志，搜索 `PIONEER_TASK`、`NEWS_INFER`、`read_document`、`execute_tool`、`submitAnswer`、`prompt` 或 `llmResp`。发出接取或提交指令不代表成功，应结合系统下一回合的动作结果、任务原文与错误核对。此日志回传不依赖下载选手容器中的本地 `logs/` 目录。
 
 现有 docs 未提供平台上传、下载 API，也未说明下载文件包含哪些字段。因此本地已验证协议链路，实际平台 LLM、沙盒环境和最终下载文件可见性仍需上传对局验证。搜索限时 7 秒、工具执行限时 10 秒，单次工具输出最多保留 6000 字符；错误和截断信息会反馈给 LLM。
 
