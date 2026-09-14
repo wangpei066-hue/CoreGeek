@@ -74,6 +74,9 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         wall.level = 3
         wall.health = 2000
         maybe_start_shop_item_job(worker, state)
+        self.assertNotIn(1, state.worker_item_jobs)
+        state.round_no = 400
+        maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["kind"], "station")
 
     def test_damaged_wall_prefers_upgrade_because_it_heals(self):
@@ -111,6 +114,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
 
     def test_station_upgrade_when_no_damaged_wall(self):
         state = minimal_state(gold_num=1000)
+        state.round_no = 400
         worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
         maybe_start_shop_item_job(worker, state)
         job = state.worker_item_jobs[10010]
