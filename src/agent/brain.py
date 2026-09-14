@@ -10,6 +10,7 @@ from .protocol import (
 from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
+from .task_solver import MIN_TASK_TIMEOUT_ROUNDS
 
 
 DAY_ROUNDS = 70
@@ -896,6 +897,11 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         if not night_wave_cleared(state) and (arrival is None or required >= arrival):
             trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取',
                   required_rounds=required, threat_eta=arrival)
+            continue
+        if task.timeout_rounds is not None and task.timeout_rounds < MIN_TASK_TIMEOUT_ROUNDS:
+            trace(state, pioneer.id, 'task_timeout_too_short',
+                  '平台给出的时限不够完成探查、修复与提交，不接这单',
+                  task_type=task.task_type, timeout_rounds=task.timeout_rounds)
             continue
         if chebyshev(pioneer.pos, task.task_position) <= 1:
             return True, {"action": "acceptTask"}

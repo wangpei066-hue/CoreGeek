@@ -42,6 +42,12 @@ class PioneerTaskTests(unittest.TestCase):
                 task.update(invalid)
             self.assertNotEqual(self.decide(data).get(10011, {}).get('action'), 'acceptTask')
 
+    def test_short_platform_timeout_is_not_accepted(self):
+        data = self.payload()
+        for task in data['teamOur']['playerTasks']:
+            task['timeoutRounds'] = 2
+        self.assertNotEqual(self.decide(data).get(10011, {}).get('action'), 'acceptTask')
+
     def test_active_task_stays_day_and_night_even_after_restart(self):
         for round_no in (10, 80):
             data = self.payload(round_no)
