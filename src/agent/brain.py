@@ -9,6 +9,7 @@ from .protocol import (
 )
 from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
+from .news_memory import game_day, vendor_prices
 
 
 DAY_ROUNDS = 70
@@ -83,13 +84,40 @@ def find_zone(state: "MatchState", neutral_type: str):
     return None
 
 
-def nearest_mine(state: "MatchState", worker: Role):
+def nearest_mine(state: "MatchState", worker: Role, banned_ores=None, boosted_ores=None):
+    """选择可采且价高优先的最近矿；banned_ores 来自新闻记忆的停工日程。"""
     if not state.map_info:
         return None
-    candidates = [z for z in state.map_info.zones if z.neutral_type in ORE_TYPES]
+    banned = banned_ores or set()
+    boosted = boosted_ores or set()
+    prices = vendor_prices(state)
+    candidates = [z for z in state.map_info.zones if z.neutral_type in ORE_TYPES and z.neutral_type not in banned]
     if not candidates:
         return None
-    return min(candidates, key=lambda z: chebyshev(worker.pos, z.pos))
+    return min(
+        candidates,
+        key=lambda z: (
+            0 if z.neutral_type in boosted else 1,
+            -prices.get(z.neutral_type, 0),
+            chebyshev(worker.pos, z.pos),
+        ),
+    )
+
+
+def best_ore_to_sell(ore_in_backpack: list, state: "MatchState") -> tuple:
+    """按小贩实价优先出售单价最高的矿种。"""
+    prices = vendor_prices(state)
+    counts = Counter(ore_in_backpack)
+    name = max(counts.keys(), key=lambda n: (prices.get(n, 0), counts[n]))
+    return name, counts[name]
+
+
+def news_ore_filters(state: "MatchState"):
+    memory = getattr(state, "news_memory", None)
+    if memory is None:
+        return set(), set()
+    day = game_day(state.round_no)
+    return memory.banned_ores(day), memory.price_boosted_ores(day)
 
 
 def own_station(state: "MatchState"):
@@ -394,8 +422,8 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     ore_in_backpack = [item for item in worker.backpack if item in ORE_TYPES]
 
     if vendor and ore_in_backpack and chebyshev(worker.pos, vendor.pos) <= 1:
-        name, num = Counter(ore_in_backpack).most_common(1)[0]
-        return selected(state, worker.id, {"action": "sell", "name": name, "num": num}, "已在小贩一格内，优先出售数量最多的矿石")
+        name, num = best_ore_to_sell(ore_in_backpack, state)
+        return selected(state, worker.id, {"action": "sell", "name": name, "num": num}, "已在小贩一格内，按实价优先出售单价最高的矿石")
 
     buy_cmd = decide_buy_medicine(worker, state)
     if buy_cmd:
@@ -422,11 +450,13 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if item_job_cmd:
         return item_job_cmd
 
-    mine = nearest_mine(state, worker)
+    banned, boosted = news_ore_filters(state)
+    mine = nearest_mine(state, worker, banned_ores=banned, boosted_ores=boosted)
     if mine is None:
-        trace(state, worker.id, "no_mine", "当前快照没有石、铁、铜矿点")
+        trace(state, worker.id, "no_mine", "当前快照没有可采矿点", banned=sorted(banned))
     if mine:
-        trace(state, worker.id, "mine_selected", "按切比雪夫距离选择最近矿点", mineral=mine.neutral_type, target={"x": mine.pos.x, "y": mine.pos.y})
+        trace(state, worker.id, "mine_selected", "按涨价优先、实价、距离选择矿点",
+              mineral=mine.neutral_type, target={"x": mine.pos.x, "y": mine.pos.y}, banned=sorted(banned))
         if chebyshev(worker.pos, mine.pos) <= 1:
             return selected(state, worker.id, {"action": "collect", "targetPos": [{"x": mine.pos.x, "y": mine.pos.y}]}, "已在最近矿点一格内，执行采集")
         step = traced_move(state, worker.id, worker.pos, mine.pos, blocked | reserved, width, height)
@@ -438,11 +468,22 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
 
 def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """返回(是否接管角色, 指令)；任务期间昼夜均保持位置。"""
+    """返回(是否接管角色, 指令)；任务期间昼夜均保持位置。
+
+    优先级：宝藏紧急窗 > 自进化接取/保持 >（由 decide_pioneer_day 继续买物/升级）。
+    """
     if pioneer.health <= 0:
         return True, None
     if state.phase_task:
         return True, decide_self_heal(pioneer)
+
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .treasure import decide_treasure_action, treasure_should_claim_pioneer
+        if treasure_should_claim_pioneer(state, pioneer, memory):
+            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+            return True, cmd
+
     candidates = sorted(
         (t for t in state.team_our.player_tasks
          if t.task_type in ("自进化类1", "自进化类2")
@@ -450,6 +491,12 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         key=lambda t: (chebyshev(pioneer.pos, t.task_position), t.task_type),
     )
     if not candidates:
+        # 无自进化任务时，白天可继续筹备宝藏（买物）
+        if memory is not None:
+            from .treasure import decide_treasure_action
+            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+            if cmd:
+                return True, cmd
         return False, None
     heal = decide_self_heal(pioneer)
     if heal:
@@ -466,7 +513,7 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
 
 
 def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """先锋优先接取和保持任务，其余时间补给与升级。"""
+    """先锋优先宝藏紧急/自进化任务，其余时间补给、买宝藏用品与升级。"""
     handled, command = decide_pioneer_task(pioneer, state, blocked, reserved)
     if handled:
         return command
@@ -477,6 +524,13 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
     buy_cmd = decide_buy_medicine(pioneer, state)
     if buy_cmd:
         return buy_cmd
+
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .treasure import decide_treasure_action
+        treasure_cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+        if treasure_cmd:
+            return treasure_cmd
 
     item_job_cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
     if item_job_cmd:

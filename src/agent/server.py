@@ -11,6 +11,8 @@ from flask import Flask, jsonify, request
 from .protocol import MatchState
 from .task_logging import task_diagnostics
 from .task_solver import PioneerTaskSolver
+from .news_memory import NewsMemory
+from .prompt_router import PromptRouter
 from .brain import V1Strategy, BasicActionValidator, is_day_round
 from .decision_log import snapshot, build_report, write_report
 
@@ -92,6 +94,8 @@ class GameServer:
         self.previous_snapshot = None
         self.strategy = strategy or V1Strategy(BasicActionValidator())
         self.task_solver = PioneerTaskSolver(self.state_dir)
+        self.news_memory = NewsMemory(self.state_dir)
+        self.prompt_router = PromptRouter(self.news_memory)
         self.app = Flask(__name__)
         self._setup_routes()
 
@@ -134,12 +138,17 @@ class GameServer:
             # 策略决策
             self.load_build_memory()
             self.match_state.update(data)
+            self.news_memory.ingest(self.match_state)
+            self.match_state.news_memory = self.news_memory
+            self.prompt_router.consume_llm_resp(self.match_state)
             previous_commands = deepcopy(self.match_state.last_sent_command)
             before = snapshot(self.match_state)
             self.match_state.decision_events = []
             started = perf_counter()
             role_command_map = self.strategy.decide(self.match_state)
             prompt, execute_cmd = self.task_solver.step(self.match_state, role_command_map)
+            news_prompt = self.prompt_router.request_prompt(self.match_state)
+            prompt = prompt or news_prompt
             diagnostic_cmd = task_diagnostics(
                 self.match_state, role_command_map, previous_commands,
                 self.task_solver.session.get('stage', 'idle'),
