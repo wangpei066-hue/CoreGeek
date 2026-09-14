@@ -8,6 +8,7 @@ from typing import Optional
 
 from .protocol import MatchState
 from .decision_log import trace
+from .log_format import headline
 from .news_logging import log_news_event
 
 DAY_NIGHT_CYCLE = 130
@@ -169,7 +170,11 @@ class NewsMemory:
                     self._upsert_ore_effect(weak)
                     if getattr(state, "decision_events", None) is not None:
                         trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程", effect=weak)
-                    log_news_event(event="ore_heuristic", roundNo=state.round_no, effect=weak)
+                log_news_event(
+                    event="official_ingested", roundNo=state.round_no,
+                    title=f"【新闻】官方消息 | {headline(official)}",
+                    officialNews=official, oreEffect=weak,
+                )
 
         if folk and folk.strip():
             legends = self.data.setdefault("legends", [])
@@ -181,8 +186,12 @@ class NewsMemory:
                 if getattr(state, "decision_events", None) is not None:
                     trace(state, None, "legend_appended", "民间传闻已累积，等待 LLM 解码",
                           day=day, legendCount=len(legends))
-                log_news_event(event="legend_appended", roundNo=state.round_no, day=day,
-                               legendCount=len(legends), text=folk[:500])
+                log_news_event(
+                    event="folk_ingested", roundNo=state.round_no,
+                    title=f"【传闻】累计{len(legends)}条 | {headline(folk)}",
+                    day=day, newLegend=folk,
+                    legends=[row.get("text") for row in legends],
+                )
 
         self.save()
 

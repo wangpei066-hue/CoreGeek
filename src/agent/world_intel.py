@@ -6,6 +6,7 @@ import json
 import re
 
 from .decision_log import trace, selected
+from .news_logging import log_news_event
 from .grid import chebyshev, move_towards
 from .protocol import Pos
 
@@ -176,8 +177,23 @@ def merge_treasure_plan(mem, update):
 def apply_llm_result(state, mem):
     if not mem.get("awaiting_llm"):
         return
-    parsed = parse_intel_llm(state.llm_resp or "")
+    raw = state.llm_resp or ""
+    parsed = parse_intel_llm(raw)
     mem["awaiting_llm"] = False
+    prompt_text = mem.get("last_prompt") or ""
+    if not (raw or "").strip():
+        log_news_event(
+            event="llm_empty", roundNo=state.round_no,
+            title="【LLM】intel 响应为空",
+            consumer="intel", promptText=prompt_text,
+        )
+    else:
+        log_news_event(
+            event="llm_output", roundNo=state.round_no,
+            title="【LLM】intel " + ("解析成功" if parsed else "输出无法解析"),
+            consumer="intel", promptText=prompt_text, llmRespRaw=raw,
+            parsedJson=parsed, parseOk=bool(parsed), applied=bool(parsed),
+        )
     if not parsed:
         trace(state, None, "news_llm_unparsed", "新闻/传闻 LLM 返回无法解析，继续用启发式")
         return
@@ -259,7 +275,13 @@ def maybe_prompt(state):
             "currentTreasure": plan,
         }, ensure_ascii=False)
     )
+    mem["last_prompt"] = prompt
     trace(state, None, "news_llm_prompt", "提交新闻/传闻推断 prompt", day=day, calls=calls[day])
+    log_news_event(
+        event="prompt_sent", consumer="intel", roundNo=state.round_no,
+        title="【LLM】发送世界情报 prompt",
+        promptText=prompt, used=calls[day],
+    )
     return prompt, ""
 
 

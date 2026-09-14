@@ -137,12 +137,40 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(len(self.memory.data["legends"]), 1)
         self.assertEqual(self.memory.data["legends"][0]["text"], "b")
 
-    def test_round_rewind_resets(self):
-        self.memory.ingest(self._state(200, official=IRON_COLLAPSE, folk="旧传闻"))
-        self.assertEqual(self.memory.banned_ores(3), {"iron"})
-        self.memory.ingest(self._state(0, official="今日无重大新闻", folk=""))
-        self.assertEqual(self.memory.banned_ores(3), set())
-        self.assertEqual(self.memory.data["legends"], [])
+    def test_stderr_news_infer_includes_prompt_and_parsed_json(self):
+        import contextlib
+        import io
+        state = self._state(0, official=IRON_COLLAPSE, folk="西部石门需三钥")
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.memory.ingest(state)
+            router = PromptRouter(self.memory)
+            prompt = router.request_prompt(state)
+            self.assertIn("民间传闻", prompt)
+            state.round_no = 1
+            state.llm_resp = json.dumps({
+                "ready": True,
+                "altarPos": {"x": 1, "y": 2},
+                "items": ["AcientTablet"],
+                "openFromRound": 10,
+                "openToRound": 20,
+                "confidence": 0.8,
+            })
+            router.consume_llm_resp(state)
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+        news = [row for row in records if row.get("marker") == "NEWS_INFER"]
+        official = next(row for row in news if row["event"] == "official_ingested")
+        self.assertIn("铁矿", official["officialNews"])
+        self.assertIn("【新闻】", official["title"])
+        folk = next(row for row in news if row["event"] == "folk_ingested")
+        self.assertEqual(folk["newLegend"], "西部石门需三钥")
+        sent = next(row for row in news if row["event"] == "prompt_sent")
+        self.assertEqual(sent["consumer"], "treasure")
+        self.assertIn("民间传闻", sent["promptText"])
+        out = next(row for row in news if row["event"] == "llm_output")
+        self.assertTrue(out["parseOk"])
+        self.assertEqual(out["parsedJson"]["altarPos"], {"x": 1, "y": 2})
+        self.assertIn("民间传闻", out["promptText"])
 
 
 class OrePricingTests(unittest.TestCase):

@@ -119,7 +119,7 @@ python -m unittest discover -s tests -v
 
 ## 本地决策日志
 
-日志 schema v2 增加 `diagnostics`，本地 JSON、可读 TXT 与平台 `STRATEGY_DECISION` 控制台摘要均可查看：
+日志 schema v2 增加 `diagnostics`，本地 JSON、可读 TXT 与平台分类 stderr 均可查看。平台下载请先读 [`docs/logging.md`](docs/logging.md)。
 
 - `source_version`：策略及诊断源文件指纹，配合 UTC 时间、队伍、回合和请求序号，确认下载日志对应哪版代码。它不是 Git 提交号。
 - `primary/outer`：分别列出规划数、已建数、缺口坐标、待升级和待维修位置；第一层侧墙延伸至短射程武器列，确保三座新建武器都位于正面与侧面墙体之后；`outer_unlocked` 显示二层准入状态。
@@ -150,12 +150,16 @@ python -m unittest discover -s tests -v
 决策日志不写入比赛响应，也不持久化到策略记忆。诊断文件写入失败只记录服务端错误，
 不会因此将正常响应改成500；原有请求、响应和状态文件的错误处理保持不变。
 
-平台控制台同时会输出两类 JSON 行：
+平台 stderr 每行一条 JSON，带中文 `title`，按 `marker` 分类（详见 [`docs/logging.md`](docs/logging.md)）：
 
-- `PIONEER_TASK`：仅开拓者任务、沙盒和 LLM 诊断。
-- `STRATEGY_DECISION`：每回合完整策略摘要，含金币、基地、武器、围墙、机器人、三名角色的动作与原因、首日阶段、武器分配、上一回合执行反馈、系统错误和快照差异。
+- `STRATEGY_DECISION`：每回合总览（金币、武器/墙数量、告警码、角色指令）。
+- `BUILD_WEAPON`：已建炮、升级资金、本回合建造/买券/开火。
+- `BUILD_WALL`：一层/二层进度与本回合砌墙、采石。
+- `PIONEER_TASK`：每回合自进化动作；接取/解题时另有 solver 细节。空闲不刷屏。
+- `ECONOMY`：仅采矿/卖矿有活动时。
+- `NEWS_INFER`：官方消息、传闻、以及 LLM 的完整 `promptText` / `parsedJson`（有事件才打）。
 
-平台只显示控制台时，应搜索 `STRATEGY_DECISION`，而不是只看 `PIONEER_TASK`。控制台包含角色血量、按物品汇总的背包数量、分支原因及估值/预算等事件参数；完整快照仍保存在容器的 `decision_*.json`。控制台版不重复任务原文和背包逐项列表，两种日志都不参与比赛响应。
+平台只显示控制台时，按 marker 搜索即可。完整快照仍在容器 `decision_*.json`。这些日志不参与比赛响应。
 
 
 ## 第一日防守阶段策略
@@ -205,9 +209,9 @@ pioneer 按距离选择 `teamOur.playerTasks` 中 `isValid=true` 且 `coldDownRo
 5. 下一回合解析 `llmResp`。要求 LLM 返回 `{"action":"execute","command":"..."}` 或 `{"action":"submit","taskAnswer":"..."}`。前者通过平台沙盒执行，再把真实输出交给 LLM；后者生成 pioneer 的 `submitAnswer`。如最终答案本身是 JSON，仍按比赛协议序列化为 `taskAnswer` 字符串。
 6. 系统明确反馈答案错误或提交动作非法时，将反馈交给 LLM 修正。任务结束、队伍变化或回合倒退时清理会话；会话保存在 `state/task_session.json`，支持进程重启恢复。缺失工具执行反馈时交给 LLM判断，不自动重复执行未知副作用的命令。
 
-任务日志标记为 `PIONEER_TASK`。读取文件和执行工具时，平台沙盒输出包含 `requestId`、`event`、正文或结果的 JSON，下一回合进入 `lastCmdResult`。未使用沙盒解题的任务回合补充 `printf` 诊断，包含 `solverStage`、角色反馈、任务原文分片。诊断不会覆盖读文件或工具命令。程序 stderr 同时记录任务、阶段、`llmResp` 和 `lastCmdResult`。
+任务日志标记为 `PIONEER_TASK`。读取文件和执行工具时，平台沙盒输出包含 `requestId`、`event`、正文或结果的 JSON，下一回合进入 `lastCmdResult`。未使用沙盒解题的任务回合补充 `printf` 诊断，包含 `solverStage`、角色反馈、任务原文分片。诊断不会覆盖读文件或工具命令。程序 stderr 在接取/解题回合记录任务、阶段、`llmResp` 和 `lastCmdResult`；空闲不打 `task_idle`。每回合另有一条 `event=round` 总览。
 
-世界新闻日志标记为 `NEWS_INFER`，通道与自进化相同：stderr 始终写入；无自进化 `phaseTask` 且沙盒空闲时，经 `executeCmd` 的 `printf` 回传到下一回合 `lastCmdResult`（含 `worldNews` 摘要、`oreEffects`、传闻条数、`treasureHypothesis`、本回合 `inferEvents`）。有自进化任务时不抢沙盒，仅保留 stderr。
+世界新闻日志标记为 `NEWS_INFER`：官方消息、传闻、LLM `promptText` 与输出 JSON 在发生时写入 stderr。无自进化 `phaseTask` 且本回合有推断活动、沙盒空闲时，经 `executeCmd` 的 `printf` 回传到下一回合 `lastCmdResult`。有自进化任务时不抢沙盒。字段说明见 [`docs/logging.md`](docs/logging.md)。
 
 在平台运行结束后，从系统下载对局日志，搜索 `PIONEER_TASK`、`NEWS_INFER`、`read_document`、`execute_tool`、`submitAnswer`、`prompt` 或 `llmResp`。发出接取或提交指令不代表成功，应结合系统下一回合的动作结果、任务原文与错误核对。此日志回传不依赖下载选手容器中的本地 `logs/` 目录。
 
