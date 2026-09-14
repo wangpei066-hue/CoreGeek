@@ -258,8 +258,17 @@ class EconomyTests(unittest.TestCase):
 
 
 class TacticalTests(unittest.TestCase):
+    def test_does_not_buy_summon_before_day_four(self):
+        state, role = defended_state()
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
+        role.pos = Pos(5, 4)
+        self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set()))
+
     def test_offense_purchase_preserves_defense_budget(self):
         state, role = defended_state()
+        state.round_no = 400
         for building in state.team_our.roles:
             if building.role_type in ('gatling', 'railgun', 'rocket'):
                 building.level = 2
@@ -267,6 +276,26 @@ class TacticalTests(unittest.TestCase):
         cmd = tactical_action(role, state, build_blocked_set(state), set())
         self.assertEqual(cmd['name'], 'LargeRobotSummonOrder')
         self.assertGreaterEqual(state.team_our.gold_num-item_cost(cmd['name'], state), 100)
+
+    def test_decide_does_not_buy_luxury_items_before_day_four(self):
+        state, role = defended_state(gold=400)
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
+        role.pos = Pos(5, 4)
+        pioneer = make_role(3, 5, 5, 'pioneer', health=200, back_pack_capability=40)
+        state.team_our.roles.append(pioneer)
+        from src.agent.protocol import ShopItem, WorldNews
+        state.weapon_shop_list = [
+            ShopItem('AcientTablet', 15), ShopItem('LargeRobotSummonOrder', 100),
+            ShopItem('StationUpgradeVoucher1', 100), ShopItem('WeaponUpgradeVoucher1', 100),
+        ]
+        state.world_news = WorldNews(folk_legends='携带AcientTablet在(6, 5)召唤。第3天。')
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        buys = [c.get('name') for c in commands.values() if c.get('action') == 'buy']
+        self.assertNotIn('AcientTablet', buys)
+        self.assertFalse(any(isinstance(name, str) and name.endswith('SummonOrder') for name in buys))
+        self.assertFalse(any(isinstance(name, str) and name.startswith('StationUpgrade') for name in buys))
 
     def test_no_offense_when_base_is_in_danger_or_budget_low(self):
         for health, gold in ((500, 400), (1500, 110)):

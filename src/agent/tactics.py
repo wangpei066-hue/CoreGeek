@@ -283,11 +283,15 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     reserve = DEFENSE_RESERVE + max(0, 3-len(weapons))*25
     item = None
     all_backpacks = [i for r in state.team_our.roles for i in r.backpack]
-    if urgent and target and 'Bomb' not in all_backpacks and 'Bomb' not in state.tactical_purchases:
+    from .treasure import shop_buy_allowed
+    if (urgent and target and 'Bomb' not in all_backpacks and 'Bomb' not in state.tactical_purchases
+            and shop_buy_allowed('Bomb', state, emergency=True)):
         item = 'Bomb'
-    elif urgent and stun and 'DizzyWeapon' not in all_backpacks and 'DizzyWeapon' not in state.tactical_purchases:
+    elif (urgent and stun and 'DizzyWeapon' not in all_backpacks and 'DizzyWeapon' not in state.tactical_purchases
+            and shop_buy_allowed('DizzyWeapon', state, emergency=True)):
         item = 'DizzyWeapon'
-    elif (cycle_round < 70 and (state.round_no or 0) < 1240 and base and base.health >= max_health(base)*0.7
+    elif (shop_buy_allowed('SmallRobotSummonOrder', state)
+          and cycle_round < 70 and (state.round_no or 0) < 1240 and base and base.health >= max_health(base)*0.7
           and len(weapons) >= 3 and sum(r.role_type == 'wall' for r in state.team_our.roles) >= 6
           and all((r.level or 1) >= 2 for r in weapons)
           and not urgent and role.id not in state.worker_item_jobs
@@ -298,7 +302,8 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
         cap = min(state.team_our.gold_num // 4, state.team_our.gold_num-reserve)
         item = next((n for n in ('BossRobotSummonOrder', 'LargeRobotSummonOrder', 'MiddleRobotSummonOrder', 'SmallRobotSummonOrder')
                      if item_cost(n, state) <= cap), None)
-    if item is None or state.team_our.gold_num < item_cost(item, state) or len(role.backpack) >= role.back_pack_capability:
+    if (item is None or not shop_buy_allowed(item, state, emergency=urgent)
+            or state.team_our.gold_num < item_cost(item, state) or len(role.backpack) >= role.back_pack_capability):
         return None
     shops = [z for z in state.map_info.zones if z.neutral_type == 'weaponShop']
     choices = [(adjacent_path(role, shop.pos, blocked | reserved, state), shop) for shop in shops]
