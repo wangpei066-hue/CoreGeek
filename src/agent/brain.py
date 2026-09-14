@@ -869,12 +869,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
                   '无法在威胁到达前提交，或两门炮守不住当前波次，回炮；题目会话保留')
             return False, None
         return True, decide_emergency_heal(pioneer, state) or decide_self_heal(pioneer)
-    memory = getattr(state, "news_memory", None)
-    if memory is not None:
-        from .treasure import decide_treasure_action, treasure_should_claim_pioneer
-        if treasure_should_claim_pioneer(state, pioneer, memory):
-            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
-            return True, cmd
     if defense_due(pioneer, state, blocked):
         trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务')
         return False, None
@@ -885,11 +879,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         key=lambda t: (chebyshev(pioneer.pos, t.task_position), t.task_type),
     )
     if not candidates:
-        if memory is not None:
-            from .treasure import decide_treasure_action
-            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
-            if cmd:
-                return True, cmd
         return False, None
     for task in candidates:
         from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
@@ -942,10 +931,6 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
     if handled:
         return cmd
     handled, command = decide_pioneer_task(pioneer, state, blocked, reserved)
-    if handled:
-        return command
-    from .world_intel import decide_treasure
-    handled, command = decide_treasure(pioneer, state, blocked, reserved)
     if handled:
         return command
     cmd = tactical_action(pioneer, state, blocked, reserved)

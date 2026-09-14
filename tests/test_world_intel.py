@@ -1,9 +1,14 @@
 """官方消息停工窗口与民间传闻祭坛线索；不把启发式当成官方规则。"""
+import json
+import tempfile
+from pathlib import Path
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy
 from src.agent.economy import profitable_mine, sellable_ores
 from src.agent.grid import build_blocked_set
+from src.agent.news_memory import NewsMemory
+from src.agent.prompt_router import PromptRouter
 from src.agent.protocol import Pos, ShopItem, WorldNews, Zone
 from src.agent.world_intel import (
     decide_treasure,
@@ -13,6 +18,7 @@ from src.agent.world_intel import (
     ores_in_spike,
     ores_to_stockpile,
     parse_intel_llm,
+    parse_legend_clues,
     parse_official_forecast,
 )
 from test_economy_tactics import defended_state, economy_state
@@ -35,13 +41,14 @@ class OfficialNewsTests(unittest.TestCase):
         self.assertEqual(parse_official_forecast("今日无重大新闻", 0), {})
         self.assertEqual(parse_official_forecast("", 0), {})
 
-    def test_stockpile_then_skip_blocked_iron_mine(self):
+    def test_stockpile_json_does_not_skip_blocked_iron_mine(self):
         state, role = economy_state()
         state.round_no = 10
         state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
         ingest_news(state)
         self.assertEqual(ores_to_stockpile(state), {"iron"})
         self.assertFalse(ore_blocked(state, "iron"))
+        state.map_info.zones = [z for z in state.map_info.zones if z.neutral_type != "copper"]
         state.map_info.zones.append(Zone(Pos(3, 1), "iron"))
         cmd = profitable_mine(role, state, build_blocked_set(state), set())
         self.assertEqual(cmd["action"], "move")
@@ -51,18 +58,19 @@ class OfficialNewsTests(unittest.TestCase):
         self.assertEqual(ores_in_spike(state), {"iron"})
         cmd = profitable_mine(role, state, build_blocked_set(state), set())
         self.assertIsNotNone(cmd)
+        self.assertIn(cmd["action"], ("move", "collect"))
 
-    def test_does_not_sell_stockpiled_iron_on_event_day(self):
+    def test_does_not_hold_stockpiled_iron_for_news(self):
         state, role = economy_state()
         state.round_no = 10
         state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
         ingest_news(state)
         role.backpack = ["iron"] * 8
-        self.assertNotIn("iron", sellable_ores(role, state))
+        self.assertIn("iron", sellable_ores(role, state))
 
 
 class FolkLegendTests(unittest.TestCase):
-    def test_extracts_altar_items_and_open_day(self):
+    def test_ingest_folk_does_not_heuristic_fill_treasure(self):
         state = minimal_state(round_no=140)
         state.weapon_shop_list = [ShopItem("AcientTablet", 15)]
         state.world_news = WorldNews(
@@ -70,10 +78,19 @@ class FolkLegendTests(unittest.TestCase):
             folk_legends="带上AcientTablet，第3天去祭坛(18, 7)开启宝藏。",
         )
         ingest_news(state)
-        plan = state.policy_memory["world_intel"]["treasure"]
-        self.assertEqual(plan["altar"], {"x": 18, "y": 7})
-        self.assertEqual(plan["items"], ["AcientTablet"])
-        self.assertEqual(plan["openDay"], 2)
+        mem = state.policy_memory["world_intel"]
+        self.assertEqual(mem["legends"][-1]["text"], "带上AcientTablet，第3天去祭坛(18, 7)开启宝藏。")
+        self.assertFalse(mem.get("treasure"))
+
+    def test_parse_legend_clues_extracts_altar_items_and_open_day(self):
+        state = minimal_state(round_no=140)
+        state.weapon_shop_list = [ShopItem("AcientTablet", 15)]
+        clues = parse_legend_clues({
+            "legends": [{"text": "带上AcientTablet，第3天去祭坛(18, 7)开启宝藏。"}],
+        }, state)
+        self.assertEqual(clues["altar"], {"x": 18, "y": 7})
+        self.assertEqual(clues["items"], ["AcientTablet"])
+        self.assertEqual(clues["openDay"], 2)
 
     def test_pioneer_buys_then_summons_when_adjacent(self):
         state, _ = defended_state(gold=40)
@@ -86,6 +103,9 @@ class FolkLegendTests(unittest.TestCase):
             folk_legends="携带AcientTablet在(6, 5)召唤。第3天。",
         )
         ingest_news(state)
+        state.policy_memory["world_intel"]["treasure"] = {
+            "altar": {"x": 6, "y": 5}, "items": ["AcientTablet"], "openDay": 2,
+        }
         handled, cmd = decide_treasure(pioneer, state, build_blocked_set(state), set())
         self.assertTrue(handled)
         self.assertEqual(cmd["action"], "buy")
@@ -107,6 +127,9 @@ class FolkLegendTests(unittest.TestCase):
             folk_legends="携带AcientTablet在(6, 5)召唤。第3天。",
         )
         ingest_news(state)
+        state.policy_memory["world_intel"]["treasure"] = {
+            "altar": {"x": 6, "y": 5}, "items": ["AcientTablet"], "openDay": 2,
+        }
         handled, cmd = decide_treasure(pioneer, state, build_blocked_set(state), set())
         self.assertFalse(handled)
         self.assertIsNone(cmd)
@@ -117,13 +140,28 @@ class FolkLegendTests(unittest.TestCase):
         state.world_news = WorldNews(official_news="", folk_legends="明日再听详情。")
         ingest_news(state)
         prompt, cmd = maybe_prompt(state)
-        self.assertTrue(prompt)
+        self.assertEqual(prompt, "")
         self.assertEqual(cmd, "")
-        state.llm_resp = '{"altar":{"x":9,"y":10},"items":["StarSand"],"openDay":4}'
-        ingest_news(state)
-        plan = state.policy_memory["world_intel"]["treasure"]
-        self.assertEqual(plan["altar"], {"x": 9, "y": 10})
-        self.assertEqual(plan["items"], ["StarSand"])
+        with tempfile.TemporaryDirectory() as root:
+            memory = NewsMemory(Path(root))
+            memory.ingest(state)
+            router = PromptRouter(memory)
+            prompt = router.request_prompt(state)
+            self.assertIn("民间传闻", prompt)
+            state.round_no = 141
+            state.llm_resp = json.dumps({
+                "ready": True,
+                "altarPos": {"x": 9, "y": 10},
+                "items": ["StarSand"],
+                "openFromRound": 520,
+                "openToRound": 649,
+                "confidence": 0.8,
+            })
+            router.consume_llm_resp(state)
+            hyp = memory.data["treasureHypothesis"]
+            self.assertEqual(hyp["altarPos"], {"x": 9, "y": 10})
+            self.assertEqual(hyp["items"], ["StarSand"])
+            self.assertEqual(hyp["source"], "llm")
 
     def test_parse_intel_llm_accepts_fenced_json(self):
         value = parse_intel_llm('```json\n{"openDay": 1}\n```')

@@ -55,6 +55,12 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertTrue(self.memory.data["needTreasureDecode"])
         self.assertEqual(self.memory.banned_ores(2), {"iron"})
         self.assertEqual(self.memory.data["legends"][-1]["text"], "西部有一石门")
+        plan = self.memory.worker_json(0)
+        self.assertEqual(plan["oreEffects"][0]["affectedOre"], "iron")
+        self.assertEqual(plan["stockpileOres"], ["iron"])
+        self.assertEqual(self.memory.data["officialPlan"]["stockpileOres"], ["iron"])
+        self.assertIsNone(self.memory.data.get("treasureHypothesis"))
+        self.assertEqual(self.memory.data.get("folkPlan") or {}, {})
         # 同文不重复追加
         self.memory.ingest(state)
         self.assertEqual(len(self.memory.data["legends"]), 1)
@@ -108,6 +114,7 @@ class NewsMemoryTests(unittest.TestCase):
         router.consume_llm_resp(state)
         hyp = self.memory.data["treasureHypothesis"]
         self.assertTrue(hyp["ready"])
+        self.assertEqual(hyp["confidence"], 0.9)
         self.assertEqual(hyp["altarPos"], {"x": 12, "y": 8})
         self.assertIsNone(self.memory.data["pendingConsumer"])
 
@@ -120,6 +127,29 @@ class NewsMemoryTests(unittest.TestCase):
         state.decision_events = []
         router.consume_llm_resp(state)
         self.assertIn("iron", self.memory.banned_ores(2))
+
+    def test_low_confidence_treasure_json_is_not_ready_and_retries(self):
+        state = self._state(0, folk="西部有一石门")
+        self.memory.ingest(state)
+        router = PromptRouter(self.memory)
+        prompt = router.request_prompt(state)
+        self.assertIn("置信度", prompt)
+        self.assertIn("allowedTaskItems", prompt)
+        state.round_no = 1
+        state.llm_resp = json.dumps({
+            "ready": True,
+            "altarPos": {"x": 1, "y": 2},
+            "items": ["AcientTablet"],
+            "openFromRound": None,
+            "openToRound": None,
+            "confidence": 0.4,
+            "notes": "只有石门，没有坐标原文",
+        })
+        router.consume_llm_resp(state)
+        hyp = self.memory.data["treasureHypothesis"]
+        self.assertEqual(hyp["confidence"], 0.4)
+        self.assertFalse(hyp["ready"])
+        self.assertTrue(self.memory.data["needTreasureDecode"])
 
     def test_parse_fenced_json(self):
         self.assertEqual(parse_json_object('```json\n{"a":1}\n```'), {"a": 1})
@@ -162,8 +192,15 @@ class NewsMemoryTests(unittest.TestCase):
         official = next(row for row in news if row["event"] == "official_ingested")
         self.assertIn("铁矿", official["officialNews"])
         self.assertIn("【新闻】", official["title"])
+        official_plan = next(row for row in news if row["event"] == "official_plan")
+        self.assertEqual(official_plan["plan"]["oreEffects"][0]["affectedOre"], "iron")
+        self.assertEqual(official_plan["plan"]["stockpileOres"], ["iron"])
         folk = next(row for row in news if row["event"] == "folk_ingested")
         self.assertEqual(folk["newLegend"], "西部石门需三钥")
+        self.assertTrue(all(
+            (row.get("plan") or {}).get("source") == "llm"
+            for row in news if row["event"] == "folk_plan"
+        ))
         sent = next(row for row in news if row["event"] == "prompt_sent")
         self.assertEqual(sent["consumer"], "treasure")
         self.assertIn("民间传闻", sent["promptText"])
@@ -171,6 +208,10 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertTrue(out["parseOk"])
         self.assertEqual(out["parsedJson"]["altarPos"], {"x": 1, "y": 2})
         self.assertIn("民间传闻", out["promptText"])
+        folk_plans = [row for row in news if row["event"] == "folk_plan"]
+        self.assertEqual(folk_plans[-1]["plan"]["altarPos"], {"x": 1, "y": 2})
+        self.assertEqual(folk_plans[-1]["plan"]["source"], "llm")
+        self.assertEqual(self.memory.data["folkPlan"]["altarPos"], {"x": 1, "y": 2})
 
 
 class OrePricingTests(unittest.TestCase):

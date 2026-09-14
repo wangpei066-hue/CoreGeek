@@ -419,13 +419,6 @@ def sellable_ores(role, state, dump_extra_stone=False):
         if base.health < max_health(base) * 0.7:
             reserve = min(reserve, 1)
     ores['stone'] = max(0, ores['stone'] - reserve)
-    from .world_intel import ores_in_spike, ores_to_stockpile
-    backpack_tight = bool(role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * 0.9)
-    if not backpack_tight:
-        spike = ores_in_spike(state)
-        for name in ores_to_stockpile(state):
-            if name not in spike:
-                ores[name] = 0
     return +ores
 
 
@@ -473,8 +466,6 @@ def liquidate(role, state, blocked, reserved):
     gap = voucher_funding_gap(state)
     cap = role.back_pack_capability or 0
     fill = (len(role.backpack) / cap) if cap else 1.0
-    from .world_intel import ores_in_spike
-    spiked = bool(ores_in_spike(state) & set(ores))
     if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and value >= gap:
         triggers.append('卖掉本包后工人去买武器升级券')
     if (state.round_no or 0) < 70:
@@ -487,8 +478,6 @@ def liquidate(role, state, blocked, reserved):
             triggers.append('卖掉本包即可完成必要武器升级')
         if role.health < max_health(role) * 0.6:
             triggers.append('低血量携矿风险')
-        if spiked:
-            triggers.append('官方消息涨价窗口，优先卖出对应矿石')
         if fill >= BATCH_FILL_RATIO:
             triggers.append('背包过半，批量变现')
         if cap and cap - len(role.backpack) <= NEAR_CAP_SLOTS:
@@ -532,7 +521,6 @@ def liquidate(role, state, blocked, reserved):
 def profitable_mine(role, state, blocked, reserved):
     """按本趟实际能采的数量估算收益：受背包剩余格约束，不再固定按10次采集。仅工人可 collect。"""
     from .opening import adjacent_path, move_on_path
-    from .world_intel import ore_blocked, ores_to_stockpile
     if role.role_type != 'worker':
         trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
         return None
@@ -553,15 +541,11 @@ def profitable_mine(role, state, blocked, reserved):
             continue
         if skip_stone and mine.neutral_type == 'stone':
             continue
-        if ore_blocked(state, mine.neutral_type):
-            continue
         path = adjacent_path(role, mine.pos, blocked | reserved, state)
         if path is None:
             continue
         return_distance = min((chebyshev(mine.pos, v.pos) for v in vendors), default=0)
         score = batch * prices.get(mine.neutral_type, 1) / (len(path) + batch + return_distance + 1)
-        if mine.neutral_type in ores_to_stockpile(state):
-            score *= 3
         candidates.append((score, -len(path), mine, path))
     if not candidates:
         trace(state, role.id, 'no_reachable_mine', '当前没有可达矿点')

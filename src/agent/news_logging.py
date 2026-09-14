@@ -12,6 +12,7 @@ _ACTIVITY_CODES = {
     "ore_heuristic", "legend_appended", "ore_decoded", "treasure_decoded",
     "llm_request", "llm_empty", "llm_parse_failed", "summon_result",
     "official_ingested", "folk_ingested", "prompt_sent", "llm_output",
+    "official_plan", "folk_plan",
     "official_news_ingested", "folk_legend_ingested",
     "news_llm_prompt", "news_llm_applied", "news_llm_unparsed",
 }
@@ -19,6 +20,40 @@ _ACTIVITY_CODES = {
 
 def log_news_event(event, roundNo=None, title="", **payload):
     emit_stderr(MARKER, event, roundNo, title=title, **payload)
+
+
+def log_official_plan(round_no, plan, source=""):
+    """官方消息标准决策 JSON（仅记录，不指挥工人）。"""
+    plan = plan or {}
+    effects = plan.get("oreEffects") or []
+    src = source or ((effects[0].get("source") if effects else "") or "")
+    ores = "、".join(e.get("affectedOre") or "?" for e in effects) or "无"
+    banned = "、".join(plan.get("bannedOres") or []) or "无"
+    stock = "、".join(plan.get("stockpileOres") or []) or "无"
+    log_news_event(
+        event="official_plan", roundNo=round_no,
+        title=f"【官方】决策JSON {ores} 今禁采[{banned}] 抢收[{stock}] source={src}",
+        plan=plan,
+    )
+
+
+def log_folk_plan(round_no, plan, source=""):
+    """民间传闻标准决策 JSON（仅记录，不指挥开拓者）。"""
+    plan = plan or {}
+    src = source or plan.get("source") or ""
+    pos = plan.get("altarPos")
+    pos_s = f"({pos['x']},{pos['y']})" if isinstance(pos, dict) and "x" in pos else "未知"
+    items = "、".join(plan.get("items") or []) or "未知"
+    conf = plan.get("confidence")
+    try:
+        conf_s = f"{float(conf):.2f}"
+    except (TypeError, ValueError):
+        conf_s = "?"
+    log_news_event(
+        event="folk_plan", roundNo=round_no,
+        title=f"【传闻】决策JSON ready={bool(plan.get('ready'))} conf={conf_s} 祭坛{pos_s} 物品[{items}] source={src}",
+        plan=plan,
+    )
 
 
 def news_diagnostics(state, memory, commands, previous_commands):
@@ -73,6 +108,8 @@ def news_diagnostics(state, memory, commands, previous_commands):
         "llmRespRaw": clip(llm_raw, 2000),
         "pendingConsumer": pending,
         "oreEffects": data.get("oreEffects") or [],
+        "officialPlan": data.get("officialPlan") or {},
+        "folkPlan": data.get("folkPlan") or {},
         "legendCount": len(legends),
         "legends": [row.get("text") for row in legends],
         "treasureHypothesis": data.get("treasureHypothesis"),
