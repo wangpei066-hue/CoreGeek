@@ -213,12 +213,15 @@ def voucher_trip_rounds(state, blocked, gold, need_sell):
 
 
 def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked):
-    """首日切换点：剩下的回合必须够修完7-8段墙；若再买券就会误工则先修墙。"""
+    """首日切换点：金币已够则先买一张券再修墙；不够时若卖矿会误工才先修墙。"""
     wall_need = wall_finish_rounds(state, missing, blocked)
     wall_deadline = wall_need + muster_need
     can_finish_walls = remaining > wall_deadline
-    has_voucher = any('WeaponUpgradeVoucher1' in r.backpack
-                      for r in state.team_our.roles if r.role_type in ('worker', 'pioneer'))
+    has_voucher = any(
+        isinstance(item, str) and 'WeaponUpgradeVoucher' in item
+        for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')
+        for item in r.backpack
+    )
     from .brain import item_cost
     voucher_cost = item_cost('WeaponUpgradeVoucher1', state)
     gold_ready = gold >= voucher_cost or has_voucher
@@ -229,20 +232,15 @@ def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_o
             'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
             'can_finish_walls': can_finish_walls,
         }
-    if remaining <= wall_deadline:
-        # 只够修墙和回防，不再卖矿或绕路买券。
-        return {
-            'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
-            'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
-            'can_finish_walls': can_finish_walls,
-        }
     if gold_ready:
+        # 券或金币已经在手里：买/用只要一两回合，不因墙时限放弃升级。
         return {
             'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
             'allow_walls': True, 'allow_upgrade': True, 'allow_sell': False, 'allow_mine': False,
             'can_finish_walls': can_finish_walls,
         }
-    if sell_trip is None or remaining <= wall_deadline + sell_trip:
+    if remaining <= wall_deadline or sell_trip is None or remaining <= wall_deadline + sell_trip:
+        # 只够修墙和回防，不再外出卖矿绕路买券。
         return {
             'wall_need': wall_need, 'wall_deadline': wall_deadline, 'sell_trip': sell_trip,
             'allow_walls': True, 'allow_upgrade': False, 'allow_sell': False, 'allow_mine': False,
@@ -283,25 +281,63 @@ def active_wall_plan(state, base):
     return wall_ring(state, base) if outer_wall_ready(state) else primary_wall_plan(state, base)
 
 
+def mobile_walkable(state, blocked, reserved=()):
+    """寻路时忽略己方可移动角色的临时占位，避免队友互相卡住导致空转或缺炮。"""
+    mobiles = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')}
+    return (set(blocked) - mobiles) | set(reserved)
+
+
+def _outerness(state, pos):
+    """迎敌方向越靠前、离基地越远，越算外炮/外位。"""
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    if base is None:
+        return (pos.x, pos.y)
+    direction = attack_direction(state, base)
+    return ((pos.x - base.pos.x) * direction, chebyshev(pos, Pos(base.pos.x, base.pos.y)))
+
+
+def _fighter_layer(state, role):
+    """0=院内里侧，越大越靠外；用于里炮给人、外炮给外面的人。"""
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    outside = 0 if base and in_courtyard(state, base, role.pos) else 1
+    return (outside, _outerness(state, role.pos), role.id)
+
+
+def _weapon_layer(state, weapon):
+    return (_outerness(state, weapon.pos), weapon.id)
+
+
+def _assignment_score(pairs, distances, fighter_order, weapon_order):
+    unreachable = sum(distances[f.id, w.id] >= 10000 for f, w in pairs)
+    parked = -sum(distances[f.id, w.id] == 0 for f, w in pairs)
+    mismatch = sum(abs(fighter_order[f.id] - weapon_order[w.id]) for f, w in pairs)
+    travel = sum(distances[f.id, w.id] for f, w in pairs)
+    return (unreachable, parked, mismatch, travel)
+
+
 def assign_weapons(state, excluded_ids=(), persist=False):
-    """至多三座武器，枚举一对一分配，优先可达并最小化总路程。"""
+    """一人一炮：把队友当障碍，里侧的人开里炮、外侧的人开外炮，避免卡在通道里空转。"""
     fighters = sorted((r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id not in excluded_ids), key=lambda r: r.id)
     weapons = sorted((r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0), key=lambda r: r.id)
     if not fighters or not weapons:
         return {}
-    blocked = (build_blocked_set(state) - {(r.pos.x, r.pos.y) for r in fighters}) | movement_avoid(state)
+    static = build_blocked_set(state) | movement_avoid(state)
     distances = {}
     for fighter in fighters:
+        others = {(r.pos.x, r.pos.y) for r in fighters if r.id != fighter.id}
+        blocked = (static | others) - {(fighter.pos.x, fighter.pos.y)}
         for weapon in weapons:
             path = adjacent_path(fighter, weapon.pos, blocked, state)
             distances[fighter.id, weapon.id] = len(path) if path is not None else 10000
+    fighter_order = {f.id: i for i, f in enumerate(sorted(fighters, key=lambda r: _fighter_layer(state, r)))}
+    weapon_order = {w.id: i for i, w in enumerate(sorted(weapons, key=lambda r: _weapon_layer(state, r)))}
     best = None
     assignment = {}
     count = min(len(fighters), len(weapons))
     for chosen in permutations(fighters, count):
         for targets in permutations(weapons, count):
             pairs = list(zip(chosen, targets))
-            score = sum(distances[f.id, w.id] for f, w in pairs)
+            score = _assignment_score(pairs, distances, fighter_order, weapon_order)
             if best is None or score < best:
                 best = score
                 assignment = {f.id: w for f, w in pairs}
@@ -314,10 +350,13 @@ def assign_weapons(state, excluded_ids=(), persist=False):
             continue
         fighter = next((r for r in fighters if r.id == fid), None)
         weapon = weapons_by_id.get(wid)
-        if fighter and weapon and distances.get((fid, wid), 10000) < 10000:
+        if fighter and weapon:
             prev[fid] = weapon
     if len(prev) == count and len({w.id for w in prev.values()}) == count:
-        assignment = prev
+        prev_pairs = [(next(f for f in fighters if f.id == fid), weapon) for fid, weapon in prev.items()]
+        prev_score = _assignment_score(prev_pairs, distances, fighter_order, weapon_order)
+        if best is None or prev_score <= best:
+            assignment = prev
     if persist:
         state.policy_memory['weapon_assignment'] = {str(fid): weapon.id for fid, weapon in assignment.items()}
     return assignment
@@ -333,6 +372,27 @@ def move_on_path(state, role, path, reserved, reason):
     return None
 
 
+def best_voucher_worker(state, workers, blocked):
+    """把买券/用券交给已经持券或离商店最近的工人，避免远工占住任务。"""
+    from .brain import find_zone
+    holders = [w for w in workers
+               if any(isinstance(item, str) and 'WeaponUpgradeVoucher' in item for item in w.backpack)]
+    if holders:
+        return min(holders, key=lambda w: w.id)
+    shop = find_zone(state, 'weaponShop')
+    if shop is None:
+        return workers[0] if workers else None
+    walkable = mobile_walkable(state, blocked)
+    ranked = []
+    for worker in workers:
+        path = adjacent_path(worker, shop.pos, walkable, state)
+        if path is not None:
+            ranked.append((len(path), worker.id, worker))
+    if ranked:
+        return min(ranked)[2]
+    return min(workers, key=lambda w: (chebyshev(w.pos, shop.pos), w.id)) if workers else None
+
+
 def station_path(role, weapon, blocked, state):
     """操控位置不能停在未来墙体缺口上，避免堵塞回城通道。"""
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
@@ -340,6 +400,15 @@ def station_path(role, weapon, blocked, state):
     goals = {(p.x, p.y) for p in neighbors8(weapon.pos, state.map_info.width, state.map_info.height)
              if (p.x, p.y) not in ring and ((p.x, p.y) not in blocked or p == role.pos)}
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
+
+
+def weapon_approach_path(role, weapon, blocked, reserved, state):
+    """去开炮：先绕开队友，走不通再让路穿过占位，避免空转。"""
+    own = {(role.pos.x, role.pos.y)}
+    strict = adjacent_path(role, weapon.pos, (blocked | reserved) - own, state)
+    if strict is not None:
+        return strict
+    return adjacent_path(role, weapon.pos, mobile_walkable(state, blocked, reserved), state)
 
 
 def weapon_candidates(state, base, name, extra_names=(), extra_positions=()):
@@ -462,9 +531,10 @@ def plan_opening(state):
     commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
     assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
     remaining = 70 - state.round_no
-    travel = [station_path(r, assignments[r.id], blocked - {(a.pos.x, a.pos.y) for a in fighters}, state)
+    travel = [weapon_approach_path(r, assignments[r.id], blocked, set(), state)
               for r in fighters if r.id in assignments]
-    muster_need = max([len(p) for p in travel if p is not None] + [0]) + MUSTER_BUFFER
+    lengths = [len(p) if p is not None else FALLBACK_TRAVEL for p in travel]
+    muster_need = max(lengths + [0]) + MUSTER_BUFFER
     muster = bool(weapons) and remaining <= muster_need
     upgraded_once = any((w.level or 1) >= 2 for w in weapons)
     has_three = len(weapons) >= 3
@@ -487,6 +557,10 @@ def plan_opening(state):
             if (owner and owner.role_type == 'pioneer' and job.get('kind') == 'weapon'
                     and job.get('item') not in owner.backpack):
                 del state.worker_item_jobs[role_id]
+        if allow_upgrade and should_upgrade_weapon(state):
+            carrier = best_voucher_worker(state, workers, blocked)
+            if carrier:
+                maybe_start_shop_item_job(carrier, state)
     if muster:
         phase = '就位'
     elif not has_three:
@@ -539,6 +613,15 @@ def plan_opening(state):
                         gold -= item_cost(cmd['name'], state)
                     commands[role.id] = cmd
                     continue
+                job = state.worker_item_jobs.get(role.id)
+                if (job and job.get('kind') == 'weapon' and job.get('item') not in role.backpack
+                        and gold >= item_cost(job['item'], state)):
+                    other = next((w for w in workers if w.id != role.id and w.id not in state.worker_item_jobs), None)
+                    if other:
+                        state.worker_item_jobs[other.id] = job
+                        del state.worker_item_jobs[role.id]
+                        trace(state, role.id, 'weapon_upgrade_job_transferred',
+                              '当前工人买不到券，转交给另一名工人', other_id=other.id)
             if allow_sell and any(z.neutral_type == 'vendor' for z in state.map_info.zones):
                 handled, cmd = liquidate(role, budget_state, blocked, reserved)
                 if cmd:
@@ -553,8 +636,7 @@ def plan_opening(state):
             weapon = assignments.get(role.id)
             if weapon:
                 trace(state, role.id, 'weapon_assignment', '夜间一人一炮，提前就位', weapon_id=weapon.id)
-                walkable = (blocked - {(r.pos.x, r.pos.y) for r in fighters}) | reserved
-                cmd = move_on_path(state, role, station_path(role, weapon, walkable, state), reserved, '前往分配武器')
+                cmd = move_on_path(state, role, weapon_approach_path(role, weapon, blocked, reserved, state), reserved, '前往分配武器')
                 if cmd:
                     commands[role.id] = cmd
             continue
@@ -673,8 +755,14 @@ def plan_opening(state):
         else:
             trace(state, role.id, 'opening_no_candidate', '候选位置被占用、不可达、处于失败冷却或会封住返程；未完成墙线不会标为完成', kind=kind)
             if kind == 'wall':
-                path = interior_retreat_path(role, blocked | reserved, state)
+                path = interior_retreat_path(role, (blocked | reserved) - {(role.pos.x, role.pos.y)}, state)
                 cmd = move_on_path(state, role, path, reserved, '先回到院内，再从内侧封闭缺口')
+                if cmd:
+                    commands[role.id] = cmd
+                    continue
+            weapon = assignments.get(role.id)
+            if weapon:
+                cmd = move_on_path(state, role, weapon_approach_path(role, weapon, blocked, reserved, state), reserved, '暂无施工位，先去分配武器避免空转')
                 if cmd:
                     commands[role.id] = cmd
     for role in fighters:
@@ -682,4 +770,10 @@ def plan_opening(state):
             heal = decide_self_heal(role)
             if heal:
                 commands[role.id] = selected(state, role.id, heal, '没有更高优先级行动，最后执行自救')
+                continue
+            weapon = assignments.get(role.id)
+            if weapon:
+                cmd = move_on_path(state, role, weapon_approach_path(role, weapon, blocked, reserved, state), reserved, '没有施工指令则先守炮，避免空转')
+                if cmd:
+                    commands[role.id] = cmd
     return commands

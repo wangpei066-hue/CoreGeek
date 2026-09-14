@@ -105,11 +105,10 @@ class OpeningTests(unittest.TestCase):
         worker = state.team_our.roles[1]
         worker.pos = Pos(8, 9)
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertTrue(any(c.get('name') == 'WeaponUpgradeVoucher1' for c in commands.values())
-                        or any(e['code'] == 'opening_time_budget' and e['allow_upgrade'] for e in state.decision_events))
         buys = [c for c in commands.values() if c['action'] == 'buy']
-        if buys:
-            self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher1')
+        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_upgrade'] for e in state.decision_events))
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
         state = opening_state()
@@ -120,6 +119,21 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(budget['allow_walls'])
         self.assertFalse(budget['allow_sell'])
         self.assertFalse(budget['allow_upgrade'])
+
+    def test_gold_in_hand_still_buys_voucher_when_wall_time_is_tight(self):
+        state = opening_state()
+        state.round_no = 55
+        state.team_our.gold_num = 130
+        missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
+        budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
+        self.assertTrue(budget['allow_upgrade'])
+        self.assertFalse(budget['allow_sell'])
+        self._rockets(state)
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.team_our.roles[1].pos = Pos(8, 9)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[1]['action'], 'buy')
+        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
 
     def test_right_base_faces_left_after_switching_sides(self):
         state = opening_state()
@@ -297,4 +311,44 @@ class OpeningTests(unittest.TestCase):
             cycle = path[-6:]
             self.assertFalse(len(set(cycle)) <= 2 and len(set(path)) <= 3,
                              'worker %s appears to patrol a tiny loop: %s' % (rid, path))
+
+    def test_full_backpack_drops_ore_then_buys_voucher(self):
+        from src.agent.protocol import ShopItem
+        state = opening_state()
+        state.round_no = 30
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.weapon_shop_list = [ShopItem('WeaponUpgradeVoucher1', 100)]
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(8, 9)
+        worker.back_pack_capability = 4
+        worker.backpack = ['stone'] * 4
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[1]['action'], 'drop')
+        self.assertEqual(commands[1]['name'], 'stone')
+
+    def test_inner_fighters_take_inner_guns_outer_takes_flank(self):
+        state = opening_state()
+        state.round_no = 75
+        self._rockets(state)
+        for rocket in state.team_our.roles[-3:]:
+            rocket.attack_range = 20
+        inner = next(r for r in state.team_our.roles if r.id == 20)
+        state.team_our.roles[1].pos = Pos(11, 10)
+        state.team_our.roles[2].pos = Pos(11, 12)
+        state.team_our.roles[3].pos = Pos(14, 10)
+        state.robot.roles = [RobotRole(100, Pos(16, 10), 'bossRobot', 800)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        assigned = {e['role_id']: e['weapon_id'] for e in state.decision_events if e['code'] == 'weapon_assignment'}
+        self.assertEqual(assigned[1], inner.id)
+        self.assertNotEqual(assigned[3], inner.id)
+        self.assertEqual(len(set(assigned.values())), 3)
+        attacks = [c for c in commands.values() if c['action'] == 'attack']
+        movers = [rid for rid, c in commands.items() if c['action'] == 'move' and rid in (1, 2, 3)]
+        self.assertEqual(len(attacks) + len(movers), 3)
+        self.assertIn(1, {int(c['controllerId']) for c in attacks})
+        if 3 in movers:
+            step = commands[3]['targetPos'][0]
+            self.assertNotEqual((step['x'], step['y']), (state.team_our.roles[1].pos.x, state.team_our.roles[1].pos.y))
 

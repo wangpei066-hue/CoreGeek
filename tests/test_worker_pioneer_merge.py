@@ -11,11 +11,13 @@ class WorkerPioneerMergeTests(unittest.TestCase):
     def decide(self, state):
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_opening_workers_prepare_walls_while_pioneer_accepts(self):
+    def test_opening_workers_prepare_walls_while_pioneer_stays_home(self):
         state = opening_state()
         state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
         commands = self.decide(state)
-        self.assertEqual(commands[3], {'action': 'acceptTask'})
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'acceptTask')
+        self.assertTrue(any(e['code'] == 'opening_holds_pioneer' for e in state.decision_events)
+                        or commands.get(3, {}).get('action') == 'move')
         for worker in (1, 2):
             self.assertIn(commands[worker]['action'], ('move', 'build'))
             if commands[worker]['action'] == 'build':

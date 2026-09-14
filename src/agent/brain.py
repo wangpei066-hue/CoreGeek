@@ -366,6 +366,15 @@ def _job_target_still_exists(state: "MatchState", job: dict) -> bool:
     return any(r.pos.x == x and r.pos.y == y and r.role_type in role_types for r in state.team_our.roles)
 
 
+def _droppable_for_purchase(role: Role):
+    """买券前丢掉矿石腾空位，不丢升级券和药剂。"""
+    for name in ("copper", "iron", "stone"):
+        if name in role.backpack:
+            return name
+    return next((item for item in role.backpack
+                 if isinstance(item, str) and "Voucher" not in item and item != "Medicine"), None)
+
+
 def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved: set):
     """推进一个已分配的两段式任务：没道具先去商店买，有道具就走到目标建筑一格内使用。"""
     job = state.worker_item_jobs.get(role.id)
@@ -386,7 +395,6 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             job = state.worker_item_jobs.get(role.id)
             if not job:
                 return None
-    width, height = state.map_info.width, state.map_info.height
     item = job["item"]
     x, y = job["target"]
     target = Pos(x, y)
@@ -400,15 +408,13 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             return None
         job.pop("awaiting_use", None)
 
+    from .opening import adjacent_path, mobile_walkable, move_on_path
+    walkable = mobile_walkable(state, blocked, reserved)
     if item in role.backpack:
         if chebyshev(role.pos, target) <= 1:
             job["awaiting_use"] = True
             return selected(state, role.id, {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}, '执行维修/升级道具任务')
-        step = traced_move(state, role.id, role.pos, target, blocked | reserved, width, height)
-        if step:
-            reserved.add((step.x, step.y))
-            return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
-        return None
+        return move_on_path(state, role, adjacent_path(role, target, walkable, state), reserved, '执行维修/升级道具任务')
 
     if state.team_our.gold_num < item_cost(item, state):
         trace(state, role.id, "insufficient_gold", "道具任务购买资金不足，释放任务", available_gold=state.team_our.gold_num, required_gold=item_cost(item, state), item=item)
@@ -424,15 +430,14 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         return None
     if chebyshev(role.pos, shop.pos) <= 1:
         if len(role.backpack) >= role.back_pack_capability:
-            trace(state, role.id, "backpack_full", "背包已满，无法购买道具")
-            del state.worker_item_jobs[role.id]
+            drop = _droppable_for_purchase(role)
+            if drop:
+                trace(state, role.id, "backpack_full_drop", "背包已满，先丢掉矿石再购买升级券", drop=drop, item=item)
+                return selected(state, role.id, {"action": "drop", "name": drop}, '腾出背包空位购买升级道具')
+            trace(state, role.id, "backpack_full", "背包已满且没有可丢弃矿石，无法购买道具")
             return None
         return selected(state, role.id, {"action": "buy", "name": item, "num": 1}, '执行维修/升级道具任务')
-    step = traced_move(state, role.id, role.pos, shop.pos, blocked | reserved, width, height)
-    if step:
-        reserved.add((step.x, step.y))
-        return selected(state, role.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行维修/升级道具任务')
-    return None
+    return move_on_path(state, role, adjacent_path(role, shop.pos, walkable, state), reserved, '执行维修/升级道具任务')
 
 
 
@@ -655,6 +660,13 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
             if cmd:
                 return True, cmd
         return False, None
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
+    fighters = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0]
+    if ((state.round_no or 0) < DAY_ROUNDS and len(fighters) >= 3
+            and (len(weapons) < 3 or any((w.level or 1) < 2 for w in weapons))):
+        trace(state, pioneer.id, 'opening_holds_pioneer',
+              '首日三座武器未全部升到二级前，开拓者留在基地，保证夜间三人三炮')
+        return False, None
     for task in candidates:
         from .opening import adjacent_path, assign_weapons
         route = adjacent_path(pioneer, task.task_position, blocked | reserved, state)
@@ -769,7 +781,7 @@ def plan_pioneer_tasks(state, blocked, reserved):
 
 
 def plan_night(state: "MatchState") -> dict:
-    from .opening import assign_weapons, adjacent_path, move_on_path, movement_avoid
+    from .opening import assign_weapons, move_on_path, movement_avoid, weapon_approach_path, _fighter_layer
     from .tactics import tactical_action
     commands = {}
     if not state.team_our or not state.map_info:
@@ -783,21 +795,37 @@ def plan_night(state: "MatchState") -> dict:
         task_pioneers |= {r.id for r in state.team_our.roles
                           if r.role_type == 'pioneer' and r.health > 0 and state.phase_task}
     assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
-    from .tactics import threat_robots
+    from .tactics import threat_robots, pressure, front_breached
     robots = threat_robots(state)
-    for fighter in sorted(state.team_our.roles, key=lambda r: r.id):
-        if fighter.role_type not in ("worker", "pioneer"):
-            continue
-        if fighter.id in task_pioneers:
-            trace(state, fighter.id, 'pioneer_task_active_at_night', '自进化任务仍在进行，夜间原地保持，不参与武器分配')
-            continue
-        cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
-        if cmd:
-            if cmd['action'] == 'buy':
-                state.team_our.gold_num -= item_cost(cmd['name'], state)
-            commands[fighter.id] = cmd
-            continue
+    urgent = pressure(state) or front_breached(state)
+    fighters = [r for r in state.team_our.roles
+                if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in task_pioneers]
+    fighters.sort(key=lambda r: (
+        0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
+        _fighter_layer(state, r),
+    ))
+    for fighter in fighters:
+        if urgent:
+            cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
+            if cmd:
+                if cmd['action'] == 'buy':
+                    state.team_our.gold_num -= item_cost(cmd['name'], state)
+                commands[fighter.id] = cmd
+                continue
         weapon = assignments.get(fighter.id)
+        if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
+            ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
+            target = pick_attack_target(weapon, robots) if ready else None
+            if target:
+                trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
+                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
+                                       "targetPos": target_positions_for_weapon(weapon, target)}
+                continue
+            trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+            trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
+                  "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
+            continue
         if weapon is None:
             trace(state, fighter.id, "no_free_weapon", "没有可分配的独立武器")
             from .economy import muster_for_night
@@ -805,22 +833,13 @@ def plan_night(state: "MatchState") -> dict:
             if cmd:
                 commands[fighter.id] = cmd
             continue
-        trace(state, fighter.id, "weapon_assignment", "一人一炮；冷却和移动期间也保留分配", weapon_id=weapon.id)
-        if chebyshev(fighter.pos, weapon.pos) <= 1:
-            ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-            target = pick_attack_target(weapon, robots) if ready else None
-            if target:
-                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
-                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
-                                       "targetPos": target_positions_for_weapon(weapon, target)}
-            else:
-                trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
-                      "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
-        else:
-            cmd = move_on_path(state, fighter, adjacent_path(fighter, weapon.pos, blocked | reserved, state), reserved, "前往独立分配的武器")
-            if cmd:
-                commands[fighter.id] = cmd
+        trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+        cmd = move_on_path(state, fighter, weapon_approach_path(fighter, weapon, blocked, reserved, state), reserved, "前往独立分配的武器")
+        if cmd:
+            commands[fighter.id] = cmd
     for fighter in state.team_our.roles:
+        if fighter.id in task_pioneers:
+            continue
         controlling = any(c.get('controllerId') == str(fighter.id) for c in commands.values())
         if fighter.role_type in ('worker', 'pioneer') and fighter.id not in commands and not controlling:
             heal = decide_self_heal(fighter)
