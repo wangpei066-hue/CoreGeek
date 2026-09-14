@@ -9,7 +9,7 @@ from threading import Lock
 from flask import Flask, jsonify, request
 
 from .protocol import MatchState
-from .task_logging import task_diagnostics, log_task_exchange
+from .task_logging import task_diagnostics
 from .news_logging import news_diagnostics
 from .task_solver import PioneerTaskSolver
 from .news_memory import NewsMemory
@@ -128,9 +128,7 @@ class GameServer:
             return jsonify({"error": "invalid JSON object"}), 400
         try:
             self.prepare_directories()
-            # LLM原文仅由任务诊断输出到stderr，不写入本地请求日志。
-            payload = json.dumps({k: v for k, v in data.items() if k != 'llmResp'},
-                                 ensure_ascii=False, indent=2)
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
             while True:
                 seq = next(self.request_sequence)
                 log_path = self.log_dir / f"request_{seq:06d}.json"
@@ -142,7 +140,6 @@ class GameServer:
                     continue
 
             # 策略决策
-            log_task_exchange('request', seq, data, self.task_solver.session, data.get('roundNo'))
             self.load_build_memory()
             self.match_state.update(data)
             if self.match_state.memory_reset:
@@ -195,8 +192,6 @@ class GameServer:
             self.save_build_memory()
 
             command = {"roleCommandMap": role_command_map, "prompt": prompt, "executeCmd": execute_cmd}
-            log_task_exchange('response', seq, command, self.task_solver.session,
-                              self.match_state.round_no)
 
             response_path = self.log_dir / f"response_{seq:06d}.json"
             try:

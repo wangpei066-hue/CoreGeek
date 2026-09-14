@@ -264,7 +264,7 @@ class PioneerTaskSolver:
                         s['tool'] = answer['command']
                         s['stage'] = 'tool'
             except (ValueError, TypeError) as e:
-                s['history'].append({'llmError': str(e),
+                s['history'].append({'llmError': str(e), 'response': state.llm_resp[:6000],
                                      'errors': [e.description for e in state.errors]})
                 s['stage'] = 'ask'
         elif s['stage'] == 'wait_submit':
@@ -288,10 +288,6 @@ class PioneerTaskSolver:
                     execute = sandbox_command(EXEC_SCRIPT, dict(requestId=rid, command=s.pop('tool'), workspace=s['workspace']))
                     s['stage'] = 'wait_tool'
                 s['pendingCommand'] = execute
-                # 远端平台只下载响应中的 prompt/executeCmd；把待执行命令也放入
-                # 会话历史，下一次生成 prompt 时即可和对应的沙盒结果配对。
-                s['history'].append({'requestId': rid, 'command': execute,
-                                     'stage': s['stage']})
             elif holding and s['stage'] == 'ask':
                 if s['calls'] < 12:
                     prompt = self.make_prompt(state)

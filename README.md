@@ -217,8 +217,6 @@ pioneer 按距离选择 `teamOur.playerTasks` 中 `isValid=true` 且 `coldDownRo
 
 任务日志标记为 `PIONEER_TASK`。读取文件和执行工具时，平台沙盒输出包含 `requestId`、`event`、正文或结果的 JSON，下一回合进入 `lastCmdResult`。未使用沙盒解题的任务回合补充 `printf` 诊断，包含 `solverStage`、角色反馈、任务原文分片。诊断不会覆盖读文件或工具命令。程序 stderr 在接取/解题回合记录任务、阶段、`llmResp` 和 `lastCmdResult`；空闲不打 `task_idle`。每回合另有一条 `event=round` 总览。
 
-stderr 另以 `PIONEER_TASK_EXCHANGE` 输出完整收发数据：`event=request` 保留平台原始请求（含 `phaseTask`、`llmResp`、`lastCmdResult` 及动作反馈），`event=response` 保留实际响应（含完整 `prompt`、`executeCmd`、`roleCommandMap` 和提交答案）。每条记录附带 `sequence`、`roundNo`、`solverStage` 和沙盒 `requestId`，可配对追踪读取、求解、执行、重试与提交全过程；不截断平台提供的内容，命令结果在下一回合请求中体现。`llmResp` 原文不写入本地请求日志。
-
 世界新闻日志标记为 `NEWS_INFER`：官方消息、传闻、LLM `promptText` 与输出 JSON 在发生时写入 stderr。无自进化 `phaseTask` 且本回合有推断活动、沙盒空闲时，经 `executeCmd` 的 `printf` 回传到下一回合 `lastCmdResult`。有自进化任务时不抢沙盒。字段说明见 [`docs/logging.md`](docs/logging.md)。
 
 在平台运行结束后，从系统下载对局日志，搜索 `PIONEER_TASK`、`NEWS_INFER`、`read_document`、`execute_tool`、`submitAnswer`、`prompt` 或 `llmResp`。发出接取或提交指令不代表成功，应结合系统下一回合的动作结果、任务原文与错误核对。此日志回传不依赖下载选手容器中的本地 `logs/` 目录。
