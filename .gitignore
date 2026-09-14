@@ -28,3 +28,17 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only copies; originals stay in the working tree with the same paths.
+archive/
+CoreGeek-main/
+CoreGeek-main.zip
+CONTRIBUTING.md
+RESTRUCTURING_COMPLETE.md
+STRUCTURE.md
+docs/current_audit.md
+docs/request.txt
+docs/response.txt
+.github/CODEOWNERS
+.github/ISSUE_TEMPLATE/
+.github/pull_request_template.md
