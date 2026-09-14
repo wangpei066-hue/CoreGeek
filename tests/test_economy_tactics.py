@@ -76,6 +76,46 @@ class EconomyTests(unittest.TestCase):
                             for e in state.decision_events))
         self.assertEqual(commands[role.id]['action'], 'move')
 
+    def test_pre_night_small_ore_goes_to_vendor_before_third_night(self):
+        state, role = defended_state(gold=400)
+        state.round_no = 310  # 第三天白天，入夜前约 20 回合。
+        role.backpack = ['copper'] * 8
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertTrue(handled)
+        self.assertIsNotNone(cmd)
+        self.assertTrue(any(e['code'] == 'cashout_priority' and '入夜前清空背包' in ' '.join(e.get('triggers') or [])
+                            for e in state.decision_events))
+
+    def test_pre_night_skips_mining_and_buys_weapon_voucher(self):
+        state, role = defended_state(gold=150)
+        state.round_no = 310
+        role.backpack = []
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotEqual((commands.get(role.id) or {}).get('action'), 'collect')
+        self.assertTrue(any(e['code'] == 'cashout_skip_mine' for e in state.decision_events)
+                        or (commands.get(role.id) or {}).get('action') in ('move', 'buy', 'use'))
+        self.assertTrue(
+            (commands.get(role.id) or {}).get('action') in ('move', 'buy', 'use')
+            or any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
+            or any(e['code'] in ('voucher_buyer_pick', 'shop_job_check', 'cashout_skip_mine')
+                   for e in state.decision_events)
+        )
+
+    def test_pre_night_too_late_still_must_return_to_gun(self):
+        state, role = defended_state()
+        state.round_no = 198
+        role.backpack = ['copper'] * 8
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertTrue(any(e['code'] == 'sale_too_late' for e in state.decision_events))
+
+    def test_mid_day_small_ore_still_does_not_dump_without_voucher_gap(self):
+        state, role = defended_state(gold=400)
+        state.round_no = 145
+        role.backpack = ['copper'] * 8
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+
     def test_small_ore_pile_does_not_run_to_vendor(self):
         state, role = economy_state(gold=75)
         role.backpack = ['copper'] * 5

@@ -174,6 +174,23 @@ class DefensePriorityTests(unittest.TestCase):
         if commands[1]['action'] == 'build':
             self.assertEqual(commands[1]['name'], 'wall')
 
+    def test_unbought_fixer_does_not_block_new_walls(self):
+        state = defended()
+        state.round_no = 140
+        state.team_our.gold_num = 50
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 7)
+        worker.backpack = ['stone'] * 4
+        wall = make_role(80, 13, 10, 'wall', health=600, level=1)
+        state.team_our.roles.append(wall)
+        state.worker_item_jobs[worker.id] = {'item': 'WallFixer', 'target': (13, 10), 'kind': 'wall'}
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        commands = self.decide(state)
+        self.assertNotEqual(commands.get(1, {}).get('name'), 'WallFixer')
+        self.assertIn(commands[1]['action'], ('build', 'move', 'collect'))
+        if commands[1]['action'] == 'build':
+            self.assertEqual(commands[1]['name'], 'wall')
+
     def test_primary_side_walls_reach_short_range_weapon_column(self):
         state = defended()
         base = state.team_our.roles[0]

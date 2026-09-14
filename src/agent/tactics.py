@@ -262,7 +262,8 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
         trace(state, role.id, 'emergency_dizzy', '高防守压力下使用眩晕法宝，不在平时消耗', targets=[r.id for r in hits])
         return selected(state, role.id, {'action': 'use', 'name': 'DizzyWeapon', 'targetPos': [{'x': point.x, 'y': point.y}]}, '高压下眩晕附近机器人')
     if breached and 'WallFixer' in role.backpack:
-        damaged = [r for r in state.team_our.roles if r.role_type == 'wall' and 0 < r.health < max_health(r)*0.8
+        from .brain import wall_about_to_fall
+        damaged = [r for r in state.team_our.roles if r.role_type == 'wall' and wall_about_to_fall(r, state)
                    and chebyshev(role.pos, r.pos) <= 1 and ('repair', r.id) not in state.tactical_purchases]
         if damaged:
             wall = min(damaged, key=lambda r: r.health/max_health(r))

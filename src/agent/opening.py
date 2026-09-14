@@ -802,7 +802,7 @@ def plan_opening(state):
     from .brain import (
         WEAPON_TYPES, decide_emergency_heal, decide_self_heal, decide_shop_item_job, item_cost,
         maybe_start_shop_item_job, own_station, plan_pioneer_tasks, pick_weapon_name,
-        should_upgrade_weapon,
+        release_stale_repair_job, should_upgrade_weapon,
     )
     from .economy import liquidate, muster_for_night, profitable_mine
     from copy import copy
@@ -890,6 +890,7 @@ def plan_opening(state):
         if heal:
             commands[role.id] = selected(state, role.id, heal, '低血紧急治疗')
             continue
+        release_stale_repair_job(role, state)
         budget_state = copy(state)
         budget_state.team_our = copy(state.team_our)
         budget_state.team_our.gold_num = gold

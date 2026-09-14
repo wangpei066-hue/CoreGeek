@@ -76,15 +76,38 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["kind"], "station")
 
-    def test_damaged_wall_takes_priority_over_everything(self):
+    def test_damaged_wall_prefers_upgrade_because_it_heals(self):
         state = minimal_state(gold_num=1000)
-        wall = make_role(40000, 11, 10, "wall", health=100, level=1)  # 满血1000，明显受损
+        wall = make_role(40000, 11, 10, "wall", health=100, level=1)
         state.team_our.roles.append(wall)
         worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
         maybe_start_shop_item_job(worker, state)
         job = state.worker_item_jobs[10010]
-        self.assertEqual(job["item"], "WallFixer")
+        self.assertEqual(job["item"], "WallUpgradeVoucher1")
         self.assertEqual(job["kind"], "wall")
+
+    def test_moderate_damage_does_not_buy_wall_fixer(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        wall = make_role(40000, 11, 10, "wall", health=500, level=1)
+        state.team_our.roles.append(wall)
+        worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[10010]
+        self.assertEqual(job["item"], "WallUpgradeVoucher1")
+        self.assertNotEqual(job["item"], "WallFixer")
+
+    def test_critical_max_level_wall_repairs_only_with_fixer_in_bag(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        wall = make_role(40000, 11, 10, "wall", health=50, level=3)
+        state.team_our.roles.append(wall)
+        worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertNotIn(10010, state.worker_item_jobs)
+        worker.backpack = ["WallFixer"]
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[10010]["item"], "WallFixer")
 
     def test_station_upgrade_when_no_damaged_wall(self):
         state = minimal_state(gold_num=1000)
@@ -298,19 +321,23 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
 
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):
-    def test_worker_repairs_wall_across_several_rounds(self):
-        """完整跑一遍：分配任务 -> 走到商店 -> 买 WallFixer -> 走到围墙 -> use 修复，全程不抛异常
-        且每一步指令都能通过本地校验。"""
+    def test_worker_upgrades_damaged_wall_across_several_rounds(self):
+        """阶段墙已齐后，受损一级墙走升级券：买券、走到墙边、use。升级回满血。"""
+        from src.agent.opening import staged_wall_plan
+        from src.agent.brain import own_station
         state = minimal_state(gold_num=1000)
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
-        wall = make_role(40000, 30, 30, "wall", health=100, level=1)  # 远离商店，逼出多回合移动
+        base = own_station(state)
+        for i, (x, y) in enumerate(staged_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(500 + i, x, y, "wall", health=400, level=1))
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
-        state.team_our.roles += [wall, worker]
+        state.team_our.roles.append(worker)
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()
         actions_seen = []
-        for _ in range(200):  # 上限防止死循环；正常应在远小于此的回合数内完成
+        bought = None
+        for _ in range(200):
             commands = strategy.decide(state)
             cmd = commands.get(10010)
             if cmd is None:
@@ -321,13 +348,14 @@ class MultiRoundRepairIntegrationTest(unittest.TestCase):
             if cmd["action"] == "move":
                 worker.pos = Pos(cmd["targetPos"][0]["x"], cmd["targetPos"][0]["y"])
             elif cmd["action"] == "buy":
+                bought = cmd["name"]
                 worker.backpack.append(cmd["name"])
             elif cmd["action"] == "use":
-                # 判题器真实效果是围墙回满血；这里只需确认流程走完，不用真的改 wall.health
                 break
         self.assertIn("buy", actions_seen)
         self.assertIn("use", actions_seen)
         self.assertEqual(actions_seen[-1], "use")
+        self.assertIn("WallUpgradeVoucher", bought or "")
 
 
 if __name__ == "__main__":

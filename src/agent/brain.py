@@ -31,7 +31,10 @@ BUILD_RETRY_UNKNOWN = 5
 BUILD_RETRY_UNKNOWN_LIMIT = 3
 
 WALL_FIXER_GOLD_COST = 10
-WALL_REPAIR_RATIO = 0.8
+WALL_REPAIR_RATIO = 0.8  # 仅用于外层准入等「墙是否够健康」，不再用来派修墙包。
+WALL_CRITICAL_RATIO = 0.15  # 没有近敌时，血量低于满血 15% 才视为即将摧毁。
+WALL_CRITICAL_ABS = 80  # 约两次 BOSS 击或四次大型击；没有官方「下一击摧毁」表。
+_ROBOT_ATTACK = {'smallRobot': 5, 'middleRobot': 10, 'largeRobot': 20, 'bossRobot': 40}
 _WEAPON_STATION_VOUCHER_COST = {1: 100, 2: 150}
 _WALL_VOUCHER_COST = {1: 20, 2: 30}
 _JOB_KIND_ROLE_TYPES = {"weapon": WEAPON_TYPES, "wall": ("wall",), "station": ("station",)}
@@ -239,12 +242,48 @@ def _pending_item_job_targets(state: "MatchState") -> set:
     return {tuple(job["target"]) for job in state.worker_item_jobs.values()}
 
 
+def wall_about_to_fall(wall: Role, state: "MatchState") -> bool:
+    """墙是否马上要被打掉。小型5/中型10/大型20/BOSS40、射程3来自任务书4.7.2；不是判题器实测。"""
+    if wall is None or wall.role_type != 'wall' or wall.health <= 0:
+        return False
+    from .tactics import threat_robots
+    nearby = [r for r in threat_robots(state) if chebyshev(wall.pos, r.pos) <= 3]
+    if nearby:
+        burst = sum(_ROBOT_ATTACK.get(r.role_type, 10) for r in nearby)
+        return wall.health <= burst * 2
+    return wall.health <= WALL_CRITICAL_ABS or wall.health < max_health(wall) * WALL_CRITICAL_RATIO
+
+
+def _job_wall(state: "MatchState", job: dict):
+    x, y = job.get('target', (None, None))
+    return next((r for r in state.team_our.roles
+                 if r.role_type == 'wall' and r.pos.x == x and r.pos.y == y), None)
+
+
+def release_stale_repair_job(role: Role, state: "MatchState") -> None:
+    """未买的修墙包、以及还没到即将摧毁的维修，都释放。升级会回满血，不要排队去商店买修复包。"""
+    job = state.worker_item_jobs.get(role.id)
+    if not job or job.get('item') != 'WallFixer':
+        return
+    wall = _job_wall(state, job)
+    keep = 'WallFixer' in role.backpack and wall is not None and wall_about_to_fall(wall, state)
+    if keep:
+        return
+    del state.worker_item_jobs[role.id]
+    trace(state, role.id, 'repair_job_released',
+          '未到即将摧毁不跑商店修墙；升级墙会回满血，优先新建和升级',
+          wall_id=None if wall is None else wall.id,
+          wall_health=None if wall is None else wall.health)
+
+
 def _pick_damaged_wall(state: "MatchState", pending_targets: set):
+    """只修即将摧毁且不能再升级的墙。能升级的墙用升级券回满血。"""
     candidates = [
         r for r in state.team_our.roles
         if r.role_type == "wall"
         and (r.pos.x, r.pos.y) not in pending_targets
-        and r.health < max_health(r) * WALL_REPAIR_RATIO
+        and wall_about_to_fall(r, state)
+        and (r.level or 1) >= 3
     ]
     if not candidates:
         return None
@@ -273,7 +312,8 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
         return None
     return min(candidates, key=lambda r: (
         r.level or 1,
-        _weapon_front_key(state, r) if r.role_type in WEAPON_TYPES else 0,
+        _weapon_front_key(state, r),
+        r.health,
         _WEAPON_UPGRADE_ORDER.get(r.role_type, 99),
         r.id,
     ))
@@ -315,7 +355,8 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     trace(state, role.id, "shop_job_check", "检查维修与升级任务（预算为本回合尚未分配余额）",
           available_gold=state.team_our.gold_num, reserved_target_count=len(pending_targets))
 
-    # 未购入任务按 升级武器 > 修墙 > 升墙/基地 让位。已买到手的道具继续用完。
+    release_stale_repair_job(role, state)
+    # 未购入任务按 升级武器 > 升墙/基地 > 紧急修墙 让位。已买到手的道具继续用完。
     old_job = state.worker_item_jobs.get(role.id)
     item_name = old_job.get('item', '') if old_job else ''
     if old_job and item_name not in role.backpack:
@@ -372,14 +413,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
                   next_level=(weapon.level or 1) + 1)
         return
 
-    damaged_wall = _pick_damaged_wall(state, pending_targets)
-    if damaged_wall and ('WallFixer' in role.backpack or state.team_our.gold_num >= item_cost('WallFixer', state)):
-        state.worker_item_jobs[role.id] = {
-            "item": "WallFixer", "target": (damaged_wall.pos.x, damaged_wall.pos.y), "kind": "wall",
-        }
-        return
-
-    wall = _pick_upgradeable(state, ("wall",), pending_targets, min_health_ratio=WALL_REPAIR_RATIO)
+    wall = _pick_upgradeable(state, ("wall",), pending_targets, min_health_ratio=0.0)
     if wall and allow_structure_upgrade:
         name, cost = voucher_for("wall", wall.level or 1)
         if name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
@@ -394,6 +428,12 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
             return
         trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
+
+    damaged_wall = _pick_damaged_wall(state, pending_targets)
+    if damaged_wall and 'WallFixer' in role.backpack:
+        state.worker_item_jobs[role.id] = {
+            "item": "WallFixer", "target": (damaged_wall.pos.x, damaged_wall.pos.y), "kind": "wall",
+        }
 
 
 
@@ -698,47 +738,79 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
 
 
 def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set):
-    from .economy import liquidate, profitable_mine, muster_for_night, worker_should_shop_weapon_voucher
+    from .economy import (
+        in_pre_night_cashout_window, liquidate, profitable_mine, muster_for_night,
+        worker_should_shop_weapon_voucher,
+    )
     from .tactics import tactical_action
-    from .opening import replenish_walls, staged_walls_incomplete, worker_should_build_walls, emergency_front_seal
+    from .opening import (
+        critical_wall_missing, replenish_walls, staged_walls_incomplete,
+        worker_should_build_walls, emergency_front_seal,
+    )
     heal = decide_emergency_heal(worker, state)
     if heal:
         return selected(state, worker.id, heal, '低血紧急治疗')
-    handled, cmd = muster_for_night(worker, state, blocked, reserved)
-    if handled:
-        return cmd
     seal = emergency_front_seal(worker, state, blocked, reserved)
     if seal:
         return seal
+    release_stale_repair_job(worker, state)
     allow_build = worker_should_build_walls(state, worker)
     allow_weapon = worker_should_shop_weapon_voucher(worker, state, blocked)
-    cmd = decide_shop_item_job(worker, state, blocked, reserved)
-    if cmd:
+    cashout = in_pre_night_cashout_window(worker, state, blocked, reserved)
+    job = state.worker_item_jobs.get(worker.id)
+    held_item = bool(job and job.get('item') in worker.backpack)
+    if cashout:
+        handled, cmd = liquidate(worker, state, blocked, reserved)
+        if cmd:
+            return cmd
+        if allow_weapon or held_item:
+            if allow_weapon:
+                maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=False)
+            cmd = decide_shop_item_job(worker, state, blocked, reserved)
+            if cmd:
+                return cmd
+    handled, cmd = muster_for_night(worker, state, blocked, reserved)
+    if handled:
         return cmd
+    continue_job = False
+    if job:
+        if held_item:
+            continue_job = True
+        elif job.get('kind') == 'weapon':
+            continue_job = True
+        elif staged_walls_incomplete(state) and allow_build:
+            continue_job = False
+        else:
+            continue_job = True
+    if continue_job:
+        cmd = decide_shop_item_job(worker, state, blocked, reserved)
+        if cmd:
+            return cmd
     if allow_weapon:
-        maybe_start_shop_item_job(worker, state, allow_weapon=True)
+        maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=False)
         cmd = decide_shop_item_job(worker, state, blocked, reserved)
         if cmd:
             return cmd
         handled, cmd = liquidate(worker, state, blocked, reserved)
         if cmd:
             return cmd
-    handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True, allow_build=allow_build)
-    if cmd:
-        return cmd
+    if not cashout or critical_wall_missing(state):
+        handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True, allow_build=allow_build)
+        if cmd:
+            return cmd
     handled, cmd = liquidate(worker, state, blocked, reserved)
     if cmd:
         return cmd
     defer_upgrades = (weapon_upgrade_due(state)
-                      or ((state.round_no or 0) >= 70 and staged_walls_incomplete(state) and not allow_build))
+                      or ((state.round_no or 0) >= 70 and staged_walls_incomplete(state)))
     maybe_start_shop_item_job(
         worker, state, allow_weapon=allow_weapon,
-        allow_structure_upgrade=allow_weapon or not defer_upgrades,
+        allow_structure_upgrade=not defer_upgrades,
     )
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
     if cmd:
         return cmd
-    if sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
+    if not cashout and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, allow_build=allow_build)
         if cmd:
             return cmd
@@ -750,9 +822,10 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if item_job_cmd:
         return item_job_cmd
 
-    build_cmd = try_build(worker, state, blocked, reserved)
-    if build_cmd:
-        return build_cmd
+    if not cashout:
+        build_cmd = try_build(worker, state, blocked, reserved)
+        if build_cmd:
+            return build_cmd
 
     return profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
 
@@ -837,11 +910,18 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
 
 def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
     """先锋紧急自救、回防、买券优先，再执行白天任务与补给。"""
-    from .economy import liquidate, muster_for_night
+    from .economy import in_pre_night_cashout_window, liquidate, muster_for_night
     from .tactics import tactical_action
     heal = decide_emergency_heal(pioneer, state)
     if heal:
         return selected(state, pioneer.id, heal, '低血紧急治疗')
+    if in_pre_night_cashout_window(pioneer, state, blocked, reserved):
+        handled, cmd = liquidate(pioneer, state, blocked, reserved)
+        if cmd:
+            return cmd
+        cmd = decide_pioneer_voucher(pioneer, state, blocked, reserved)
+        if cmd:
+            return cmd
     handled, cmd = muster_for_night(pioneer, state, blocked, reserved)
     if handled:
         return cmd

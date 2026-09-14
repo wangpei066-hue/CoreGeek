@@ -14,6 +14,8 @@ WORKER_WALL_OPPORTUNITY = 6
 PIONEER_TASK_OPPORTUNITY = 8
 BUILD_STONE_RESERVE = 4
 THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
+PRE_NIGHT_CASHOUT_LEAD = 12  # 卖掉之后还要留出买券/用券时间。
+PRE_NIGHT3_CASHOUT_LEAD = 20  # 第三晚压力大，更早把背包换成火力。
 
 
 def live_pioneer(state):
@@ -327,7 +329,71 @@ def ore_prices(state):
     return {i.name: max(0, i.price) for i in state.vendor_shop_list if i.name in ('stone', 'iron', 'copper')}
 
 
-def sellable_ores(role, state):
+def dusk_cashout_lead(state):
+    """第三晚前多留几回合清包买券；其它白天入夜前也要来得及变现。"""
+    return PRE_NIGHT3_CASHOUT_LEAD if (state.round_no or 0) // 130 >= 2 else PRE_NIGHT_CASHOUT_LEAD
+
+
+def _vendor_choices(role, state, blocked, reserved):
+    from .opening import adjacent_path
+    if not state.map_info:
+        return []
+    choices = []
+    for vendor in (z for z in state.map_info.zones if z.neutral_type == 'vendor'):
+        path = adjacent_path(role, vendor.pos, blocked | reserved, state)
+        if path is not None:
+            choices.append((len(path), vendor.pos.x, vendor.pos.y, vendor, path))
+    return choices
+
+
+def _sale_return_rounds(role, state, blocked, ores, path):
+    """卖完再回炮的回合数；找不到回路返回 return_time=10000。"""
+    from .opening import MUSTER_BUFFER, adjacent_path
+    from .tactics import night_wave_cleared, threat_eta_to_base
+    sell_actions = max(1, len(ores)) if ores else 1
+    selling_pos = path[-1] if path else role.pos
+    sale_move = len(path) if path else 0
+    weapons = [r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
+    proxy = Role(-1, selling_pos, 'worker', 1)
+    obstacles = blocked - {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                           if r.role_type in ('worker', 'pioneer')}
+    return_lengths = [len(p) for p in (adjacent_path(proxy, w.pos, obstacles, state) for w in weapons) if p is not None]
+    if return_lengths:
+        return_time = min(return_lengths)
+    elif not weapons:
+        return_time = 0
+    else:
+        return_time = 10000
+    sale_rounds = sale_move + sell_actions + return_time + MUSTER_BUFFER
+    arrival = None if night_wave_cleared(state) else threat_eta_to_base(state)
+    return sale_rounds, return_time, arrival
+
+
+def in_pre_night_cashout_window(role, state, blocked, reserved=None):
+    """入夜前这一段：卖掉还能回防，但再采一趟或拖到截止就会把收益留在背包里。"""
+    from .brain import is_day_round
+    from .tactics import night_wave_cleared, threat_eta_to_base
+    reserved = reserved or set()
+    if not is_day_round(state.round_no) or (state.round_no or 0) < 70:
+        return False
+    if night_wave_cleared(state) or not state.map_info:
+        return False
+    arrival = threat_eta_to_base(state)
+    if arrival is None:
+        return False
+    ores = sellable_ores(role, state, dump_extra_stone=True)
+    probe = ores if ores else Counter({'copper': 1})
+    choices = _vendor_choices(role, state, blocked, reserved)
+    if not choices:
+        return False
+    _, _, _, _, path = min(choices, key=lambda c: c[:3])
+    sale_rounds, return_time, _ = _sale_return_rounds(role, state, blocked, probe, path)
+    if return_time >= 10000 or sale_rounds >= arrival:
+        return False
+    return arrival - sale_rounds <= dusk_cashout_lead(state)
+
+
+def sellable_ores(role, state, dump_extra_stone=False):
     from .brain import own_station
     from .opening import staged_wall_plan
     ores = Counter(i for i in role.backpack if i in ('stone', 'iron', 'copper'))
@@ -339,7 +405,11 @@ def sellable_ores(role, state):
         workers = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
         hands = max(1, len(workers))
         from .brain import max_health
-        if (state.round_no or 0) >= 70 and missing:
+        from .opening import critical_wall_missing
+        if dump_extra_stone and not critical_wall_missing(state):
+            # 入夜前正面已封，石头也卖掉换成金币；迎敌缺口仍留石给紧急封堵。
+            reserve = 0
+        elif (state.round_no or 0) >= 70 and missing:
             # 第一晚后建墙用石全部留着，只卖超出缺口的部分。
             others = sum(r.backpack.count('stone') for r in workers if r.id != role.id)
             still_need = max(0, missing - others)
@@ -362,17 +432,40 @@ def sellable_ores(role, state):
 def liquidate(role, state, blocked, reserved):
     """返回(是否接管, 指令)。往返时间不足时停止外出，转入原有防守流程。"""
     from .brain import max_health
-    from .opening import adjacent_path, move_on_path
-    ores = sellable_ores(role, state)
+    from .opening import move_on_path
+    from .tactics import night_wave_cleared
     committed = state.policy_memory.setdefault('selling_roles', [])
+    ores = sellable_ores(role, state)
+    vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor'] if state.map_info else []
+    adjacent = any(chebyshev(role.pos, z.pos) <= 1 for z in vendors)
+    choices = _vendor_choices(role, state, blocked, reserved)
+    path = []
+    sale_rounds = 0
+    arrival = None
+    return_time = 0
+    in_window = False
+    if choices:
+        _, _, _, _, path = min(choices, key=lambda c: c[:3])
+        probe = ores if ores else Counter({'copper': 1})
+        sale_rounds, return_time, arrival = _sale_return_rounds(role, state, blocked, probe, path)
+        in_window = (
+            (state.round_no or 0) >= 70
+            and arrival is not None
+            and return_time < 10000
+            and sale_rounds < arrival
+            and arrival - sale_rounds <= dusk_cashout_lead(state)
+        )
+        if in_window:
+            dumped = sellable_ores(role, state, dump_extra_stone=True)
+            if dumped:
+                ores = dumped
+                sale_rounds, return_time, arrival = _sale_return_rounds(role, state, blocked, ores, path)
     if not ores:
         if role.id in committed:
             committed.remove(role.id)
         return False, None
     prices = ore_prices(state)
     value = sum(prices.get(name, 0) * count for name, count in ores.items())
-    vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor']
-    adjacent = any(chebyshev(role.pos, z.pos) <= 1 for z in vendors)
     triggers = []
     from .brain import should_upgrade_weapon
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
@@ -400,53 +493,33 @@ def liquidate(role, state, blocked, reserved):
             triggers.append('背包过半，批量变现')
         if cap and cap - len(role.backpack) <= NEAR_CAP_SLOTS:
             triggers.append('背包即将满载，批量变现')
-    choices = []
-    for vendor in vendors:
-        path = adjacent_path(role, vendor.pos, blocked | reserved, state)
-        if path is not None:
-            choices.append((len(path), vendor.pos.x, vendor.pos.y, vendor, path))
+        if in_window:
+            triggers.append('入夜前清空背包，转化收益升级武器')
     if not choices:
         if not (triggers or adjacent or role.id in committed):
             return False, None
         trace(state, role.id, 'sale_unreachable', '需要变现，但当前没有可达的小贩；不继续盲目采矿', ore_value=value)
         return True, None
-    _, _, _, vendor, path = min(choices, key=lambda c: c[:3])
-    sale_rounds = 0
-    arrival = None
-    if path:
-        from .opening import MUSTER_BUFFER
-        from .tactics import night_wave_cleared, threat_eta_to_base
-        weapons = [r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
-        selling_pos = path[-1]
-        proxy = Role(-1, selling_pos, 'worker', 1)
-        obstacles = blocked - {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')}
-        return_paths = [adjacent_path(proxy, w.pos, obstacles, state) for w in weapons]
-        return_lengths = [len(p) for p in return_paths if p is not None]
-        return_time = min(return_lengths) if return_lengths else (0 if not weapons else 10000)
-        sale_rounds = len(path) + len(ores) + return_time + MUSTER_BUFFER
-        if return_time >= 10000:
-            trace(state, role.id, 'sale_too_late', '卖完后找不到回路，不批准这趟外出',
-                  estimated_rounds=sale_rounds, return_time=return_time)
+    if return_time >= 10000:
+        trace(state, role.id, 'sale_too_late', '卖完后找不到回路，不批准这趟外出',
+              estimated_rounds=sale_rounds, return_time=return_time)
+        return False, None
+    if not night_wave_cleared(state):
+        if arrival is None or sale_rounds >= arrival:
+            trace(state, role.id, 'sale_too_late', '卖矿往返将吃掉安全余量，暂停外出',
+                  estimated_rounds=sale_rounds, threat_eta=arrival)
             return False, None
-        if not night_wave_cleared(state):
-            arrival = threat_eta_to_base(state)
-            if arrival is None or sale_rounds >= arrival:
-                trace(state, role.id, 'sale_too_late', '卖矿往返将吃掉安全余量，暂停外出',
-                      estimated_rounds=sale_rounds, threat_eta=arrival)
+        if (state.round_no or 0) >= 70 and not (triggers or adjacent or role.id in committed):
+            extra = min(cap - len(role.backpack), 6) if cap else 6
+            if extra > 0 and sale_rounds + extra >= arrival and value > 0:
+                triggers.append('再采一趟将错过回防前变现')
+            else:
                 return False, None
-            if (state.round_no or 0) >= 70 and not (triggers or adjacent or role.id in committed):
-                extra = min(cap - len(role.backpack), 6) if cap else 6
-                if extra > 0 and sale_rounds + extra >= arrival and value > 0:
-                    triggers.append('再采一趟将错过回防前变现')
-                else:
-                    return False, None
-        elif not (triggers or adjacent or role.id in committed):
-            return False, None
     elif not (triggers or adjacent or role.id in committed):
         return False, None
     if role.id not in committed:
         committed.append(role.id)
-    trace(state, role.id, 'cashout_priority', '急用立即变现，否则等批量再跑小贩', triggers=triggers,
+    trace(state, role.id, 'cashout_priority', '急用立即变现，入夜前清空背包换成火力', triggers=triggers,
           sellable=dict(ores), quoted_value=value, known_prices=prices,
           stone_reserved=role.backpack.count('stone')-ores.get('stone', 0),
           trip_rounds=sale_rounds, threat_eta=arrival, fill_ratio=round(fill, 2))
@@ -462,6 +535,9 @@ def profitable_mine(role, state, blocked, reserved):
     from .world_intel import ore_blocked, ores_to_stockpile
     if role.role_type != 'worker':
         trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
+        return None
+    if in_pre_night_cashout_window(role, state, blocked, reserved):
+        trace(state, role.id, 'cashout_skip_mine', '入夜前停止采矿，把背包收益换成金币和火力')
         return None
     if len(role.backpack) >= role.back_pack_capability:
         trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
