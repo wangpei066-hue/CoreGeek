@@ -10,7 +10,15 @@ from .news_memory import NewsMemory, game_day
 from .protocol import MatchState, Pos, Role
 
 TREASURE_URGENCY_ROUNDS = 15
+TREASURE_BUY_FROM_DAY = 4  # 第四天起才买任务用品；前三天金币留给升炮。
 SUMMON_OK = 1
+
+
+def treasure_buys_allowed(state: MatchState) -> bool:
+    """第四天之前不买祭坛任务用品。已买到手的仍可献祭。"""
+    return game_day(state.round_no) >= TREASURE_BUY_FROM_DAY
+
+
 SUMMON_BAD_PLACE_OR_TIME = 2
 SUMMON_BAD_ITEMS = 3
 SUMMON_EMPTY = 4
@@ -90,12 +98,15 @@ def treasure_should_claim_pioneer(state: MatchState, pioneer: Role, memory: News
         return False
     if in_open_window(state, memory) and items_ready(pioneer, memory):
         return True
+    missing = missing_items(pioneer, memory)
+    can_shop = treasure_buys_allowed(state)
     until = rounds_until_window(state, memory)
     if until is not None and 0 < until <= TREASURE_URGENCY_ROUNDS:
-        return True
+        return (not missing) or can_shop
     if memory.data.get("treasureStage") in ("gather", "wait_window", "approach", "summon"):
-        # 已在执行链路上：白天继续买物；窗口内强制占用
-        if in_open_window(state, memory) or missing_items(pioneer, memory):
+        if in_open_window(state, memory) and not missing:
+            return True
+        if missing and can_shop:
             return True
     return False
 
@@ -168,6 +179,11 @@ def decide_treasure_action(pioneer: Role, state: MatchState, memory: NewsMemory,
     missing = missing_items(pioneer, memory)
 
     if missing:
+        if not treasure_buys_allowed(state):
+            trace(state, pioneer.id, "treasure_buy_deferred",
+                  "第四天前不买任务用品，金币留给武器升级",
+                  day=game_day(state.round_no), missing=missing)
+            return None
         memory.data["treasureStage"] = "gather"
         memory.save()
         target_item = memory.data.get("buyTarget") if memory.data.get("buyTarget") in missing else missing[0]

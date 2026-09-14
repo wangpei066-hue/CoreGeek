@@ -203,7 +203,7 @@
 2. 只有被 `pick_weapon_voucher_buyer` 选中才 `decide_pioneer_voucher`。  
 3. 包里有可卖矿则变现（通常很少）。  
 4. 任务：只接有效且冷却为 0 的「自进化类1/2」，按距离排序。行程 + 超时 + 从任务点回炮 + `MUSTER_BUFFER` ≥ `T_安全截止` 则不接；路径找不到则不接。已在任务点一格内 `acceptTask`。只有自己是采购者时不新接。  
-5. 宝藏：传闻抽出祭坛/用品后，空闲时买齐并 `summonTreasure`。自进化优先于宝藏；窗口前 15 回合会占用开拓者筹备。  
+5. 宝藏：第四天起才买任务用品；前三天金币留给升炮。已买到手或第四天后，空闲时买齐并 `summonTreasure`。自进化优先于宝藏；窗口前 15 回合且允许采购时才占用开拓者筹备。  
 6. 战术道具。  
 7. 已有非武器商店任务，或新开修墙/墙券/基地券（`allow_weapon=False`，避免和专责买券冲突）。  
 8. 自救 / 路过买药。  
@@ -303,6 +303,7 @@ $$
 
 - 传闻累计祭坛坐标、非战斗商店物品名、开启日。  
 - 状态机：`gather` 买缺的用品（默认价 15，有商店报价则用报价）→ `wait_window` 物品齐了等窗口，前 15 回合提前靠近祭坛但保持约 2 格外 → `approach`/`summon` 一格内 `summonTreasure`。  
+- **第四天之前不买任务用品**（`game_day < 4`，即 `round_no < 390`）。背包里已经有的仍可献祭。  
 - 结果码 1 或 4：这轮宝藏结束。3：物品不对，清空假设重解。2：地点/时间不对，保留物品，重解窗口。  
 - 自进化没占用 `prompt` 时，每天最多 3 次 LLM 补全启发式没读出的字段。宝藏已完成则不再请求。
 
@@ -355,7 +356,7 @@ $$
 | `PRE_NIGHT_CASHOUT_LEAD` / `PRE_NIGHT3_CASHOUT_LEAD` | 12 / 20 | 入夜前清包留量；第三晚前更早把矿换成火力 |
 | `WORKER_WALL_OPPORTUNITY` / `PIONEER_TASK_OPPORTUNITY` | 6 / 8 | 买券耽误施工/任务的加罚 |
 | `DAILY_SUMMON_LIMIT` / `DEFENSE_RESERVE` | 10 / 100 | 召唤令 |
-| `TREASURE_URGENCY_ROUNDS` | 15 | 窗口前占用开拓者 |
+| `TREASURE_URGENCY_ROUNDS` / `TREASURE_BUY_FROM_DAY` | 15 / 4 | 窗口前占用开拓者；第几天起才买任务用品 |
 | 新闻 LLM 日限 | 3 | 不含自进化 |
 
 ---
