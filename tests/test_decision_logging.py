@@ -41,9 +41,8 @@ class DecisionLoggingTests(unittest.TestCase):
         report = build_report(state, commands, {}, before, None, 1, 0, '白天')
         role = report['roles'][0]
         self.assertEqual(role['status'], 'idle')
-        event = next(e for e in role['events'] if e['code'] == 'station_upgrade_unaffordable')
-        self.assertEqual(event['available_gold'], 75)
-        self.assertEqual(event['required_gold'], 100)
+        event = next(e for e in role['events'] if e['code'] == 'early_buy_blocked')
+        self.assertEqual(event['item'], 'StationUpgradeVoucher1')
 
     def test_attack_belongs_to_controller_not_idle_role(self):
         from src.agent.protocol import RobotRole, Pos

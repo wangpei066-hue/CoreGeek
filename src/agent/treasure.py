@@ -10,13 +10,30 @@ from .news_memory import NewsMemory, game_day
 from .protocol import MatchState, Pos, Role
 
 TREASURE_URGENCY_ROUNDS = 15
-TREASURE_BUY_FROM_DAY = 4  # 第四天起才买任务用品；前三天金币留给升炮。
+TREASURE_BUY_FROM_DAY = 4  # 第四天起才买任务用品/召唤令/基地券；前三天金币留给升炮。
 SUMMON_OK = 1
+EARLY_GAME_BUY_ALLOW = frozenset({
+    "WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2",
+    "WallUpgradeVoucher1", "WallUpgradeVoucher2",
+    "Medicine", "WallFixer",
+})
+EMERGENCY_BUY_ALLOW = frozenset({"Bomb", "DizzyWeapon"})
 
 
 def treasure_buys_allowed(state: MatchState) -> bool:
     """第四天之前不买祭坛任务用品。已买到手的仍可献祭。"""
     return game_day(state.round_no) >= TREASURE_BUY_FROM_DAY
+
+
+def shop_buy_allowed(name: str, state: MatchState, emergency: bool = False) -> bool:
+    """第四天前只买升炮/升墙/药/修复包；高压才买炸弹眩晕。召唤令、基地券、任务用品一律等到第四天。"""
+    if not name:
+        return False
+    if game_day(state.round_no) >= TREASURE_BUY_FROM_DAY:
+        return True
+    if emergency and name in EMERGENCY_BUY_ALLOW:
+        return True
+    return name in EARLY_GAME_BUY_ALLOW
 
 
 SUMMON_BAD_PLACE_OR_TIME = 2

@@ -424,10 +424,14 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     if (allow_structure_upgrade and station and (station.level or 1) < 3
             and (station.pos.x, station.pos.y) not in pending_targets):
         name, cost = voucher_for("station", station.level or 1)
-        if name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
+        from .treasure import shop_buy_allowed
+        if name not in role.backpack and not shop_buy_allowed(name, state):
+            trace(state, role.id, "early_buy_blocked", "第四天前不买基地券，金币留给武器升级", item=name)
+        elif name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
             state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
             return
-        trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
+        else:
+            trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
 
     damaged_wall = _pick_damaged_wall(state, pending_targets)
     if damaged_wall and 'WallFixer' in role.backpack:
@@ -499,6 +503,12 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
             trace(state, role.id, 'weapon_upgrade_job_waiting_funds', '保留武器升级目标并继续筹资，不改做城墙/基地升级')
             return None
         del state.worker_item_jobs[role.id]
+        return None
+    from .treasure import shop_buy_allowed
+    if not shop_buy_allowed(item, state):
+        trace(state, role.id, "early_buy_blocked", "第四天前不买该商店道具，金币留给武器升级", item=item)
+        if job.get("kind") != "weapon":
+            del state.worker_item_jobs[role.id]
         return None
     shop = find_zone(state, "weaponShop")
     if shop is None:
@@ -981,6 +991,11 @@ def plan_day(state: "MatchState") -> dict:
         if cmd:
             cost = 0
             if cmd["action"] == "buy":
+                from .treasure import shop_buy_allowed
+                from .tactics import front_breached, pressure
+                if not shop_buy_allowed(cmd["name"], state, emergency=pressure(state) or front_breached(state)):
+                    trace(state, role.id, "early_buy_blocked", "第四天前拦截任务用品/召唤令/基地券购买", item=cmd["name"])
+                    continue
                 cost = item_cost(cmd["name"], state) * cmd.get("num", 1)
             elif cmd["action"] == "build" and cmd["name"] in WEAPON_TYPES:
                 cost = WEAPON_GOLD_COST
@@ -1046,6 +1061,11 @@ def plan_night(state: "MatchState") -> dict:
                 continue
             if cmd:
                 if cmd.get('action') == 'buy':
+                    from .treasure import shop_buy_allowed
+                    from .tactics import front_breached, pressure
+                    if not shop_buy_allowed(cmd['name'], state, emergency=pressure(state) or front_breached(state)):
+                        trace(state, role.id, 'early_buy_blocked', '第四天前拦截任务用品/召唤令/基地券购买', item=cmd['name'])
+                        continue
                     cost = item_cost(cmd['name'], state) * cmd.get('num', 1)
                     if cost > state.team_our.gold_num:
                         continue
@@ -1070,6 +1090,9 @@ def plan_night(state: "MatchState") -> dict:
             cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
             if cmd:
                 if cmd['action'] == 'buy':
+                    from .treasure import shop_buy_allowed
+                    if not shop_buy_allowed(cmd['name'], state, emergency=True):
+                        continue
                     state.team_our.gold_num -= item_cost(cmd['name'], state)
                 commands[fighter.id] = cmd
                 continue
@@ -1093,6 +1116,9 @@ def plan_night(state: "MatchState") -> dict:
                 cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
                 if cmd:
                     if cmd['action'] == 'buy':
+                        from .treasure import shop_buy_allowed
+                        if not shop_buy_allowed(cmd['name'], state, emergency=urgent):
+                            continue
                         state.team_our.gold_num -= item_cost(cmd['name'], state)
                     commands[fighter.id] = cmd
                     continue
