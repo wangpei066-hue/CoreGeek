@@ -7,6 +7,17 @@ import sys
 MARKER = "PIONEER_TASK"
 
 
+def log_task_exchange(event, sequence, payload, session, round_no):
+    """完整记录平台收发数据；不截断、不落盘，request/response以sequence配对。"""
+    print(json.dumps({
+        "marker": "PIONEER_TASK_EXCHANGE", "event": event,
+        "sequence": sequence, "roundNo": round_no,
+        "solverStage": session.get("stage", "idle"),
+        "requestId": session.get("requestId"),
+        "payload": payload,
+    }, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
 def task_diagnostics(state, commands, previous_commands, solver_stage="idle"):
     pioneers = [r for r in state.team_our.roles if r.role_type == "pioneer"] if state.team_our else []
     record = {

@@ -29,6 +29,15 @@ class TaskSolverTests(unittest.TestCase):
     def post(self):
         response = self.client.post('/', json=self.payload)
         self.assertEqual(response.status_code, 200)
+        exchanges = [record for line in self.output.getvalue().splitlines()
+                     if line.startswith('{')
+                     and (record := json.loads(line)).get('marker') == 'PIONEER_TASK_EXCHANGE']
+        received, sent = exchanges[-2:]
+        self.assertEqual(received['event'], 'request')
+        self.assertEqual(sent['event'], 'response')
+        self.assertEqual(received['sequence'], sent['sequence'])
+        self.assertEqual(received['payload'], self.payload)
+        self.assertEqual(sent['payload'], response.json)
         return response.json
 
     def next_round(self, **values):
@@ -224,6 +233,29 @@ class TaskSolverTests(unittest.TestCase):
         self.assertEqual(submit['roleCommandMap']['10011']['taskAnswer'], '2')
         retry = self.next_round(errors=[{'errorCode': 2, 'description': '答案不完全正确'}])
         self.assertIn('答案不完全正确', retry['prompt'])
+
+    def test_raw_llm_response_goes_to_stderr_not_local_logs(self):
+        self.post()
+        replies = [
+            ('请计算1+1，仅返回数字', '非法响应' * 2000),
+            ('新的题目', '{"action":"submit","taskAnswer":"旧答案"}'),
+            ('新的题目', '{"action":"submit","taskAnswer":"新答案"}'),
+            ('', '任务结束时的响应'),
+        ]
+        for seq, (task, reply) in enumerate(replies, start=2):
+            with self.subTest(seq=seq):
+                self.next_round(phaseTask=task, llmResp=reply)
+                record = json.loads((self.root / f'logs/request_{seq:06d}.json').read_text())
+                self.assertNotIn('llmResp', record)
+                if seq == 2:
+                    for path in (*self.root.glob('logs/*.json'),
+                                 *self.root.glob('state/*.json')):
+                        self.assertNotIn(reply, path.read_text())
+                diagnostics = [json.loads(line) for line in self.output.getvalue().splitlines()
+                               if line.startswith('{')]
+                self.assertTrue(any(item.get('llmResp') == reply
+                                    and item.get('roundNo') == self.payload['roundNo']
+                                    for item in diagnostics))
 
     def test_wrong_sandbox_correlation_does_not_feed_llm(self):
         self.payload['phaseTask'] = '阅读 `/task.md`'
