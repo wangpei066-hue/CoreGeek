@@ -111,6 +111,7 @@ def pressure(state):
 
 def _note_respawns(state):
     """阵亡后次日复活：清掉该角色旧建造目标、商店任务和炮位记忆，避免沿用上一世分配。"""
+    from .economy import clear_mine_target
     prev = state.policy_memory.get('role_alive') or {}
     alive = {}
     assignment = dict(state.policy_memory.get('weapon_assignment') or {})
@@ -125,6 +126,7 @@ def _note_respawns(state):
             state.worker_item_jobs.pop(role.id, None)
             assignment.pop(key, None)
             wall_targets.pop(key, None)
+            clear_mine_target(state, role.id)
             trace(state, role.id, 'role_respawned', '角色复活，清除旧炮位与建造目标后重新分配')
     state.policy_memory['role_alive'] = alive
     state.policy_memory['weapon_assignment'] = assignment
