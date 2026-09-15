@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 from .protocol import MatchState
 from .task_logging import task_diagnostics
 from .news_logging import news_diagnostics
-from .task_solver import PioneerTaskSolver
+from .task_solver import PioneerTaskSolver, WAITING_STAGES
 from .news_memory import NewsMemory
 from .prompt_router import PromptRouter
 from .brain import V1Strategy, BasicActionValidator, is_day_round
@@ -166,12 +166,15 @@ class GameServer:
             diagnostic_cmd = task_diagnostics(
                 self.match_state, role_command_map, previous_commands,
                 self.task_solver.session.get('stage', 'idle'),
+                occupy_sandbox=self.task_solver.session.get('stage') not in WAITING_STAGES,
             )
             news_cmd = news_diagnostics(
                 self.match_state, self.news_memory, role_command_map, previous_commands,
             )
-            # 与自进化一致：解题命令优先；否则任务诊断；再否则新闻诊断经沙盒回传。
-            execute_cmd = execute_cmd or diagnostic_cmd or news_cmd
+            if self.task_solver.session.get('stage') in WAITING_STAGES:
+                execute_cmd = execute_cmd or ''
+            else:
+                execute_cmd = execute_cmd or diagnostic_cmd or news_cmd
             elapsed_ms = (perf_counter() - started) * 1000
             # 诊断日志失败不应让合法比赛响应变成500。
             try:

@@ -15,6 +15,7 @@ _ACTIVITY_CODES = {
     "official_plan", "folk_plan",
     "official_news_ingested", "folk_legend_ingested",
     "news_llm_prompt", "news_llm_applied", "news_llm_unparsed",
+    "llm_skipped",
 }
 
 

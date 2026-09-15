@@ -108,6 +108,15 @@ class PromptRouter:
 
     def consume_llm_resp(self, state: MatchState) -> None:
         pending = self.memory.data.get("pendingConsumer")
+        if state.phase_task:
+            if pending:
+                log_news_event(
+                    event="llm_skipped", roundNo=state.round_no,
+                    title="【LLM】自进化占用通道，跳过新闻消费",
+                    consumer=pending,
+                )
+                self.memory.clear_pending()
+            return
         if not pending:
             return
         # 同回合重试：不重复消费

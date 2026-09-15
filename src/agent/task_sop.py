@@ -37,9 +37,10 @@ if updated != original:
     with config.open('w', encoding='utf-8', newline='') as f:
         f.write(updated)
 script = root / 'bin/start.sh'
-if not script.exists():
-    script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text('#!/bin/sh\n', encoding='utf-8')  # 有功能要求时替换为真实实现
+if script.exists():
+    script.chmod(0o755)
+else:
+    raise AssertionError('缺少启动脚本且无功能依据，不创建空脚本')
 assert script.is_file(), '脚本路径不是文件'
 script.chmod(0o755)
 assert directory.is_dir() and stat.S_IMODE(directory.stat().st_mode) == 0o755

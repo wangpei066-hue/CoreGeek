@@ -95,6 +95,20 @@ class NewsMemoryTests(unittest.TestCase):
         state.phase_task = "做题"
         self.assertEqual(PromptRouter(self.memory).request_prompt(state), "")
 
+    def test_phase_task_does_not_consume_task_json_as_news(self):
+        state = self._state(0, official=IRON_COLLAPSE, folk="情报")
+        self.memory.ingest(state)
+        router = PromptRouter(self.memory)
+        router.request_prompt(state)
+        self.assertEqual(self.memory.data["pendingConsumer"], "treasure")
+        state.round_no = 1
+        state.phase_task = "做题"
+        state.llm_resp = '{"action":"submit","taskAnswer":"2"}'
+        router.consume_llm_resp(state)
+        self.assertIsNone(self.memory.data["pendingConsumer"])
+        hyp = self.memory.data.get("treasureHypothesis") or {}
+        self.assertFalse(hyp.get("ready"))
+
     def test_consume_ore_and_treasure_llm(self):
         state = self._state(5, official=IRON_COLLAPSE, folk="石门需三钥")
         self.memory.ingest(state)
