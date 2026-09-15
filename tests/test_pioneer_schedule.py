@@ -158,7 +158,8 @@ class PioneerScheduleTests(unittest.TestCase):
         commands = self.decide(state)
         self.assertIn('3', {c['controllerId'] for c in commands.values() if c.get('action') == 'attack'})
 
-    def test_ingest_rebinding_clears_old_task_session_before_decide(self):
+    def test_stale_task_session_does_not_leak_into_new_task(self):
+        """phaseTask 换了新任务时，求解器必须重新开会话，不能把旧任务的"已可提交"状态带过来。"""
         state, pioneer = self.armed_day()
         state.phase_task = '新任务正文'
         with tempfile.TemporaryDirectory() as root:
@@ -169,9 +170,14 @@ class PioneerScheduleTests(unittest.TestCase):
                 'history': [], 'index': 0, 'offset': 0, 'calls': 0, 'retries': 0,
                 'round': 139, 'fingerprint': task_fingerprint('旧任务正文'),
             }
-            solver.ingest_feedback(state)
+            state.round_no = 140
+            state.llm_resp = ''
+            state.last_cmd_result = ''
+            state.errors = []
+            state.last_round_role_action_results = {}
+            solver.step(state, {})
             self.assertNotEqual(state.task_session.get('answer'), '旧答案')
-            self.assertEqual(state.task_session.get('fingerprint'), task_fingerprint('新任务正文'))
+            self.assertNotEqual(state.task_session.get('fingerprint'), task_fingerprint('旧任务正文'))
             self.assertFalse(solver_ready_to_submit(state))
 
     def test_timeout_is_not_used_as_solve_duration(self):
