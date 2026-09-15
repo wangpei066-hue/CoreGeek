@@ -66,7 +66,7 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 self.assertEqual(commands[20]['controllerId'], '3')
                 self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
 
-    def test_pioneer_buys_voucher_instead_of_new_task_when_gold_enough(self):
+    def test_ordinary_voucher_does_not_preempt_feasible_task(self):
         state = opening_state()
         state.round_no = 140
         state.team_our.gold_num = 130
@@ -81,9 +81,10 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(8, 9)
         commands = self.decide(state)
-        self.assertEqual(commands[pioneer.id]['action'], 'buy')
-        self.assertEqual(commands[pioneer.id]['name'], 'WeaponUpgradeVoucher1')
-        self.assertNotEqual(commands[pioneer.id]['action'], 'acceptTask')
+        self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
+        self.assertNotEqual(commands[pioneer.id]['action'], 'buy')
+        self.assertTrue(any(c.get('action') == 'buy' and c.get('name') == 'WeaponUpgradeVoucher1'
+                            for rid, c in commands.items() if rid != pioneer.id))
 
     def test_worker_buys_voucher_when_pioneer_is_next_to_task(self):
         state = opening_state()

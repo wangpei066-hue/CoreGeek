@@ -2,9 +2,12 @@
 import unittest
 
 from src.agent.brain import V1Strategy, BasicActionValidator, pick_weapon_name
-from src.agent.opening import wall_ring, primary_wall_plan, assign_weapons, safe_wall, opening_time_budget
+from src.agent.opening import (
+    wall_ring, primary_wall_plan, assign_weapons, safe_wall, opening_time_budget,
+    estimate_opening_upgrade, day_rounds_remaining, plan_opening,
+)
 from src.agent.grid import build_blocked_set
-from src.agent.protocol import Pos, Zone, RobotRole
+from src.agent.protocol import Pos, Zone, RobotRole, ShopItem
 from test_shop_items import minimal_state, make_role
 
 
@@ -130,6 +133,53 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(budget['allow_walls'])
         self.assertFalse(budget['allow_sell'])
         self.assertFalse(budget['allow_upgrade'])
+
+    def test_day1_mines_metal_before_stone_until_weapon_upgraded(self):
+        from src.agent.protocol import ShopItem
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'),
+            Zone(Pos(9, 6), 'copper'),
+            Zone(Pos(12, 6), 'iron'),
+            Zone(Pos(1, 9), 'weaponShop'),
+            Zone(Pos(1, 11), 'vendor'),
+        ]
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 3), ShopItem('stone', 1)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        targets = state.policy_memory.get('mine_targets') or {}
+        ores = {targets.get(str(rid), {}).get('ore') for rid in (1, 2)}
+        self.assertTrue(ores)
+        self.assertTrue(ores <= {'copper', 'iron'})
+        self.assertNotIn('stone', ores)
+        for rid in (1, 2):
+            cmd = commands.get(rid) or {}
+            self.assertIn(cmd.get('action'), ('move', 'collect'))
+            if cmd.get('action') == 'collect':
+                self.assertNotEqual(cmd['targetPos'][0], {'x': 6, 'y': 9})
+
+    def test_day1_mines_stone_after_front_weapon_is_level_two(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'),
+            Zone(Pos(9, 6), 'copper'),
+            Zone(Pos(1, 9), 'weaponShop'),
+            Zone(Pos(1, 11), 'vendor'),
+        ]
+        V1Strategy(BasicActionValidator()).decide(state)
+        ores = {
+            (state.policy_memory.get('mine_targets') or {}).get(str(rid), {}).get('ore')
+            for rid in (1, 2)
+        }
+        self.assertIn('stone', ores)
+        self.assertNotIn('copper', ores)
+        self.assertNotIn('iron', ores)
 
     def test_gold_in_hand_still_buys_voucher_when_wall_time_is_tight(self):
         state = opening_state()
@@ -457,4 +507,211 @@ class OpeningTests(unittest.TestCase):
         target = builds[0]['targetPos'][0]
         self.assertEqual(target['x'], 13)
         self.assertEqual(max(abs(target['x'] - 12), abs(target['y'] - 10)), 1)
+
+
+class OpeningUpgradeEstimateTests(unittest.TestCase):
+    def _rockets(self, state):
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1, health=1000),
+            make_role(21, 12, 8, 'rocket', level=1, health=1000),
+            make_role(22, 12, 12, 'rocket', level=1, health=1000),
+        ]
+
+    def _upgrade_map(self, state, copper=True, vendor=True, shop=True):
+        zones = [Zone(Pos(6, 9), 'stone')]
+        if copper:
+            zones.append(Zone(Pos(9, 6), 'copper'))
+        if vendor:
+            zones.append(Zone(Pos(1, 11), 'vendor'))
+        if shop:
+            zones.append(Zone(Pos(1, 9), 'weaponShop'))
+        state.map_info.zones = zones
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 3), ShopItem('stone', 1)]
+        return state
+
+    def _est(self, state, gold=None):
+        if gold is not None:
+            state.team_our.gold_num = gold
+        return estimate_opening_upgrade(state, build_blocked_set(state), state.team_our.gold_num)
+
+    def test_estimate_includes_mining_when_broke_and_empty(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        est = self._est(state, gold=0)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'need_mine')
+        self.assertEqual(est['ore'], 'copper')
+        self.assertGreaterEqual(est['mine_rounds'], 20)
+        self.assertGreater(est['total'], est['mine_rounds'])
+        self.assertGreater(est['route_rounds'], 0)
+        self.assertGreaterEqual(est['action_rounds'], 3)
+
+    def test_estimate_mines_only_the_remaining_voucher_gap(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        state.team_our.roles[1].backpack = ['copper'] * 10
+        est = self._est(state, gold=0)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'need_mine')
+        self.assertEqual(est['mine_rounds'], 10)
+        self.assertEqual(est['inventory_sale_value'], 50)
+
+    def test_estimate_picks_higher_price_ore_when_total_rounds_are_shorter(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        state.map_info.zones.append(Zone(Pos(12, 6), 'iron'))
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 50), ShopItem('stone', 1)]
+        est = self._est(state, gold=0)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'need_mine')
+        self.assertEqual(est['ore'], 'iron')
+        self.assertEqual(est['mine_rounds'], 2)
+
+    def test_estimate_sells_existing_metal_without_mining(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        state.team_our.roles[1].backpack = ['copper'] * 20
+        est = self._est(state, gold=0)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'sell_inventory')
+        self.assertEqual(est['mine_rounds'], 0)
+        self.assertGreaterEqual(est['inventory_sale_value'], 100)
+        self.assertGreaterEqual(est['action_rounds'], 3)
+
+    def test_estimate_gold_ready_skips_mine_and_sell(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        est = self._est(state, gold=130)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'gold_ready')
+        self.assertEqual(est['mine_rounds'], 0)
+        self.assertEqual(est['funding_deficit'], 0)
+        self.assertGreaterEqual(est['action_rounds'], 2)
+
+    def test_estimate_held_voucher_skips_mine_sell_buy(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        state.team_our.roles[1].backpack = ['WeaponUpgradeVoucher1']
+        est = self._est(state, gold=0)
+        self.assertTrue(est['ok'])
+        self.assertEqual(est['status'], 'have_voucher')
+        self.assertEqual(est['mine_rounds'], 0)
+        self.assertEqual(est['action_rounds'], 1)
+
+    def test_estimate_mine_unreachable(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state, copper=False)
+        est = self._est(state, gold=0)
+        self.assertFalse(est['ok'])
+        self.assertIsNone(est['total'])
+        self.assertEqual(est['fallback_reason'], 'mine_unreachable')
+
+    def test_estimate_vendor_unreachable(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state, vendor=False)
+        state.team_our.roles[1].backpack = ['copper'] * 20
+        est = self._est(state, gold=0)
+        self.assertFalse(est['ok'])
+        self.assertEqual(est['fallback_reason'], 'vendor_unreachable')
+
+    def test_estimate_shop_unreachable(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state, shop=False)
+        est = self._est(state, gold=130)
+        self.assertFalse(est['ok'])
+        self.assertEqual(est['fallback_reason'], 'shop_unreachable')
+
+    def test_estimate_backpack_too_small_to_mine_enough(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        state.team_our.roles[1].back_pack_capability = 2
+        state.team_our.roles[2].back_pack_capability = 2
+        est = self._est(state, gold=0)
+        self.assertFalse(est['ok'])
+        self.assertEqual(est['fallback_reason'], 'backpack_capacity')
+        self.assertGreaterEqual(est['mine_rounds'], 20)
+
+    def test_dead_weapon_not_counted_as_three(self):
+        state = opening_state()
+        state.round_no = 20
+        self._rockets(state)
+        state.team_our.roles[-1].health = 0
+        V1Strategy(BasicActionValidator()).decide(state)
+        phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
+        self.assertEqual(phase['weapons'], 2)
+        self.assertEqual(phase['phase'], '武器')
+
+    def test_dead_level_two_weapon_does_not_set_upgraded_once(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        state.team_our.roles.append(make_role(29, 11, 10, 'rocket', level=2, health=0))
+        self._upgrade_map(state)
+        V1Strategy(BasicActionValidator()).decide(state)
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertFalse(budget['upgraded'])
+        self.assertIn(budget['upgrade_status'], ('need_mine', 'sell_inventory'))
+
+    def test_dead_wall_reenters_missing(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        cell = primary_wall_plan(state, state.team_our.roles[0])[0]
+        state.team_our.roles.append(make_role(99, cell[0], cell[1], 'wall', health=0, level=1))
+        V1Strategy(BasicActionValidator()).decide(state)
+        phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
+        self.assertIn(cell, [tuple(p) for p in phase['wall_missing']])
+
+    def test_day1_remaining_rounds(self):
+        self.assertEqual(day_rounds_remaining(0), 70)
+        self.assertEqual(day_rounds_remaining(20), 50)
+
+    def test_day2_remaining_rounds(self):
+        self.assertEqual(day_rounds_remaining(140), 60)
+        self.assertEqual(day_rounds_remaining(70), 0)
+        self.assertEqual(day_rounds_remaining(129), 0)
+
+    def test_night_does_not_restart_opening_economy(self):
+        state = opening_state()
+        self._rockets(state)
+        state.round_no = 75
+        self.assertEqual(plan_opening(state), {})
+        self.assertTrue(any(e['code'] == 'opening_night_guard' for e in state.decision_events))
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(e['code'] == 'opening_phase' for e in state.decision_events))
+        self.assertFalse(any(c.get('action') in ('collect', 'buy', 'sell') for c in commands.values()))
+
+    def test_gold_ready_allows_upgrade_and_walls_in_parallel(self):
+        state = opening_state()
+        self._rockets(state)
+        missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
+        budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
+        self.assertTrue(budget['allow_upgrade'])
+        self.assertTrue(budget['allow_walls'])
+        self.assertFalse(budget['allow_mine'])
+        self.assertEqual(budget['upgrade_status'], 'gold_ready')
+
+    def test_upgrade_too_late_stops_metal_mining(self):
+        state = opening_state()
+        self._rockets(state)
+        self._upgrade_map(state)
+        missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
+        budget = opening_time_budget(state, missing, 8, 3, 0, False, build_blocked_set(state))
+        self.assertFalse(budget['allow_mine'])
+        self.assertFalse(budget['allow_sell'])
+        self.assertTrue(budget['allow_walls'])
+        self.assertIn(budget['fallback_reason'], ('upgrade_too_late', 'backpack_capacity', 'unreachable'))
+        self.assertGreaterEqual(budget['mine_rounds'], 20)
 

@@ -893,11 +893,13 @@ class PioneerTaskSolver:
                 raise ValueError('bad archives')
         except (OSError, ValueError):
             self.archives = {}
+        self._ingested_round = None
 
     def reset(self):
         self.session = {}
         self.experience = empty_experience()
         self.archives = {}
+        self._ingested_round = None
         for path in (self.path, self.experience_path, self.archives_path):
             try:
                 path.unlink()
@@ -1397,7 +1399,11 @@ class PioneerTaskSolver:
             return 'tight', remaining
         return 'normal', remaining
 
-    def step(self, state, commands):
+    def ingest_feedback(self, state):
+        """只消费 lastCmd/llm/submit 并绑定当前 phaseTask，不发出解题动作。"""
+        if getattr(self, '_ingested_round', None) == state.round_no:
+            state.task_session = dict(self.session) if self.session else {}
+            return
         key = [state.team_our.team_id, state.team_our.type, state.phase_task] if state.team_our else None
         self._bind_match(state)
         s = self.session
@@ -1415,7 +1421,9 @@ class PioneerTaskSolver:
                     self._emit_summary(self.session, state, self.session.get('endReason'))
                 self.session = {}
                 self.save()
-            return '', ''
+            state.task_session = {}
+            self._ingested_round = state.round_no
+            return
         rewound = (state.round_no or 0) < s.get('round', -1)
         if rewound:
             self.archives = {}
@@ -1442,12 +1450,32 @@ class PioneerTaskSolver:
                 and not s.get('workspace')
                 and any(not path.startswith('/') for path in s['paths'])):
             s['stage'] = 'ask'
-        # 兼容升级前保存的会话。
         for field, value in task_context(state.phase_task).items():
             s.setdefault(field, value)
         s.setdefault('metrics', empty_metrics(state.round_no))
         s.setdefault('promptVersion', PROMPT_VERSION)
         s.setdefault('promptHash', PROMPT_HASH)
+        if s.get('feedbackRound') != state.round_no:
+            if s['stage'] in ('wait_read', 'wait_tool', 'wait_probe'):
+                self._consume_waiting(state, s)
+            elif s['stage'] == 'wait_llm':
+                self._consume_llm(state, s)
+            elif s['stage'] == 'wait_submit':
+                self._consume_submit(state, s)
+            if s['stage'] == 'api_fetch' and not api_fetch_query(
+                    s.get('apiReplay') or {}, state.phase_task, 'preview'):
+                s['stage'] = 'ask'
+            s['feedbackRound'] = state.round_no
+        self.session = s
+        state.task_session = dict(s)
+        self._ingested_round = state.round_no
+
+    def step(self, state, commands):
+        self.ingest_feedback(state)
+        s = self.session
+        if not state.phase_task or not state.team_our:
+            return '', ''
+        key = [state.team_our.team_id, state.team_our.type, state.phase_task]
         # 相同回合重试返回完全相同的任务动作，不重复推进状态机。
         if s.get('round') == state.round_no and 'response' in s:
             cached = s['response']
@@ -1456,14 +1484,6 @@ class PioneerTaskSolver:
             return cached['prompt'], cached['executeCmd']
         prompt, execute = '', ''
         submission = {}
-        if s['stage'] in ('wait_read', 'wait_tool', 'wait_probe'):
-            execute = self._consume_waiting(state, s) or ''
-        elif s['stage'] == 'wait_llm':
-            self._consume_llm(state, s)
-        elif s['stage'] == 'wait_submit':
-            self._consume_submit(state, s)
-        if s['stage'] == 'api_fetch' and not api_fetch_query(s.get('apiReplay') or {}, state.phase_task, 'preview'):
-            s['stage'] = 'ask'
 
         if state.map_info:
             holding, pioneer = self._holding_for_output(state, commands)

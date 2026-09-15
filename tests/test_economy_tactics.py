@@ -244,6 +244,41 @@ class EconomyTests(unittest.TestCase):
         self.assertEqual(target['ore'], 'iron')
         self.assertEqual((target['x'], target['y']), (2, 1))
 
+    def test_voucher_mine_prefers_near_high_price_iron(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'iron'),
+            Zone(Pos(25, 25), 'copper'),
+        ]
+        state.vendor_shop_list = [ShopItem('iron', 10), ShopItem('copper', 5)]
+        picked = pick_mine(role, state, build_blocked_set(state), set(),
+                           want_ores=('iron', 'copper'), purpose='voucher')
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked[0].neutral_type, 'iron')
+
+    def test_voucher_mine_prefers_near_copper_when_far_iron_takes_more_rounds(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'copper'),
+            Zone(Pos(25, 25), 'iron'),
+        ]
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 10)]
+        picked = pick_mine(role, state, build_blocked_set(state), set(),
+                           want_ores=('iron', 'copper'), purpose='voucher')
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked[0].neutral_type, 'copper')
+
+    def test_voucher_mine_without_vendor_prices_does_not_invent_them(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.vendor_shop_list = []
+        self.assertIsNone(pick_mine(role, state, build_blocked_set(state), set(),
+                                    want_ores=('iron', 'copper'), purpose='voucher'))
+
     def test_cashout_window_clears_mine_target(self):
         state, role = defended_state()
         state.round_no = 310

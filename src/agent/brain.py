@@ -10,7 +10,12 @@ from .protocol import (
 from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
-from .task_solver import MIN_TASK_TIMEOUT_ROUNDS
+from .pioneer_schedule import (
+    SCHEDULER_VERSION, SHOP_STALL_ROUNDS, add_branch, apply_task_choice, begin_schedule,
+    bump_streak, emit_scheduler_log, ensure_schedule_buckets, interrupt_reservation,
+    mark_outcome, reservation_of, reset_shop_progress, shop_progress_stalled,
+    voucher_is_defense_critical,
+)
 
 
 DAY_ROUNDS = 70
@@ -305,6 +310,7 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
     candidates = [
         r for r in state.team_our.roles
         if r.role_type in role_types
+        and r.health > 0
         and (r.pos.x, r.pos.y) not in pending_targets
         and (r.level or 1) <= max_current_level
         and r.health >= max_health(r) * min_health_ratio
@@ -707,11 +713,16 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
 
 
 
-def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """开拓者专责买/用武器升级券：任务金币够了就去商店，不走工人卖矿路径。进行中的任务不中断。"""
+def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, reserved: set,
+                           allow_interrupt=False, interrupt_reason=None):
+    """开拓者买/用武器升级券。进行中的任务和普通任务预约默认不中断。"""
     if pioneer.role_type != "pioneer" or pioneer.health <= 0:
         return None
     if state.phase_task:
+        return None
+    reservation = reservation_of(state)
+    if reservation and not allow_interrupt:
+        add_branch(state, 'voucher_blocked_by_reservation')
         return None
     job = state.worker_item_jobs.get(pioneer.id)
     has_voucher = any(isinstance(item, str) and "WeaponUpgradeVoucher" in item for item in pioneer.backpack)
@@ -722,8 +733,13 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
             maybe_start_shop_item_job(pioneer, state, allow_weapon=True)
         cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
         if cmd:
+            if reservation and allow_interrupt:
+                interrupt_reservation(state, interrupt_reason or 'defense_critical_voucher_job',
+                                      extra={'action': cmd.get('action')})
             trace(state, pioneer.id, "pioneer_voucher_job",
-                  "开拓者执行武器升级券任务（购买或使用）", action=cmd.get("action"))
+                  "开拓者执行武器升级券任务（购买或使用）", action=cmd.get("action"),
+                  interrupt=bool(reservation and allow_interrupt),
+                  interruptReason=interrupt_reason)
         return cmd
     from .economy import pick_weapon_voucher_buyer
     buyer = pick_weapon_voucher_buyer(state, blocked)
@@ -743,8 +759,13 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
     maybe_start_shop_item_job(pioneer, state, allow_weapon=True)
     cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
     if cmd:
+        if reservation and allow_interrupt:
+            interrupt_reservation(state, interrupt_reason or 'defense_critical_voucher',
+                                  cost=cost, extra={'item': name})
         trace(state, pioneer.id, "pioneer_buys_voucher", "任务金币已够，开拓者去买武器升级券",
-              item=name, available_gold=state.team_our.gold_num, required_gold=cost)
+              item=name, available_gold=state.team_our.gold_num, required_gold=cost,
+              interrupt=bool(reservation and allow_interrupt),
+              interruptReason=interrupt_reason, defenseCritical=bool(allow_interrupt))
     return cmd
 
 
@@ -843,121 +864,171 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
 
 def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """回防窗内是否留在任务点由 pioneer_should_hold_task 决定，不再用「三炮二级」一刀切。
-    未开始的任务始终受 defense_due 约束，不会在回防期新接。"""
+    """回防窗内是否留在任务点由 pioneer_should_hold_task 决定。
+    未开始的任务始终受 defense_due 约束；普通买券不再抢占可行任务。"""
+    from .economy import defense_due, pioneer_should_hold_task
+    add_branch(state, 'decide_pioneer_task')
     if pioneer.health <= 0:
+        mark_outcome(state, 'dead', None, 'dead')
         return True, None
-    from .economy import defense_due, pioneer_available_to_buy_voucher, pioneer_should_hold_task
-    job = state.worker_item_jobs.get(pioneer.id)
-    if job and job.get("kind") == "weapon" and not state.phase_task:
-        return False, None
-    if (not state.phase_task and pioneer_available_to_buy_voucher(state)
-            and should_upgrade_weapon(state)):
-        from .economy import pick_weapon_voucher_buyer
-        buyer = pick_weapon_voucher_buyer(state, blocked)
-        if buyer is not None and buyer.id == pioneer.id:
-            weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=2)
-            if weapon is not None:
-                name, _ = voucher_for("weapon", weapon.level or 1)
-                if state.team_our.gold_num >= item_cost(name, state) or any(
-                        isinstance(item, str) and "WeaponUpgradeVoucher" in item for item in pioneer.backpack):
-                    trace(state, pioneer.id, "task_yields_to_voucher",
-                          "买券完整代价最低的是开拓者，先去商店，不新接任务")
-                    return False, None
+    ctx = getattr(state, '_pioneer_sched', None)
+    if not isinstance(ctx, dict) or 'candidates' not in ctx:
+        ctx = begin_schedule(state, pioneer, blocked, reserved)
     if state.phase_task:
+        add_branch(state, 'active_phase_task')
         if defense_due(pioneer, state, blocked) and not pioneer_should_hold_task(pioneer, state):
+            add_branch(state, 'active_yield_defense')
+            mark_outcome(state, 'task_yields_to_defense', None, 'yield_active_to_defense')
             trace(state, pioneer.id, 'task_yields_to_defense',
                   '无法在威胁到达前提交，或两门炮守不住当前波次，回炮；题目会话保留')
             return False, None
-        return True, decide_emergency_heal(pioneer, state) or decide_self_heal(pioneer)
+        heal = decide_emergency_heal(pioneer, state) or decide_self_heal(pioneer)
+        mark_outcome(state, 'hold_active_task', heal, 'hold_active_task')
+        bump_streak(state, 'task')
+        return True, heal
+    row = ctx.get('selected')
+    if row:
+        from .pioneer_schedule import save_reservation
+        save_reservation(state, pioneer, row)
     if defense_due(pioneer, state, blocked):
-        trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务')
+        add_branch(state, 'new_task_defense_gate')
+        mark_outcome(state, 'task_yields_to_defense', None, 'defense_blocks_new_task')
+        trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务',
+              schedulerVersion=SCHEDULER_VERSION,
+              defense=ctx.get('defense'))
         return False, None
-    candidates = sorted(
-        (t for t in state.team_our.player_tasks
-         if t.task_type in ("自进化类1", "自进化类2")
-         and t.is_valid and t.cold_down_rounds == 0),
-        key=lambda t: (chebyshev(pioneer.pos, t.task_position), t.task_type),
-    )
-    if not candidates:
+    if not row:
+        add_branch(state, 'no_feasible_task')
+        for candidate in ctx.get('candidates') or []:
+            reason = candidate.get('rejected')
+            if reason == 'defense_time':
+                trace(state, pioneer.id, 'task_not_enough_time',
+                      '预计解题耗时加回防余量不足，不接这单',
+                      task_type=candidate.get('taskType'), needed=candidate.get('needed'),
+                      threat_eta=candidate.get('available'), solve_estimate=candidate.get('solveEstimate'),
+                      solve_source=candidate.get('solveSource'), timeout_rounds=candidate.get('timeoutRounds'))
+            elif reason == 'platform_timeout_too_short':
+                trace(state, pioneer.id, 'task_timeout_too_short',
+                      '平台给出的时限不够完成探查、修复与提交，不接这单',
+                      task_type=candidate.get('taskType'), timeout_rounds=candidate.get('timeoutRounds'))
+            elif reason == 'no_return_from_task':
+                trace(state, pioneer.id, 'task_not_enough_time', '任务点回炮找不到路，不接这单',
+                      task_type=candidate.get('taskType'))
+        mark_outcome(state, 'no_feasible_task', None, 'no_feasible_task')
         return False, None
-    for task in candidates:
-        from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
-        from .tactics import night_wave_cleared, threat_eta_to_base
-        route = adjacent_path(pioneer, task.task_position, blocked | reserved, state)
-        if route is None:
-            continue
-        back = station_return_steps(pioneer, state, blocked, from_pos=task.task_position)
-        if back is None:
-            trace(state, pioneer.id, 'task_not_enough_time', '任务点回炮找不到路，不接这单',
-                  task_type=task.task_type)
-            continue
-        required = len(route) + (task.timeout_rounds or 15) + back + MUSTER_BUFFER
-        arrival = threat_eta_to_base(state)
-        if not night_wave_cleared(state) and (arrival is None or required >= arrival):
-            trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取',
-                  required_rounds=required, threat_eta=arrival)
-            continue
-        if task.timeout_rounds is not None and task.timeout_rounds < MIN_TASK_TIMEOUT_ROUNDS:
-            trace(state, pioneer.id, 'task_timeout_too_short',
-                  '平台给出的时限不够完成探查、修复与提交，不接这单',
-                  task_type=task.task_type, timeout_rounds=task.timeout_rounds)
-            continue
-        if chebyshev(pioneer.pos, task.task_position) <= 1:
-            return True, {"action": "acceptTask"}
-        step = move_towards(pioneer.pos, task.task_position, blocked | reserved,
-                            state.map_info.width, state.map_info.height)
-        if step:
-            reserved.add((step.x, step.y))
-            return True, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}
+    add_branch(state, 'commit_feasible_task')
+    ok, cmd = apply_task_choice(pioneer, state, blocked, reserved, row)
+    if ok:
+        return True, cmd
+    mark_outcome(state, 'task_move_blocked', None, 'task_move_blocked')
     return False, None
 
 
+def _pioneer_shop_action(pioneer, state, blocked, reserved, reason='ordinary_shop'):
+    add_branch(state, reason)
+    stalled, stall_rounds = shop_progress_stalled(pioneer, state)
+    if stalled:
+        trace(state, pioneer.id, 'shop_stall_reassess',
+              '采购连续无位置/库存/阶段变化，重新评估路线和买家',
+              stallRounds=stall_rounds, threshold=SHOP_STALL_ROUNDS, reason='shop_stall')
+        state.worker_item_jobs.pop(pioneer.id, None)
+        reset_shop_progress(state)
+        bump_streak(state, 'task')
+        return None
+    critical, crit_reason = voucher_is_defense_critical(state)
+    reservation = reservation_of(state)
+    allow = (not reservation) or critical
+    cmd = decide_pioneer_voucher(
+        pioneer, state, blocked, reserved,
+        allow_interrupt=allow and bool(reservation),
+        interrupt_reason=None if not reservation else ('defense_critical_voucher:%s' % crit_reason),
+    )
+    if cmd:
+        mark_outcome(state, reason, cmd, 'shop')
+        bump_streak(state, 'shop')
+        return cmd
+    return None
+
+
 def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
-    """先锋紧急自救、回防、买券优先，再执行白天任务与补给。"""
+    """紧急治疗与真实防守优先；无强制防守时先评估自进化任务，再决定普通买券/卖矿。"""
     from .economy import in_pre_night_cashout_window, liquidate, muster_for_night
     from .tactics import tactical_action
+    begin_schedule(state, pioneer, blocked, reserved)
+    add_branch(state, 'emergency_heal')
     heal = decide_emergency_heal(pioneer, state)
     if heal:
+        mark_outcome(state, 'emergency_heal', heal, 'emergency_heal')
         return selected(state, pioneer.id, heal, '低血紧急治疗')
-    if in_pre_night_cashout_window(pioneer, state, blocked, reserved):
-        handled, cmd = liquidate(pioneer, state, blocked, reserved)
-        if cmd:
-            return cmd
-        cmd = decide_pioneer_voucher(pioneer, state, blocked, reserved)
-        if cmd:
-            return cmd
-    handled, cmd = muster_for_night(pioneer, state, blocked, reserved)
-    if handled:
-        return cmd
-    cmd = decide_pioneer_voucher(pioneer, state, blocked, reserved)
-    if cmd:
-        return cmd
-    handled, cmd = liquidate(pioneer, state, blocked, reserved)
-    if handled:
-        return cmd
+    add_branch(state, 'task_before_ordinary_shop')
     handled, command = decide_pioneer_task(pioneer, state, blocked, reserved)
     if handled:
         return command
+    add_branch(state, 'muster_for_night')
+    handled, cmd = muster_for_night(pioneer, state, blocked, reserved)
+    if handled:
+        if reservation_of(state):
+            interrupt_reservation(state, 'defense_due', extra=(getattr(state, '_pioneer_sched', {}) or {}).get('defense'))
+        mark_outcome(state, 'muster_for_night', cmd, 'defense')
+        bump_streak(state, 'defense')
+        return cmd
+    if not reservation_of(state):
+        add_branch(state, 'pre_night_cashout')
+        if in_pre_night_cashout_window(pioneer, state, blocked, reserved):
+            handled, cmd = liquidate(pioneer, state, blocked, reserved)
+            if cmd:
+                mark_outcome(state, 'pre_night_cashout', cmd, 'shop')
+                bump_streak(state, 'shop')
+                return cmd
+            cmd = _pioneer_shop_action(pioneer, state, blocked, reserved, 'pre_night_voucher')
+            if cmd:
+                return cmd
+        cmd = _pioneer_shop_action(pioneer, state, blocked, reserved, 'ordinary_voucher')
+        if cmd:
+            return cmd
+        handled, cmd = liquidate(pioneer, state, blocked, reserved)
+        if handled:
+            if cmd:
+                mark_outcome(state, 'liquidate', cmd, 'shop')
+                bump_streak(state, 'shop')
+            return cmd
+    else:
+        add_branch(state, 'reservation_blocks_ordinary_shop')
+        critical, crit_reason = voucher_is_defense_critical(state)
+        if critical:
+            cmd = _pioneer_shop_action(pioneer, state, blocked, reserved,
+                                       'defense_critical_voucher:%s' % crit_reason)
+            if cmd:
+                return cmd
     cmd = tactical_action(pioneer, state, blocked, reserved)
     if cmd:
+        mark_outcome(state, 'tactical', cmd, 'tactical')
         return cmd
 
     item_job_cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
-    if item_job_cmd:
+    if item_job_cmd and not reservation_of(state):
+        mark_outcome(state, 'item_job', item_job_cmd, 'shop')
+        bump_streak(state, 'shop')
         return item_job_cmd
 
-    maybe_start_shop_item_job(pioneer, state, allow_weapon=False)
-    cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
-    if cmd:
-        return cmd
+    if not reservation_of(state):
+        maybe_start_shop_item_job(pioneer, state, allow_weapon=False)
+        cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+        if cmd:
+            mark_outcome(state, 'structure_shop', cmd, 'shop')
+            bump_streak(state, 'shop')
+            return cmd
     heal = decide_self_heal(pioneer) or decide_buy_medicine(pioneer, state)
     if heal:
+        mark_outcome(state, 'self_heal', heal, 'heal')
         return heal
     from .opening import pioneer_stay_clear
     cmd = pioneer_stay_clear(pioneer, state, blocked, reserved)
     if cmd is None:
+        mark_outcome(state, 'no_pioneer_action', None, 'idle')
         trace(state, pioneer.id, "no_pioneer_action", "当前没有可用任务，也未产生治疗、补给或维修升级动作", available_gold=state.team_our.gold_num)
+    else:
+        mark_outcome(state, 'stay_clear', cmd, 'stay_clear')
     return cmd
 
 
@@ -1019,6 +1090,7 @@ def plan_pioneer_tasks(state, blocked, reserved):
     for role in state.team_our.roles:
         if role.role_type != "pioneer":
             continue
+        begin_schedule(state, role, blocked, reserved)
         handled, command = decide_pioneer_task(role, state, blocked, reserved)
         if handled:
             handled_ids.add(role.id)
@@ -1225,6 +1297,7 @@ class V1Strategy(Strategy):
         }
         kept = [e for e in (state.decision_events or []) if e.get("code") in news_codes]
         state.decision_events = kept
+        ensure_schedule_buckets(state)
         from .tactics import begin_round
         begin_round(state)
         learn_from_last_round(state)
@@ -1249,6 +1322,7 @@ class V1Strategy(Strategy):
         commands = resolve_actor_conflicts(commands, state)
         commands = self._filter_valid(commands, state)
         state.last_sent_command = commands
+        emit_scheduler_log(state, commands)
         return commands
 
     def _filter_valid(self, commands: dict, state: "MatchState") -> dict:

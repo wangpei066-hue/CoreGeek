@@ -26,9 +26,14 @@ def live_pioneer(state):
 
 
 def pioneer_available_to_buy_voucher(state):
-    """进行中的任务不中断；空闲开拓者才去买券。"""
+    """进行中的任务、已预约或正在前往任务点的开拓者不去买普通券。"""
     pioneer = live_pioneer(state)
-    return bool(pioneer and not state.phase_task)
+    if not pioneer or state.phase_task:
+        return False
+    from .pioneer_schedule import has_task_reservation, voucher_is_defense_critical
+    if has_task_reservation(state, pioneer) and not voucher_is_defense_critical(state)[0]:
+        return False
+    return True
 
 
 def next_weapon_voucher_cost(state):
@@ -44,6 +49,12 @@ def backpack_ore_value(role, state):
     ores = sellable_ores(role, state)
     prices = ore_prices(state)
     return sum(prices.get(name, 0) * count for name, count in ores.items())
+
+
+def metal_inventory_value(role, state):
+    """背包铜铁按当前小贩报价计值；无报价计 0，不编造售价。"""
+    prices = ore_prices(state)
+    return sum(prices.get(name, 0) for name in role.backpack if name in ('iron', 'copper'))
 
 
 def worker_should_shop_weapon_voucher(role, state, blocked=None):
@@ -78,7 +89,8 @@ def _upgrade_target_weapon(state):
     if job:
         x, y = job['target']
         weapon = next((r for r in state.team_our.roles
-                       if r.role_type in WEAPON_TYPES and r.pos.x == x and r.pos.y == y), None)
+                       if r.role_type in WEAPON_TYPES and r.health > 0
+                       and r.pos.x == x and r.pos.y == y), None)
         if weapon:
             return weapon
     return _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=2)
@@ -92,6 +104,15 @@ def _voucher_opportunity(role, state, at_shop=False):
         return WORKER_WALL_OPPORTUNITY if critical_wall_missing(state) else 0
     if role.role_type != 'pioneer' or not state.team_our:
         return 0
+    from .grid import build_blocked_set
+    from .opening import movement_avoid
+    from .pioneer_schedule import INTERRUPT_RESERVATION_COST, pioneer_task_commitment
+    blocked = build_blocked_set(state) | movement_avoid(state)
+    commitment = pioneer_task_commitment(role, state, blocked)
+    if commitment.get('inAcceptRange'):
+        return INTERRUPT_RESERVATION_COST * 2
+    if commitment.get('reserved') or commitment.get('feasible'):
+        return INTERRUPT_RESERVATION_COST
     tasks = [t for t in state.team_our.player_tasks
              if t.task_type in ('自进化类1', '自进化类2') and t.is_valid and t.cold_down_rounds == 0]
     if not tasks:
@@ -157,6 +178,27 @@ def _voucher_trip_parts(role, state, blocked, weapon, cost):
     return time_needed, time_needed + _voucher_opportunity(role, state, at_shop=at_shop)
 
 
+def _skip_pioneer_voucher_buyer(role, state, blocked):
+    """进行中任务、领取当轮、普通任务预约不把开拓者派去买券；防守必需购买除外。"""
+    if role is None or role.role_type != 'pioneer':
+        return False
+    if state.phase_task:
+        return True
+    from .pioneer_schedule import (
+        SHOP_PROGRESS_KEY, SHOP_STALL_ROUNDS, pioneer_task_commitment, voucher_is_defense_critical,
+    )
+    stalled = int((state.policy_memory.get(SHOP_PROGRESS_KEY) or {}).get('stallRounds') or 0)
+    if stalled >= SHOP_STALL_ROUNDS:
+        return True
+    critical, _reason = voucher_is_defense_critical(state)
+    if critical:
+        return False
+    commitment = pioneer_task_commitment(role, state, blocked)
+    if commitment.get('inAcceptRange') or commitment.get('reserved') or commitment.get('feasible'):
+        return True
+    return False
+
+
 def pick_weapon_voucher_buyer(state, blocked=None):
     """在能按时完成的人里选综合代价最低的；已持券优先。执行中任务保持稳定，除非阵亡、不可达或赶不上截止。"""
     if not state.team_our or not state.map_info:
@@ -194,7 +236,7 @@ def pick_weapon_voucher_buyer(state, blocked=None):
                       if r.id in state.worker_item_jobs
                       and state.worker_item_jobs[r.id].get('kind') == 'weapon'
                       and r.health > 0), None)
-        if still_ok(owner):
+        if still_ok(owner) and not _skip_pioneer_voucher_buyer(owner, state, blocked):
             return owner
     if not weapon_upgrade_due(state) and not existing:
         return None
@@ -204,7 +246,7 @@ def pick_weapon_voucher_buyer(state, blocked=None):
     for role in state.team_our.roles:
         if role.role_type not in ('worker', 'pioneer') or role.health <= 0:
             continue
-        if role.role_type == 'pioneer' and state.phase_task:
+        if _skip_pioneer_voucher_buyer(role, state, blocked):
             continue
         parts = _voucher_trip_parts(role, state, blocked, weapon, cost)
         if parts is None:
@@ -259,12 +301,16 @@ def task_defense_override(state) -> bool:
 
 
 def solver_can_progress(state) -> bool:
-    session = getattr(state, 'task_session', None) or {}
+    from .pioneer_schedule import scheduler_task_session
+    session = scheduler_task_session(state)
     return bool(state.phase_task) and session.get('stage') != 'exhausted'
 
 
 def solver_ready_to_submit(state) -> bool:
-    session = getattr(state, 'task_session', None) or {}
+    from .pioneer_schedule import scheduler_task_session
+    session = scheduler_task_session(state)
+    if not session:
+        return False
     if session.get('stage') in ('submit', 'wait_submit'):
         return True
     return bool(session.get('answer'))
@@ -575,6 +621,39 @@ def trip_collect_limit(role, state, path_len=0, return_len=0, purpose='income'):
     return max(0, min(cap, slack))
 
 
+def voucher_collect_plan(role, state, blocked, reserved, mine, remaining_value, prices=None, path=None):
+    """按 vendorShopList 报价，估算采这座矿凑够升级券缺口的回合：去程 + 采集 + 去小贩。
+    没有报价或矿不可达时返回 None，不编造价格。"""
+    from .opening import adjacent_path
+    prices = ore_prices(state) if prices is None else prices
+    price = prices.get(mine.neutral_type, 0)
+    if price <= 0 or remaining_value <= 0:
+        return None
+    if path is None:
+        path = adjacent_path(role, mine.pos, blocked | reserved, state)
+    if path is None:
+        return None
+    units = -(-int(remaining_value) // price)
+    slots = max(0, (role.back_pack_capability or 0) - len(role.backpack))
+    vendor_len = vendor_return_steps(mine, state, blocked, reserved)
+    return {
+        'path': path,
+        'units': units,
+        'price': price,
+        'path_len': len(path),
+        'vendor_len': vendor_len,
+        'rounds': len(path) + units + vendor_len,
+        'fits_backpack': units <= slots,
+    }
+
+
+def voucher_ore_remaining_value(role, state):
+    """当前金币加本人背包铜铁后，买一张武器升级券还差多少。"""
+    from .brain import item_cost
+    gold = state.team_our.gold_num if state.team_our else 0
+    return max(0, item_cost('WeaponUpgradeVoucher1', state) - gold - metal_inventory_value(role, state))
+
+
 def vendor_return_steps(mine, state, blocked, reserved):
     """从矿点走到小贩邻格的寻路长度；没有小贩时采石建墙不依赖回程。"""
     from .opening import adjacent_path
@@ -607,22 +686,32 @@ def _mine_at(state, x, y, want_ores):
 
 
 def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
-    """一人一矿：能沿用粘性目标就继续；否则未占用矿优先，按本趟可采数量打分。"""
+    """一人一矿：能沿用粘性目标就继续；筹资买券时按 vendorShopList 选总回合最短的铜铁。"""
     from .opening import adjacent_path
     want = set(want_ores)
     if not want or state.map_info is None:
         return None
     prices = ore_prices(state)
     occupied = claimed_mines(state, exclude_role_id=role.id)
+    remaining_value = voucher_ore_remaining_value(role, state) if purpose == 'voucher' else 0
+    if purpose == 'voucher' and remaining_value <= 0:
+        return None
 
     def score_mine(mine, path):
+        if purpose == 'voucher':
+            plan = voucher_collect_plan(
+                role, state, blocked, reserved, mine, remaining_value, prices=prices, path=path,
+            )
+            if plan is None or not plan['fits_backpack']:
+                return None
+            return -plan['rounds'], plan['units'], plan['path_len'], plan['vendor_len'], plan
         path_len = len(path)
         return_len = vendor_return_steps(mine, state, blocked, reserved) if purpose == 'income' else 0
         batch = trip_collect_limit(role, state, path_len=path_len, return_len=return_len, purpose=purpose)
         if batch <= 0:
             return None
         score = batch * prices.get(mine.neutral_type, 1) / (path_len + batch + return_len + 1)
-        return score, batch, path_len, return_len
+        return score, batch, path_len, return_len, None
 
     sticky = get_mine_target(state, role.id)
     if sticky:
@@ -634,7 +723,7 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
             path = adjacent_path(role, mine.pos, blocked | reserved, state)
             ranked = None if path is None else score_mine(mine, path)
             if ranked is not None:
-                score, batch, path_len, return_len = ranked
+                score, batch, path_len, return_len, _plan = ranked
                 set_mine_target(state, role.id, mine)
                 trace(state, role.id, 'sticky_mine', '沿用尚未采完的矿点', mineral=mine.neutral_type,
                       batch=batch, path_len=path_len, return_len=return_len, score=round(score, 4))
@@ -650,18 +739,29 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
         ranked = score_mine(mine, path)
         if ranked is None:
             continue
-        score, batch, path_len, return_len = ranked
+        score, batch, path_len, return_len, plan = ranked
         claimed = (mine.pos.x, mine.pos.y) in occupied
-        candidates.append((1 if claimed else 0, -score, path_len, mine, path, batch, return_len, score))
+        if purpose == 'voucher':
+            candidates.append((plan['rounds'], 1 if claimed else 0, path_len, mine, path, batch, return_len, score))
+        else:
+            candidates.append((1 if claimed else 0, -score, path_len, mine, path, batch, return_len, score))
     if not candidates:
         trace(state, role.id, 'no_reachable_mine', '当前没有可达矿点')
         return None
-    claimed_flag, _, path_len, mine, path, batch, return_len, score = min(candidates, key=lambda c: c[:3])
+    chosen = min(candidates, key=lambda c: c[:3])
+    primary, secondary, path_len, mine, path, batch, return_len, score = chosen
     set_mine_target(state, role.id, mine)
-    trace(state, role.id, 'income_mine', '按本趟可采数量、报价与寻路成本估算矿点收益',
-          mineral=mine.neutral_type, price=prices.get(mine.neutral_type), batch=batch,
-          path_len=path_len, return_len=return_len, claimed=bool(claimed_flag), score=round(score, 4),
-          estimate_note='未知报价按等权比较；回程是到小贩的寻路长度')
+    price = prices.get(mine.neutral_type)
+    if purpose == 'voucher':
+        trace(state, role.id, 'voucher_mine', '按小贩报价选凑够升级券总回合最短的矿',
+              mineral=mine.neutral_type, price=price, collect_units=batch,
+              path_len=path_len, vendor_len=return_len, rounds=primary, claimed=bool(secondary),
+              remaining_value=remaining_value, vendor_prices=prices)
+    else:
+        trace(state, role.id, 'income_mine', '按本趟可采数量、报价与寻路成本估算矿点收益',
+              mineral=mine.neutral_type, price=price, batch=batch,
+              path_len=path_len, return_len=return_len, claimed=bool(primary), score=round(score, 4),
+              estimate_note='未知报价按等权比较；回程是到小贩的寻路长度')
     return mine, path
 
 
@@ -674,9 +774,14 @@ def go_mine(role, state, blocked, reserved, want_ores, purpose='income',
         return None
     mine, path = picked
     if path:
-        reason = travel_reason or '前往本趟批量收益较高的可达矿点'
+        if travel_reason:
+            reason = travel_reason
+        elif purpose == 'voucher':
+            reason = '按小贩报价前往凑够升级券总回合最短的矿'
+        else:
+            reason = '前往本趟批量收益较高的可达矿点'
         return move_on_path(state, role, path, reserved, reason)
-    reason = collect_reason or '采集矿石，凑够一趟再出售'
+    reason = collect_reason or ('采集铜铁，凑够升级券' if purpose == 'voucher' else '采集矿石，凑够一趟再出售')
     return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, reason)
 
 
