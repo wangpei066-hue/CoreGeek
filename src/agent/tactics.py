@@ -112,12 +112,17 @@ def pressure(state):
 
 
 def _note_respawns(state):
-    """阵亡后次日复活：清掉该角色旧建造目标、商店任务和炮位记忆，避免沿用上一世分配。"""
+    """阵亡/复活都要清掉旧建造目标、商店任务和炮位记忆，避免占着位置不用又没人能顶上。
+
+    阵亡这一侧尤其关键：worker_item_jobs/mine_targets 里死者的条目如果留着，
+    _pending_item_job_targets、claimed_mines 会一直把对应的武器/矿位当成"已经有人在办"，
+    没人会去释放死者自己的任务（因为角色循环只处理存活角色），队友因此永远排不上号。"""
     from .economy import clear_mine_target
     prev = state.policy_memory.get('role_alive') or {}
     alive = {}
     assignment = dict(state.policy_memory.get('weapon_assignment') or {})
     wall_targets = dict(state.policy_memory.get('opening_wall_targets') or {})
+    selling = list(state.policy_memory.get('selling_roles') or [])
     for role in state.team_our.roles:
         if role.role_type not in ('worker', 'pioneer'):
             continue
@@ -130,7 +135,17 @@ def _note_respawns(state):
             wall_targets.pop(key, None)
             clear_mine_target(state, role.id)
             trace(state, role.id, 'role_respawned', '角色复活，清除旧炮位与建造目标后重新分配')
+        elif prev.get(key) is True and role.health <= 0:
+            state.worker_build_targets.pop(role.id, None)
+            state.worker_item_jobs.pop(role.id, None)
+            assignment.pop(key, None)
+            wall_targets.pop(key, None)
+            clear_mine_target(state, role.id)
+            if role.id in selling:
+                selling.remove(role.id)
+            trace(state, role.id, 'role_died', '角色阵亡，释放其道具任务/占矿/炮位，避免卡住队友')
     state.policy_memory['role_alive'] = alive
+    state.policy_memory['selling_roles'] = selling
     state.policy_memory['weapon_assignment'] = assignment
     if wall_targets:
         state.policy_memory['opening_wall_targets'] = wall_targets

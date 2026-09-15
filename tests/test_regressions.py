@@ -177,3 +177,31 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn(1, state.worker_item_jobs)
         self.assertNotIn('1', state.policy_memory.get('weapon_assignment', {}))
         self.assertTrue(any(e['code'] == 'role_respawned' for e in state.decision_events))
+
+    def test_death_releases_stale_role_jobs_for_teammates(self):
+        """回归：工人阵亡时必须当场释放它占着的道具任务/占矿/炮位，
+        不然 _pending_item_job_targets/claimed_mines 会把这些目标当成"已经有人在办"，
+        存活的队友永远排不上号——没人会替死者释放自己都不知道的任务。"""
+        from src.agent.tactics import begin_round
+        from src.agent.economy import claimed_mines, get_mine_target, set_mine_target
+        state = minimal_state()
+        worker = make_role(1, 10, 10, 'worker', health=220)
+        state.team_our.roles.append(worker)
+        state.worker_build_targets[1] = (8, 8, 'wall')
+        state.worker_item_jobs[1] = {'item': 'WeaponUpgradeVoucher1', 'target': (12, 10), 'kind': 'weapon'}
+        state.policy_memory['weapon_assignment'] = {'1': 20}
+        state.policy_memory['opening_wall_targets'] = {'1': [8, 8]}
+        state.policy_memory['selling_roles'] = [1]
+        set_mine_target(state, 1, Zone(Pos(6, 9), 'copper'))
+        state.policy_memory['role_alive'] = {'1': True}
+        begin_round(state)  # 存活快照
+        worker.health = 0
+        begin_round(state)  # 阵亡这一回合
+        self.assertNotIn(1, state.worker_build_targets)
+        self.assertNotIn(1, state.worker_item_jobs)
+        self.assertNotIn('1', state.policy_memory.get('weapon_assignment', {}))
+        self.assertNotIn('1', state.policy_memory.get('opening_wall_targets', {}))
+        self.assertNotIn(1, state.policy_memory.get('selling_roles', []))
+        self.assertIsNone(get_mine_target(state, 1))
+        self.assertEqual(claimed_mines(state), set())
+        self.assertTrue(any(e['code'] == 'role_died' for e in state.decision_events))
