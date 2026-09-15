@@ -8,7 +8,7 @@ from src.agent.opening_schedule import (
     current_opening_stage,
 )
 from src.agent.grid import build_blocked_set
-from src.agent.protocol import Pos, Zone, ShopItem
+from src.agent.protocol import Pos, Zone, ShopItem, PlayerTask
 from test_opening import opening_state
 from test_shop_items import make_role
 
@@ -349,6 +349,27 @@ class OpeningFsmTrailTests(unittest.TestCase):
                   if e.get('code') == 'muster_cashout_before_night' and e.get('role_id') == worker.id]
         self.assertTrue(events)
         self.assertEqual(commands.get(worker.id, {}).get('action'), 'move')
+
+    def test_voucher_buyer_skips_pioneer_busy_with_task(self):
+        """回归：_voucher_buyer_id 选中正在做自进化任务的开拓者时，那名开拓者会被主循环
+        直接 continue 跳过、永远不会真的去买——必须把它排除在候选人之外，让工人来买，
+        否则金币够了也会一直卡着，既不买券也不修墙（当时观测到的现象）。"""
+        state = opening_state()
+        state.team_our.gold_num = 200
+        _rockets(state)
+        state.map_info.zones = [
+            Zone(Pos(1, 9), 'weaponShop'), Zone(Pos(6, 9), 'stone'), Zone(Pos(1, 11), 'vendor'),
+        ]
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 5), ShopItem('stone', 1)]
+        state.weapon_shop_list = [ShopItem('WeaponUpgradeVoucher1', 100)]
+        pioneer = next(r for r in state.team_our.roles if r.id == 3)
+        pioneer.pos = Pos(2, 9)  # 离商店比两名工人都近，是 _voucher_buyer_id 天然会选中的对象
+        state.phase_task = '部署修复任务：工作区为 /srv/app/'
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(2, 9), 0, 10, 10, True)]
+
+        trail = run_opening(state, 15)  # trail 只记录工人(1,2)，天然排除开拓者
+        bought_by_worker = any(row['action'] == 'buy' for row in trail)
+        self.assertTrue(bought_by_worker, format_trail(trail))
 
     def test_no_second_upgrade_on_day1(self):
         state = opening_state()

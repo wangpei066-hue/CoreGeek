@@ -494,10 +494,11 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     return _tick(state, role, STAGE_WALL, 'wall', 'yard', None, 0, 'hold', 'wait_in_yard', None)
 
 
-def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments):
+def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments,
+                      excluded_buyer_ids=()):
     if 'WeaponUpgradeVoucher1' in (role.backpack or []):
         return opening_apply_voucher(role, state, blocked, reserved, STAGE_FUND)
-    buyer = _voucher_buyer_id(state, gold, cost)
+    buyer = _voucher_buyer_id(state, gold, cost, excluded_ids=excluded_buyer_ids)
     goal = _goal(state, role.id)
     if (goal and goal.get('kind') == 'vendor' and goal.get('stage') == STAGE_FUND
             and _metal_count(role) and gold < cost):
@@ -543,23 +544,27 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
     return None
 
 
-def _voucher_buyer_id(state, gold, cost):
+def _voucher_buyer_id(state, gold, cost, excluded_ids=()):
+    """excluded_ids：本回合被开拓者自进化任务接管、根本不会被 dispatch 的角色。
+    选中它们当买家等于没人买——它们在主循环里直接 continue，永远不会执行到这笔购买。"""
     if gold < cost:
         return None
-    holders = [r for r in state.team_our.roles
-               if r.role_type in ('worker', 'pioneer') and r.health > 0
-               and 'WeaponUpgradeVoucher1' in (r.backpack or [])]
+    candidates = [r for r in state.team_our.roles
+                  if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id not in excluded_ids]
+    if not candidates:
+        return None
+    holders = [r for r in candidates if 'WeaponUpgradeVoucher1' in (r.backpack or [])]
     if holders:
         return holders[0].id
     from .brain import find_zone
     shop = find_zone(state, 'weaponShop')
-    actors = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0]
-    if shop is None or not actors:
-        return actors[0].id if actors else None
-    return min(actors, key=lambda r: (chebyshev(r.pos, shop.pos), r.id)).id
+    if shop is None:
+        return candidates[0].id
+    return min(candidates, key=lambda r: (chebyshev(r.pos, shop.pos), r.id)).id
 
 
-def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls):
+def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls,
+                          excluded_buyer_ids=()):
     from .tactics import imminent_contact
     if imminent_contact(state) and stage != STAGE_BUILD_WEAPONS:
         cmd = opening_muster(role, state, blocked, reserved, assignments, STAGE_MUSTER)
@@ -577,14 +582,15 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
         if role.role_type == 'pioneer':
             if 'WeaponUpgradeVoucher1' in (role.backpack or []):
                 return opening_apply_voucher(role, state, blocked, reserved, STAGE_FUND)
-            if gold >= cost and role.id == _voucher_buyer_id(state, gold, cost):
+            if gold >= cost and role.id == _voucher_buyer_id(state, gold, cost, excluded_ids=excluded_buyer_ids):
                 trace(state, role.id, 'voucher_buyer_pick', '开拓者被选为第一张升级券买家')
                 return opening_shop_voucher(role, state, blocked, reserved, STAGE_FUND, 'gold_ready')
             if gold < cost:
                 trace(state, role.id, 'pioneer_voucher_wait_gold', '金币不足，开拓者不空等买券')
             from .opening import pioneer_stay_clear
             return pioneer_stay_clear(role, state, blocked, reserved, assignments)
-        return opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments)
+        return opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments,
+                                 excluded_buyer_ids=excluded_buyer_ids)
     if stage == STAGE_APPLY:
         if 'WeaponUpgradeVoucher1' in (role.backpack or []):
             return opening_apply_voucher(role, state, blocked, reserved, STAGE_APPLY)
@@ -709,7 +715,8 @@ def plan_opening_fsm(state):
                 commands[role.id] = cmd
                 continue
         cmd = dispatch_opening_role(
-            role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls)
+            role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls,
+            excluded_buyer_ids=task_pioneers)
         if cmd:
             if cmd.get('action') == 'buy':
                 gold -= item_cost(cmd.get('name') or 'WeaponUpgradeVoucher1', state)
