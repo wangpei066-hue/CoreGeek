@@ -247,6 +247,21 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertFalse(budget['allow_income_mine'])
         self.assertTrue(budget['allow_stone_mine'])
 
+    def test_weapons_finished_after_cutoff_does_not_stick_in_build_weapons(self):
+        """回归：三炮在筹资截止点之后才建完时，阶段必须能从 BUILD_WEAPONS 直接跳到
+        BUILD_SURVIVAL_WALL，不能因为 LEGAL_TRANSITIONS 缺一条边而卡死在原地空转。"""
+        state = opening_state()
+        state.round_no = FIRST_UPGRADE_CUTOFF - 2
+        state.team_our.gold_num = 75
+        _map(state, quotes=False)
+        trail = run_opening(state, 40)
+        stages = [row['stage'] for row in trail if row['worker_id'] == 1]
+        self.assertIn(STAGE_WALL, stages)
+        self.assertNotIn('BUILD_WEAPONS', stages[stages.index(STAGE_WALL):])
+        no_command = [e for e in state.decision_events
+                      if e.get('code') == 'worker_no_command' and e.get('worker_state') == 'BUILD_WEAPONS']
+        self.assertEqual(no_command, [])
+
     def test_no_second_upgrade_on_day1(self):
         state = opening_state()
         state.round_no = 20
