@@ -141,7 +141,7 @@ class OpeningTests(unittest.TestCase):
     def test_day1_mines_metal_before_stone_until_weapon_upgraded(self):
         from src.agent.protocol import ShopItem
         state = opening_state()
-        state.round_no = 20
+        state.round_no = 8
         state.team_our.gold_num = 0
         self._rockets(state)
         state.map_info.zones = [
