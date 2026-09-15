@@ -132,6 +132,7 @@ def illegal_switches(trail):
         'backpack_full', 'gold_ready', 'have_voucher', 'muster', 'survival_wall',
         'build_weapons', 'wait_in_yard', 'blocked_by_nonstone_inventory', 'at_post',
         'stage_change', 'batch_not_ready', 'batch_ready', 'mine_exhausted',
+        'wall_stage_metal_unused', 'muster_cashout_before_night',
     }
     return [row for row in trail if row.get('switch_reason') not in allowed]
 
@@ -310,6 +311,44 @@ class OpeningFsmTrailTests(unittest.TestCase):
         tick2 = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
         self.assertEqual(tick2.get('goal_type'), 'wall')
         self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
+
+    def test_wall_stage_sells_metal_even_when_backpack_not_full(self):
+        """回归：修墙阶段背包没满也不能一直攥着铜铁不出手，浪费到入夜。"""
+        from src.agent.opening_schedule import opening_wall_work
+        from src.agent.opening import movement_avoid
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'), Zone(Pos(1, 11), 'vendor'),
+        ]
+        state.vendor_shop_list = [ShopItem('iron', 3)]
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.backpack = ['iron'] * 10  # 远没塞满 100 容量的背包
+        blocked = build_blocked_set(state) | movement_avoid(state)
+        state.decision_events = []
+        opening_wall_work(worker, state, blocked, set(), set(), {})
+        tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(tick.get('goal_type'), 'vendor')
+        self.assertEqual(tick.get('switch_reason'), 'wall_stage_metal_unused')
+
+    def test_role_sells_metal_before_early_muster_when_time_allows(self):
+        """回归：到个人回防点时背包还有铜铁、且时间够，要先绕去卖掉再回炮，不能直接空转带进夜里。"""
+        state = opening_state()
+        state.round_no = 60
+        state.team_our.gold_num = 0
+        _rockets(state)
+        state.map_info.zones = [Zone(Pos(1, 11), 'vendor')]
+        state.vendor_shop_list = [ShopItem('iron', 3)]
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.backpack = ['iron'] * 10
+        state.policy_memory['opening_stage'] = STAGE_WALL
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        events = [e for e in state.decision_events
+                  if e.get('code') == 'muster_cashout_before_night' and e.get('role_id') == worker.id]
+        self.assertTrue(events)
+        self.assertEqual(commands.get(worker.id, {}).get('action'), 'move')
 
     def test_no_second_upgrade_on_day1(self):
         state = opening_state()

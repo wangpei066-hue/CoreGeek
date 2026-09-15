@@ -464,15 +464,17 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
             switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
             return _tick(state, role, STAGE_WALL, 'wall', 'wall', target, 0 if cmd.get('action') == 'build' else 1,
                          cmd.get('action'), switch, cmd)
-    if _metal_count(role) and (_backpack_full(role) or stones == 0 and _backpack_full(role)):
-        cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_WALL, 'blocked_by_nonstone_inventory')
+    if _metal_count(role):
+        # 修墙阶段用不上铜铁了（第一天不做第二门升级），背包里有多少都该卖掉换金币，
+        # 不能等到背包塞满才想起来卖，不然会一直闲置到入夜白白浪费。
+        cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_WALL, 'wall_stage_metal_unused')
         if cmd:
             return cmd
         for name in ('copper', 'iron'):
             if name in (role.backpack or []):
                 cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '丢弃铜铁以便采石')
                 return _tick(state, role, STAGE_WALL, 'wall', 'drop', None, 0, 'drop',
-                             'blocked_by_nonstone_inventory', cmd)
+                             'wall_stage_metal_unused', cmd)
     if missing and not pack_full and (not batch_ready or stones == 0):
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
         if mine is not None:
@@ -682,6 +684,23 @@ def plan_opening_fsm(state):
         role_deadline = remaining if own_travel is None else own_travel + MUSTER_BUFFER
         role_due = stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER) and (
             imminent_contact(state) or remaining <= role_deadline)
+        # 还没到硬截止点，但背包有铜铁、马上要进最后回防窗口了：这是最后能安全绕一趟小贩的时机，
+        # 现在不卖，等 role_due 触发就只能直接回炮，铜铁只能烂在背包里过夜。
+        if (not role_due and stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER)
+                and not imminent_contact(state) and _metal_count(role)):
+            zone, vendor_path = _nearest_zone(role, state, blocked, reserved, 'vendor')
+            if zone is not None:
+                detour = 2 * len(vendor_path) + 1
+                if remaining <= role_deadline + detour:
+                    cmd = opening_sell_metal(role, state, blocked, reserved, stage,
+                                             'muster_cashout_before_night')
+                    if cmd:
+                        trace(state, role.id, 'muster_cashout_before_night',
+                              '快到个人回防截止点，最后一次绕去卖掉背包里的铜铁',
+                              own_travel=own_travel, remaining=remaining, role_deadline=role_deadline,
+                              detour=detour)
+                        commands[role.id] = cmd
+                        continue
         if role_due:
             cmd = opening_muster(role, state, blocked, reserved, assignments, STAGE_MUSTER)
             if cmd:
