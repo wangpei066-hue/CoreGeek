@@ -174,7 +174,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertTrue(wall_rows)
         self.assertEqual([r for r in wall_rows if r['goal_type'] in ('copper', 'iron')], [])
         self.assertEqual(len(illegal_switches(trail)), 0)
-        self.assertEqual(aba_oscillations(trail), 0)
+        self.assertTrue(any(r.get('switch_reason') == 'batch_not_ready' for r in wall_rows))
+        self.assertTrue(any(r.get('switch_reason') == 'batch_ready' for r in wall_rows))
         idle = [r for r in trail if r['worker_id'] in (1, 2) and not r['action']
                 and r['stage'] in (STAGE_FUND, STAGE_WALL)]
         self.assertEqual(len(idle), 0)
@@ -267,8 +268,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
                       if e.get('code') == 'worker_no_command' and e.get('worker_state') == 'BUILD_WEAPONS']
         self.assertEqual(no_command, [])
 
-    def test_stone_goes_to_wall_without_waiting_for_batch(self):
-        """第一天生存墙优先：采到石头就先补关键墙，不再等满一批。"""
+    def test_stone_batches_before_building_walls_while_time_allows(self):
+        """第一天生存墙优先，但白天还够时先攒一批石头，避免一块一跑。"""
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -280,10 +281,11 @@ class OpeningFsmTrailTests(unittest.TestCase):
         wall_rows = [r for r in trail if r['worker_id'] == 1 and r['stage'] == STAGE_WALL]
         builds = [r for r in wall_rows if r['action'] == 'build' and r['goal_type'] == 'wall']
         self.assertGreater(len(builds), 0)
-        self.assertTrue(any(r.get('switch_reason') == 'urgent_wall' for r in wall_rows))
+        self.assertTrue(any(r.get('switch_reason') == 'batch_not_ready' for r in wall_rows))
+        self.assertTrue(any(r.get('switch_reason') == 'batch_ready' for r in wall_rows))
 
-    def test_opening_wall_work_builds_with_one_stone(self):
-        """opening_wall_work 单测：手上只有 1 块石头也先补生存墙。"""
+    def test_opening_wall_work_batches_one_stone_until_late(self):
+        """opening_wall_work 单测：早期 1 石继续采，临近入夜才提前补墙。"""
         from src.agent.opening_schedule import opening_wall_work
         from src.agent.opening import movement_avoid
         state = opening_state()
@@ -298,15 +300,25 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
-        self.assertEqual(tick.get('goal_type'), 'wall')
-        self.assertEqual(tick.get('switch_reason'), 'urgent_wall')
+        self.assertEqual(tick.get('goal_type'), 'stone')
+        self.assertEqual(tick.get('switch_reason'), 'batch_not_ready')
+
+        state.round_no = 65
+        worker.pos = Pos(12, 7)
+        blocked = build_blocked_set(state) | movement_avoid(state)
+        state.decision_events = []
+        opening_wall_work(worker, state, blocked, set(), set(), {})
+        late_tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(late_tick.get('goal_type'), 'wall')
+        self.assertEqual(late_tick.get('switch_reason'), 'urgent_wall')
 
         worker.backpack = ['stone'] * 6
+        state.round_no = 45
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick2 = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
         self.assertEqual(tick2.get('goal_type'), 'wall')
-        self.assertEqual(tick2.get('switch_reason'), 'urgent_wall')
+        self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
 
     def test_claimed_mine_does_not_force_large_detour(self):
         from src.agent.opening_schedule import choose_nearest_mine

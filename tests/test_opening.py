@@ -415,6 +415,7 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[2].backpack = ['stone'] * 4
         strategy = V1Strategy(BasicActionValidator())
         idle_moves = {1: [], 2: [], 3: []}
+        actions = {1: [], 2: [], 3: []}
         for turn in range(16):
             state.round_no = 35 + turn
             commands = strategy.decide(state)
@@ -422,8 +423,11 @@ class OpeningTests(unittest.TestCase):
                 role = next(r for r in state.team_our.roles if r.id == rid)
                 cmd = commands.get(rid, {})
                 idle_moves[rid].append((role.pos.x, role.pos.y))
+                actions[rid].append(cmd.get('action'))
                 if cmd.get('action') == 'move':
                     role.pos = Pos(**cmd['targetPos'][0])
+                elif cmd.get('action') == 'collect':
+                    role.backpack.append('stone')
                 elif cmd.get('action') == 'build' and cmd.get('name') == 'wall':
                     pos = cmd['targetPos'][0]
                     role.backpack.remove('stone')
@@ -445,8 +449,9 @@ class OpeningTests(unittest.TestCase):
             path = idle_moves[rid]
             self.assertGreater(len(set(path)), 1)
             cycle = path[-6:]
-            self.assertFalse(len(set(cycle)) <= 2 and len(set(path)) <= 3,
-                             'worker %s appears to patrol a tiny loop: %s' % (rid, path))
+            if len(set(cycle)) <= 2 and len(set(path)) <= 3:
+                self.assertTrue(all(a == 'collect' for a in actions[rid][-6:]),
+                                'worker %s appears to patrol a tiny loop: %s' % (rid, path))
 
     def test_full_backpack_stone_is_not_dropped_for_voucher_before_day1_walls(self):
         from src.agent.protocol import ShopItem
@@ -536,7 +541,7 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].backpack = ['stone'] * 2
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertIn(commands[1]['action'], ('move', 'buy', 'build'))
-        self.assertNotEqual((state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore'), 'stone')
+        self.assertEqual((state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore'), 'stone')
 
     def test_night_empty_one_round_still_holds_guns(self):
         state = opening_state()

@@ -474,24 +474,30 @@ def opening_muster(role, state, blocked, reserved, assignments, stage):
 
 
 def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
-    """首日生存墙优先：少量石头也先补关键缺口，避免囤石拖过入夜。"""
-    from .opening import STONE_BATCH, claim_opening_wall, survival_wall_missing
+    """首日生存墙优先：先攒够一趟墙材再集中施工，临近入夜才提前补缺口。"""
+    from .opening import (
+        MUSTER_BUFFER, STONE_BATCH, assign_weapons, claim_opening_wall, day_rounds_remaining,
+        survival_wall_missing,
+    )
     missing = survival_wall_missing(state)
     stones = (role.backpack or []).count('stone')
     cap = role.back_pack_capability or 0
     pack_full = bool(cap and len(role.backpack or []) >= cap)
-    # 只备够这名工人这趟真正用得上的量：不超过 STONE_BATCH，也不超过缺口数。
-    batch_target = min(STONE_BATCH, len(missing)) if missing else 0
-    urgent_ready = stones > 0
-    batch_ready = (stones >= batch_target if batch_target else stones > 0) or urgent_ready
+    # 只备够这名工人这趟真正用得上的量：不超过 STONE_BATCH/背包容量/剩余缺口。
+    batch_cap = cap or STONE_BATCH
+    batch_target = min(STONE_BATCH, batch_cap, len(missing)) if missing else 0
+    remaining = day_rounds_remaining(state.round_no)
+    urgent_ready = stones > 0 and remaining <= MUSTER_BUFFER + 6
+    batch_ready = stones >= batch_target if batch_target else stones > 0
+    wall_assignments = assignments or assign_weapons(state)
     mine_exhausted = False
-    if missing and stones > 0 and not pack_full and not batch_ready:
+    if missing and stones > 0 and not pack_full and not batch_ready and not urgent_ready:
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
         if mine is not None:
             target = (mine.pos.x, mine.pos.y)
             if path:
                 return opening_move(state, role, path, reserved, target, '前往最近可达石矿继续囤石',
-                                    'mine', 'stone', reason, STAGE_WALL)
+                                    'mine', 'stone', 'batch_not_ready', STAGE_WALL)
             cmd = selected(state, role.id, {
                 'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
             }, '继续采集石头，攒够一批再建墙')
@@ -499,14 +505,14 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                          'batch_not_ready', cmd)
         mine_exhausted = True
         trace(state, role.id, 'stone_mine_unreachable', '石矿不可达，带着手上的石头去建墙')
-    if stones > 0 and missing and (pack_full or batch_ready or mine_exhausted):
-        cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, assignments)
+    if stones > 0 and missing and (pack_full or batch_ready or urgent_ready or mine_exhausted):
+        cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, wall_assignments)
         if cmd:
             target = None
             if cmd.get('action') in ('build', 'move'):
                 tp = cmd.get('targetPos') or [{}]
                 target = (tp[0].get('x'), tp[0].get('y'))
-            if urgent_ready:
+            if urgent_ready and not (pack_full or batch_ready):
                 switch = 'urgent_wall'
             else:
                 switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
