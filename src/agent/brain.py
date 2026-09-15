@@ -22,10 +22,9 @@ DAY_ROUNDS = 70
 NIGHT_ROUNDS = 60
 DAY_NIGHT_CYCLE = DAY_ROUNDS + NIGHT_ROUNDS
 WEAPON_TYPES = ("gatling", "railgun", "rocket")
-# 用户确认编制：两门火箭炮 + 一门电磁炮。火箭炮有冷却、攻击频率低，
-# 升级优先给电磁炮（打得更频繁，升级收益更快兑现），同级/同位置时才轮到火箭炮。
+# 用户确认编制：两门火箭炮 + 一门电磁炮；升级优先给火箭炮。
 WANTED_WEAPONS = ("rocket", "rocket", "railgun")
-_WEAPON_UPGRADE_ORDER = {"railgun": 0, "rocket": 1, "gatling": 2}
+_WEAPON_UPGRADE_ORDER = {"rocket": 0, "railgun": 1, "gatling": 2}
 MAX_WEAPONS = 3
 WEAPON_GOLD_COST = 25
 ORE_TYPES = ("stone", "iron", "copper")
@@ -327,8 +326,8 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
     return min(candidates, key=lambda r: (
         r.level or 1,
         _weapon_front_key(state, r),
-        r.health,
         _WEAPON_UPGRADE_ORDER.get(r.role_type, 99),
+        r.health,
         r.id,
     ))
 

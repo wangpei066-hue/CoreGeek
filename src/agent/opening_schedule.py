@@ -16,8 +16,8 @@ LEGAL_TRANSITIONS = {
     STAGE_WALL: {STAGE_MUSTER},
     STAGE_MUSTER: set(),
 }
-# 实测墙工时约 16 回合 + 回炮缓冲 3，cycle 40 后仍剩约 30 回合修最低墙。
-FIRST_UPGRADE_CUTOFF = 40
+# 第一晚之前墙比首升炮更关键；三炮齐后直接修最低生存墙。
+FIRST_UPGRADE_CUTOFF = 0
 GOAL_SWITCH_PENALTY = 4
 GOAL_STALL_ROUNDS = 3
 MINE_CLEARLY_CLOSER_STEPS = 2
@@ -90,11 +90,14 @@ def resolve_opening_stage(state, remaining=None, muster_need=3, gold=None):
         if l2 >= 1:
             return _set_opening_stage(state, STAGE_WALL, 'first_upgrade_confirmed')
         return STAGE_APPLY
+    day1 = (state.round_no or 0) < 70
     if len(weapons) < 3:
         return _set_opening_stage(state, STAGE_BUILD_WEAPONS, 'need_three_weapons')
     if l2 >= 1:
         return _set_opening_stage(state, STAGE_WALL, 'first_upgrade_confirmed')
     if stage in (None, STAGE_BUILD_WEAPONS):
+        if day1:
+            return _set_opening_stage(state, STAGE_WALL, 'day1_walls_before_upgrade')
         if cutoff and gold < cost and not has_voucher:
             return _set_opening_stage(state, STAGE_WALL, 'upgrade_cutoff_unfunded')
         return _set_opening_stage(state, STAGE_FUND, 'three_weapons_ready')
@@ -397,10 +400,10 @@ def opening_shop_voucher(role, state, blocked, reserved, stage, switch_reason='g
 def opening_apply_voucher(role, state, blocked, reserved, stage):
     from .brain import WEAPON_TYPES
     from .opening import adjacent_path
-    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0 and (r.level or 1) < 2]
-    if not weapons:
+    from .brain import _pending_item_job_targets, _pick_upgradeable
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=1)
+    if weapon is None:
         return None
-    weapon = min(weapons, key=lambda w: (chebyshev(role.pos, w.pos), w.id))
     path = adjacent_path(role, weapon.pos, blocked | reserved, state)
     if path is None and chebyshev(role.pos, weapon.pos) > 1:
         return None
@@ -415,6 +418,14 @@ def opening_apply_voucher(role, state, blocked, reserved, stage):
         return opening_move(state, role, path, reserved, target, '前往武器使用升级券',
                             'weapon', 'rocket', 'have_voucher', stage)
     return None
+
+
+def day1_wall_floor_met(state, floor=7):
+    if (state.round_no or 0) >= 70:
+        return True
+    alive = sum(1 for r in (state.team_our.roles if state.team_our else [])
+                if r.role_type == 'wall' and r.health > 0)
+    return alive >= floor
 
 
 def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
@@ -640,7 +651,21 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
         if 'WeaponUpgradeVoucher1' in (role.backpack or []):
             return opening_apply_voucher(role, state, blocked, reserved, STAGE_WALL)
         if role.role_type != 'worker':
+            if gold >= cost and 'stone' not in (role.backpack or []):
+                trace(state, role.id, 'voucher_buyer_pick', '生存墙阶段开拓者空档并行购买火箭升级券',
+                      available_gold=gold, required_gold=cost)
+                cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'pioneer_parallel_voucher')
+                if cmd:
+                    return cmd
+            elif gold < cost:
+                trace(state, role.id, 'pioneer_voucher_wait_gold',
+                      '生存墙阶段金币不足，开拓者不抢工人采矿，只等待任务金币或墙后备用',
+                      available_gold=gold, required_gold=cost)
             return opening_muster(role, state, blocked, reserved, assignments, STAGE_WALL)
+        if day1_wall_floor_met(state) and gold >= cost:
+            cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'wall_floor_met_backup_voucher')
+            if cmd:
+                return cmd
         return opening_wall_work(role, state, blocked, reserved, claimed, assignments)
     return None
 

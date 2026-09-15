@@ -34,6 +34,14 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles.append(make_role(22, 13, 10, 'railgun', level=1))
         self.assertEqual(pick_weapon_name(state), 'rocket')
 
+    def test_upgrade_prefers_rocket_over_railgun(self):
+        from src.agent.brain import _pick_upgradeable, WEAPON_TYPES
+        state = opening_state()
+        rocket = make_role(20, 12, 10, 'rocket', level=1, health=1000)
+        railgun = make_role(21, 12, 8, 'railgun', level=1, health=100)
+        state.team_our.roles += [rocket, railgun]
+        self.assertEqual(_pick_upgradeable(state, WEAPON_TYPES, set()).role_type, 'rocket')
+
     def test_initial_workers_build_rockets_before_walls(self):
         state = opening_state()
         commands = V1Strategy(BasicActionValidator()).decide(state)
@@ -103,7 +111,7 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] in ('围墙', 'SURVIVAL_WALL')
                             for e in state.decision_events))
 
-    def test_enough_gold_buys_voucher_before_walls(self):
+    def test_enough_gold_pioneer_buys_voucher_while_workers_build_walls(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 130
@@ -118,10 +126,12 @@ class OpeningTests(unittest.TestCase):
         commands = V1Strategy(BasicActionValidator()).decide(state)
         buys = [c for c in commands.values() if c['action'] == 'buy']
         self.assertEqual(len(buys), 1)
-        self.assertEqual(buys[0]['name'], 'WeaponUpgradeVoucher1')
-        self.assertEqual(commands[pioneer.id]['action'], 'buy')
+        self.assertEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
+        self.assertEqual(commands.get(pioneer.id, {}).get('name'), 'WeaponUpgradeVoucher1')
         self.assertNotIn(1, state.worker_item_jobs)
-        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_upgrade'] for e in state.decision_events))
+        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_walls'] for e in state.decision_events))
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == 'SURVIVAL_WALL'
+                            for e in state.decision_events))
 
     def test_two_weapons_on_rear_rank_one_cell_forward(self):
         from src.agent.opening import weapon_slots
@@ -143,7 +153,7 @@ class OpeningTests(unittest.TestCase):
         self.assertFalse(budget['allow_sell'])
         self.assertFalse(budget['allow_upgrade'])
 
-    def test_day1_mines_nearest_metal_before_cutoff(self):
+    def test_day1_mines_stone_before_upgrade(self):
         from src.agent.protocol import ShopItem
         state = opening_state()
         state.round_no = 8
@@ -164,9 +174,8 @@ class OpeningTests(unittest.TestCase):
         }
         ores.discard(None)
         self.assertTrue(ores)
-        self.assertTrue(ores <= {'copper', 'iron'})
-        self.assertNotIn('stone', ores)
-        self.assertEqual(state.policy_memory.get('opening_stage'), 'FUND_FIRST_UPGRADE')
+        self.assertEqual(ores, {'stone'})
+        self.assertEqual(state.policy_memory.get('opening_stage'), 'BUILD_SURVIVAL_WALL')
         for rid in (1, 2):
             cmd = commands.get(rid) or {}
             self.assertIn(cmd.get('action'), ('move', 'collect'))
@@ -201,7 +210,7 @@ class OpeningTests(unittest.TestCase):
         self.assertNotIn('copper', ores)
         self.assertNotIn('iron', ores)
 
-    def test_day1_second_upgrade_when_gold_and_time_allow(self):
+    def test_day1_pioneer_can_buy_upgrade_while_workers_keep_walling(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 250
@@ -215,6 +224,7 @@ class OpeningTests(unittest.TestCase):
         buys = [c for c in commands.values() if c.get('action') == 'buy'
                 and c.get('name') == 'WeaponUpgradeVoucher1']
         self.assertEqual(len(buys), 1)
+        self.assertEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
         self.assertFalse(any(j.get('kind') == 'weapon' for j in state.worker_item_jobs.values()))
 
     def test_day1_second_upgrade_runs_in_parallel_after_first_l2(self):
@@ -242,21 +252,21 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(any(c.get('action') in ('move', 'build', 'collect') for rid, c in commands.items()
                             if rid == other.id))
 
-    def test_gold_in_hand_still_buys_voucher_when_wall_time_is_tight(self):
+    def test_gold_in_hand_still_prioritizes_walls_when_wall_time_is_tight(self):
         state = opening_state()
         state.round_no = 55
         state.team_our.gold_num = 130
         self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
-        self.assertTrue(budget['allow_upgrade'])
+        self.assertFalse(budget['allow_upgrade'])
         self.assertFalse(budget['allow_sell'])
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(8, 9)
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertEqual(commands[pioneer.id]['action'], 'buy')
-        self.assertEqual(commands[pioneer.id]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
+        self.assertEqual(commands.get(pioneer.id, {}).get('name'), 'WeaponUpgradeVoucher1')
 
     def test_right_base_faces_left_after_switching_sides(self):
         state = opening_state()
@@ -342,8 +352,7 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(walls <= primary)
         # 攒够 STONE_BATCH(6) 再成片建墙后，同样的 70 回合窗口里完工数会比"采一块建一道"更少，
         # 这是批量搬运减少往返的预期代价，不是回归；只要求确实有墙建成。
-        self.assertGreaterEqual(len(walls), 2)
-        self.assertLessEqual(len(walls), 8)
+        self.assertGreaterEqual(len(walls), 8)
 
 
     def _rockets(self, state):
@@ -353,7 +362,7 @@ class OpeningTests(unittest.TestCase):
             make_role(22, 12, 12, 'rocket', level=1),
         ]
 
-    def test_worker_near_shop_buys_voucher_when_cheaper_than_pioneer(self):
+    def test_worker_near_shop_does_not_buy_voucher_before_day1_walls(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 130
@@ -364,8 +373,8 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].pos = Pos(8, 9)
         state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertTrue(any(c.get('action') == 'buy' for c in commands.values()))
-        self.assertIn(commands[1]['action'], ('move', 'buy'))
+        self.assertFalse(any(c.get('action') == 'buy' for c in commands.values()))
+        self.assertIn(commands[1]['action'], ('move', 'collect', 'build'))
         self.assertNotEqual(commands.get(3, {}).get('name'), 'WeaponUpgradeVoucher1')
 
     def test_outside_worker_enters_courtyard_instead_of_patrolling(self):
@@ -439,7 +448,7 @@ class OpeningTests(unittest.TestCase):
             self.assertFalse(len(set(cycle)) <= 2 and len(set(path)) <= 3,
                              'worker %s appears to patrol a tiny loop: %s' % (rid, path))
 
-    def test_full_backpack_drops_ore_then_buys_voucher(self):
+    def test_full_backpack_stone_is_not_dropped_for_voucher_before_day1_walls(self):
         from src.agent.protocol import ShopItem
         state = opening_state()
         state.round_no = 30
@@ -454,8 +463,8 @@ class OpeningTests(unittest.TestCase):
         pioneer.back_pack_capability = 4
         pioneer.backpack = ['stone'] * 4
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertEqual(commands[pioneer.id]['action'], 'drop')
-        self.assertEqual(commands[pioneer.id]['name'], 'stone')
+        self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'drop')
+        self.assertFalse(any(c.get('name') == 'WeaponUpgradeVoucher1' for c in commands.values()))
 
     def test_inner_fighters_take_inner_guns_outer_takes_flank(self):
         state = opening_state()
@@ -719,7 +728,7 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
         self.assertFalse(budget['upgraded'])
         self.assertFalse(budget.get('upgrade_funded'))
-        self.assertEqual(budget.get('opening_stage'), 'FUND_FIRST_UPGRADE')
+        self.assertEqual(budget.get('opening_stage'), 'BUILD_SURVIVAL_WALL')
 
     def test_dead_wall_reenters_missing(self):
         state = opening_state()
@@ -798,14 +807,15 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         self.assertFalse(any(e['code'] == 'opening_phase' for e in state.decision_events))
         self.assertFalse(any(c.get('action') in ('collect', 'buy', 'sell') for c in commands.values()))
 
-    def test_gold_ready_allows_upgrade_and_walls_in_parallel(self):
+    def test_gold_ready_still_prioritizes_day1_walls(self):
         state = opening_state()
         self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
-        self.assertTrue(budget['allow_upgrade'])
+        self.assertFalse(budget['allow_upgrade'])
         self.assertFalse(budget.get('allow_income_mine'))
         self.assertTrue(budget.get('upgrade_funded'))
+        self.assertTrue(budget['allow_walls'])
 
     def test_upgrade_too_late_stops_metal_mining(self):
         state = opening_state()

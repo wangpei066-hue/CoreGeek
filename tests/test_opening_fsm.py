@@ -160,7 +160,7 @@ def aba_oscillations(trail):
 
 
 class OpeningFsmTrailTests(unittest.TestCase):
-    def test_scene_a_nearest_metal_until_upgrade_then_walls(self):
+    def test_scene_a_walls_before_day1_upgrade(self):
         state = opening_state()
         state.team_our.gold_num = 0
         _rockets(state)
@@ -169,18 +169,20 @@ class OpeningFsmTrailTests(unittest.TestCase):
             next(r for r in state.team_our.roles if r.id == rid).back_pack_capability = 8
         trail = run_opening(state, 70)
         fund_rows = [r for r in trail if r['stage'] == STAGE_FUND]
-        self.assertTrue(fund_rows)
-        self.assertEqual(sum(1 for r in fund_rows if r['goal_type'] == 'stone'), 0)
+        self.assertEqual(fund_rows, [])
+        wall_rows = [r for r in trail if r['stage'] == STAGE_WALL]
+        self.assertTrue(wall_rows)
+        self.assertEqual([r for r in wall_rows if r['goal_type'] in ('copper', 'iron')], [])
         self.assertEqual(len(illegal_switches(trail)), 0)
         self.assertEqual(aba_oscillations(trail), 0)
         idle = [r for r in trail if r['worker_id'] in (1, 2) and not r['action']
                 and r['stage'] in (STAGE_FUND, STAGE_WALL)]
         self.assertEqual(len(idle), 0)
-        self.assertTrue(any(r['action'] in ('sell', 'buy', 'use') or r['goal_type'] in ('vendor', 'weaponShop', 'rocket')
-                            for r in trail))
+        walls = [r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0]
+        self.assertGreaterEqual(len(walls), 7)
         print('\n=== 场景 A 轨迹 ===\n' + format_trail(trail))
 
-    def test_scene_b_cutoff_switches_to_walls_once(self):
+    def test_scene_b_goes_to_walls_once_after_weapons(self):
         state = opening_state()
         state.team_our.gold_num = 0
         _rockets(state)
@@ -193,11 +195,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
         for row in trail:
             if row['worker_id'] == 1 and (not stages or stages[-1] != row['stage']):
                 stages.append(row['stage'])
-        self.assertIn(STAGE_FUND, stages)
         self.assertIn(STAGE_WALL, stages)
-        self.assertNotIn(STAGE_FUND, stages[stages.index(STAGE_WALL):])
-        fund_stone = sum(1 for r in trail if r['stage'] == STAGE_FUND and r['goal_type'] == 'stone')
-        self.assertEqual(fund_stone, 0)
+        self.assertNotIn(STAGE_FUND, stages)
         wall_metal = [r for r in trail if r['stage'] == STAGE_WALL and r['goal_type'] in ('copper', 'iron')]
         self.assertEqual(wall_metal, [])
         self.assertTrue(any(r['stage'] == STAGE_WALL and r['goal_type'] in ('stone', 'wall', 'yard') for r in trail))
@@ -205,7 +204,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertEqual(len(illegal_switches(trail)), 0)
         print('\n=== 场景 B 轨迹 ===\n' + format_trail(trail, 32))
 
-    def test_scene_c_unreachable_nearest_keeps_goal(self):
+    def test_scene_c_day1_prefers_stone_over_reachable_metal(self):
         state = opening_state()
         state.round_no = 8
         state.team_our.gold_num = 0
@@ -219,10 +218,12 @@ class OpeningFsmTrailTests(unittest.TestCase):
         worker = state.team_our.roles[1]
         worker.pos = Pos(9, 9)
         trail = run_opening(state, 8)
-        fund = [r for r in trail if r['worker_id'] == 1 and r['stage'] == STAGE_FUND]
-        ores = {r['goal_type'] for r in fund if r['goal_type'] in ('copper', 'iron')}
-        self.assertIn('iron', ores)
-        self.assertEqual(aba_oscillations(fund), 0)
+        wall = [r for r in trail if r['worker_id'] == 1 and r['stage'] == STAGE_WALL]
+        ores = {r['goal_type'] for r in wall if r['goal_type'] in ('stone', 'copper', 'iron')}
+        self.assertIn('stone', ores)
+        self.assertNotIn('copper', ores)
+        self.assertNotIn('iron', ores)
+        self.assertEqual(aba_oscillations(wall), 0)
 
     def test_scene_d_both_workers_busy(self):
         state = opening_state()
@@ -240,10 +241,10 @@ class OpeningFsmTrailTests(unittest.TestCase):
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         state.round_no = 8
         budget = opening_time_budget(state, missing, 62, 3, 0, False, build_blocked_set(state))
-        self.assertEqual(budget['opening_stage'], STAGE_FUND)
-        self.assertTrue(budget['allow_income_mine'])
-        self.assertFalse(budget['allow_stone_mine'])
-        self.assertFalse(budget['allow_walls'])
+        self.assertEqual(budget['opening_stage'], STAGE_WALL)
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(budget['allow_stone_mine'])
+        self.assertTrue(budget['allow_walls'])
         state.policy_memory.clear()
         state.round_no = FIRST_UPGRADE_CUTOFF
         budget = opening_time_budget(state, missing, 30, 3, 0, False, build_blocked_set(state))
@@ -382,10 +383,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertTrue(events)
         self.assertEqual(commands.get(worker.id, {}).get('action'), 'move')
 
-    def test_voucher_buyer_skips_pioneer_busy_with_task(self):
-        """回归：_voucher_buyer_id 选中正在做自进化任务的开拓者时，那名开拓者会被主循环
-        直接 continue 跳过、永远不会真的去买——必须把它排除在候选人之外，让工人来买，
-        否则金币够了也会一直卡着，既不买券也不修墙（当时观测到的现象）。"""
+    def test_pioneer_busy_does_not_block_day1_wall_work(self):
+        """首日三炮齐后先修墙；开拓者忙任务也不能让工人卡在买券选择上。"""
         state = opening_state()
         state.team_our.gold_num = 200
         _rockets(state)
@@ -401,7 +400,9 @@ class OpeningFsmTrailTests(unittest.TestCase):
 
         trail = run_opening(state, 15)  # trail 只记录工人(1,2)，天然排除开拓者
         bought_by_worker = any(row['action'] == 'buy' for row in trail)
-        self.assertTrue(bought_by_worker, format_trail(trail))
+        self.assertFalse(bought_by_worker, format_trail(trail))
+        self.assertTrue(any(row['stage'] == STAGE_WALL and row['goal_type'] in ('stone', 'wall')
+                            for row in trail), format_trail(trail))
 
     def test_no_second_upgrade_on_day1(self):
         state = opening_state()
