@@ -100,17 +100,19 @@
 
 ## 5. 武器升级日程
 
-首日主目标是 **一门存活武器到 2 级**（`required_opening_upgrades = 1`）。完成后立即采石修墙。第二门（`optional_parallel_upgrades = 1`）只用已有现金、已持券或卖矿富余，与修墙并行，不再关墙、不占用全部工人。`weapon_upgrade_due`：
+首日主目标是 **一门 2 级 + 最低生存墙**，不是每回合重算「还能不能升级」。三门基础武器建成后，由跨回合持久的 `opening_stage` 推进第一门升级；cycle ≥ `FIRST_UPGRADE_CUTOFF`(40) 且金币仍不够、也没有券，则一次性切到修墙，当天不再回到筹资。
+
+第一天不实现第二门升级。`weapon_upgrade_due`：
 
 | 天数 | 升什么 |
 | --- | --- |
-| 第 0 天 | 先升一门到 2 级；完成后立即修墙。第二门只在现金/余券够且不挡修墙时并行 |
+| 第 0 天 | 只升一门到 2 级；完成后或截止点资金不足，立即修最低生存墙 |
 | 第 1 天 | 先再升一门到 2 级；墙不到 12 段则暂停继续升；三门都到 2 级后先升一次基地，再往 3 级升 |
 | 第 2 天起 | 基地仍是 1 级则优先买基地券（白天拿着，挨打/火箭冷却再用）；围住炮和基地的内层墙按能否完工回炮决定，不强求铺满；否则未满 3 级的炮继续升 |
 
 **谁去买券**
 
-首日与后续白天都调用同一个 `pick_weapon_voucher_buyer`。比较存活工人和空闲开拓者的完整代价，不按「开拓者空闲、金币已够」一刀切。开拓者只有被正式选为采购者时，才因采购暂停接新任务。首日第二门用 `extra=True` 另找买家，不抢走第一张券的人。
+第二天起调用 `pick_weapon_voucher_buyer`。第一天只指定一名最近商店的存活工人/开拓者买第一张券，不并行第二张。开拓者只有自己被选中才去商店。
 
 缺钱工人：
 
@@ -132,47 +134,49 @@
 
 ## 6. 第一天白天（官方 cycle 0–69；cycle ≥ 70 入夜回防）
 
-`plan_opening`。只统计 `health > 0` 的武器和墙。先规划开拓者任务（接管的人不占炮），再持久化一人一炮分配。角色处理顺序：先开拓者，再工人。
+`plan_opening` 是第一天工人主任务的唯一所有者，实现为五阶段有限状态机（`src/agent/opening_schedule.py`）。只统计 `health > 0` 的武器和墙。三炮未齐时才规划开拓者任务；角色处理顺序先开拓者后工人。`opening_stage` 跨回合持久，禁止每回合按瞬时条件在筹资和修墙之间回退。
 
-### 时间预算（`opening_time_budget`）
+合法转换：
 
-`wall_need` ≈ 修完缺口的工时；`wall_deadline` = 工时 + 回炮缓冲 3。`can_finish_walls` / 关键墙工时真正约束是否继续第一门升级。卖矿看 **全队现金 + 所有存活工人铜铁估值**。无报价仍允许卖，不编造售价，日志 `sale_value_unknown`。
+```text
+BUILD_WEAPONS → FUND_FIRST_UPGRADE
+FUND_FIRST_UPGRADE → APPLY_FIRST_UPGRADE | BUILD_SURVIVAL_WALL | MUSTER
+APPLY_FIRST_UPGRADE → BUILD_SURVIVAL_WALL | MUSTER
+BUILD_SURVIVAL_WALL → MUSTER
+```
 
-| 情况 | 修墙 | 升级 | 卖矿 | 采矿 |
-| --- | --- | --- | --- | --- |
-| 已有一门存活武器 ≥2 级 | 开 | 仅现金/余券够时并行第二门 | 关 | 关（只采石修墙） |
-| 券或金币已在手（第一门未完成） | 开 | 开 | 关 | 关 |
-| 继续第一门会导致关键墙来不及 | 开 | 关 | 关 | 关 |
-| 否则（三炮已齐、第一门未升到 2 级且链路来得及） | 关 | 开 | 开 | 开（只采铜铁） |
+禁止 `BUILD_SURVIVAL_WALL → FUND`、`APPLY → FUND`、`MUSTER → 任何白天经济阶段`。第一天不跑第二门升级，也不调用 `profitable_mine`。
 
-`opening_commit=walls` 在第一门完成后写入；第二门不得取消该承诺。75/76 只是观测开火时点，不推迟官方入夜后的远程经济。
+| 阶段 | 工人只允许 |
+| --- | --- |
+| `BUILD_WEAPONS` | 建三门初级火箭、去施工位、必要回避。禁止采矿和修墙 |
+| `FUND_FIRST_UPGRADE` | 采最近可达铜/铁、去 vendor 卖铜铁、去 weaponShop 买第一张券、持券去武器。禁止采石、修墙、自由选矿 |
+| `APPLY_FIRST_UPGRADE` | 持券者走向目标武器用券；其他人保持安全位置或回基地，不跨图采石。快照确认一门存活武器 2 级后立刻进墙阶段 |
+| `BUILD_SURVIVAL_WALL` | 采最近可达石矿、修最低生存墙、必要时丢掉阻塞容量的铜铁。禁止重新采铜铁和升级筹资 |
+| `MUSTER` | 走向分配武器并保持。禁止采矿、出售、购买和远距离施工 |
 
-阶段名写在决策日志 `opening_phase`：武器 → 筹资升级 → 围墙 → 就位。字段含 `cycle`、`rounds_to_night`、`alive_weapons`。剩余白天回合不够走回炮位（路程 + 3）则 `muster`，停止施工。
+`opening_time_budget` 只从当前 `opening_stage` 派生允许项，不再用估算在筹资和修墙之间切换。cycle ≥ 40 且金币不够、没有券 → 永久 `BUILD_SURVIVAL_WALL`。剩余白天 ≤ `MUSTER_BUFFER`(3) 或贴身威胁 → `MUSTER`。
+
+资源目标按每名工人到所有可达候选矿的真实最短路径选择：`score = path_length`；服务器已给出单位售价时才用 `path_length / known_unit_value`。`switch_penalty = 4`，且必须落在合法换目标白名单里。每个工人的 `opening_worker_goals` 跨回合保持；连续三回合路径不缩短才宣布原目标失效。检测到 `A→B→A` 时保持原目标、走当前 BFS 下一步。
+
+`go_mine` / `liquidate` / `replenish_walls` / `muster_for_night` 只提供原子动作，不能自行改战略阶段。最终命令之后只有紧急治疗、近敌战斗、正式回防可以覆盖。
+
+最低生存墙（`survival_wall_plan`）先封正面通向基地/武器/操炮位的缺口，再补两侧端点。死亡墙、死亡武器不计入完成。
 
 ### 开拓者首日
 
-1. 已在做任务：继续（低血紧急治疗）。回防窗是否留下看 `pioneer_should_hold_task`。  
-2. 三炮齐后走同一套 `pick_weapon_voucher_buyer`：只有自己被选中才去商店，不因「金币够了」就停接任务。  
-3. 第一门仍缺钱且没有可行任务时，去武器商店旁等待变现到账后买券；cycle ≥ 70 必须回防，不再等商店。  
-4. 否则战术道具 / 自救 / 路过买药。  
-5. 站在未来墙线或炮位上则让开；无事则去已分配炮位。  
-6. 绝不 `collect` / `build`。
+1. 三炮未齐：可接开拓者任务；三炮齐后不再让任务覆盖买券。  
+2. 只有自己被选为买券者且金币够才去商店；已持券则去用。  
+3. 否则让开墙线/炮位，无事去已分配炮位。  
+4. 绝不 `collect` / `build`。
 
 ### 工人首日
 
-三炮未齐：金币每座 25，走到空炮位 `build rocket`。没 75 金不改去修墙。本回合已发出建炮指令则其它工人等待，不提前转入围墙。
+三炮未齐：金币每座 25，走到空炮位 `build rocket`。没金不改去修墙。
 
-三炮齐后：
+三炮齐后只执行当前阶段的一种主资源目标。背包满才去 vendor；金币够才去商店；获券后去武器。没有指令则记录 `worker_state` / `no_command_reason`，不允许无原因 IDLE。
 
-1. 正面紧急缺口且身上有石、能在安全窗内封堵：暂停未买到手的采购，先补这一段。已持券不抢。  
-2. 第一门未完成时指定 `opening_cashout_owner` 去小贩；两包各一半矿也能卖，不要求单包够券价。无报价仍 `sell`，日志 `sale_value_unknown`。  
-3. 已被派买券则去买/用；一名工人买券时，另一人可以采石修墙。  
-4. 允许采矿且还不能修墙：只采铜铁，不采石。矿种按 `vendorShopList` 报价选总回合最短的那座；无报价不编造售价，但仍可采矿后去卖。  
-5. 第一门 2 级后立即采石修墙。第二门不关闭墙。  
-6. 集合则去炮。找不到回路时按需要集合，不用 8 当成准时可达。  
-7. 没有指令则自救或去炮，避免空转。已预约卖矿的人同回合不被改派采矿/修墙/回家。
-
-首日工人 **不走** `muster_for_night` 的第 50 回合一刀切，由本计划按返程集合。高压破口除外。
+首日工人 **不走** `muster_for_night` 的第 50 回合一刀切。高压/贴身威胁除外。
 
 ---
 
@@ -349,6 +353,8 @@ $$
 | `WANTED_WEAPONS` | 三座 rocket | 编制 |
 | `WEAPON_GOLD_COST` | 25 | 建炮 |
 | `DAY1/DAY2_WALL_TARGET` | 8 / 12 | 阶段墙数 |
+| `FIRST_UPGRADE_CUTOFF` | 40 | 第一天升级筹资截止；之后只修墙 |
+| `GOAL_SWITCH_PENALTY` / `GOAL_STALL_ROUNDS` | 4 / 3 | 换矿代价；三回合无进展才换目标 |
 | `MUSTER_BUFFER` / `LATE_BUILD_SLACK` / `MAX_WALL_OVERRUN` | 3 / 2 / 12 | 回防缓冲；墙工时 overrun 初值与上限 |
 | `WAVE_LOCAL_STREAK` / `WAVE_CLEAR_STREAK` | 3 / 8 | 夜间院内就近施工 / 试探外出的连续空窗，不是官方清波 |
 | `STONE_BATCH` / `MINE_TRIP_CAP` | 6 / 6 | 首日矿边一次采够半圈；选矿只按本趟还能采的几下计，不用整包空位抬远矿 |

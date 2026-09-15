@@ -321,12 +321,8 @@ class EconomyTests(unittest.TestCase):
         state, role = economy_state()
         role.backpack = []
         state.vendor_shop_list = []
-        picked = pick_mine(role, state, build_blocked_set(state), set(),
-                           want_ores=('iron', 'copper'), purpose='voucher')
-        self.assertIsNotNone(picked)
-        event = next(e for e in state.decision_events if e['code'] == 'voucher_mine')
-        self.assertFalse(event.get('price'))
-        self.assertEqual(event.get('vendor_prices') or {}, {})
+        self.assertIsNone(pick_mine(role, state, build_blocked_set(state), set(),
+                                    want_ores=('iron', 'copper'), purpose='voucher'))
 
     def test_cashout_window_clears_mine_target(self):
         state, role = defended_state()

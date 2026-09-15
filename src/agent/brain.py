@@ -432,7 +432,7 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     if not weapons:
         return False
-    from .opening import DAY1_WEAPON_L2_TARGET, DAY2_WALL_TARGET
+    from .opening import DAY2_WALL_TARGET, REQUIRED_OPENING_UPGRADES
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     l2 = sum((w.level or 1) >= 2 for w in weapons)
     walls = sum(r.role_type == "wall" and r.health > 0 for r in state.team_our.roles)
@@ -440,7 +440,7 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
         return False
     if any((w.level or 1) < 2 for w in weapons):
         if day <= 0:
-            return l2 < DAY1_WEAPON_L2_TARGET
+            return l2 < REQUIRED_OPENING_UPGRADES
         if day == 1:
             if l2 < 2:
                 return True
@@ -456,21 +456,26 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
 
 
 def should_upgrade_weapon(state: "MatchState") -> bool:
-    """按日程控制升级节奏。首日先完成第一门；第二门只用现金/余券并行。其后同一时刻只锁一门。"""
-    from .opening import (
-        DAY1_WEAPON_L2_TARGET, REQUIRED_OPENING_UPGRADES, day1_second_upgrade_fits, live_l2_weapon_count,
-    )
+    """按日程控制升级节奏。第一天只升第一门；第二天起沿用原日程。"""
+    from .opening import REQUIRED_OPENING_UPGRADES, day1_second_upgrade_fits, live_l2_weapon_count
+    from .opening_schedule import STAGE_APPLY, STAGE_FUND, current_opening_stage
     jobs = sum(1 for job in state.worker_item_jobs.values() if job.get("kind") == "weapon")
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     if not weapon_upgrade_due(state):
         return False
     if day <= 0:
-        l2 = live_l2_weapon_count(state)
-        if l2 + jobs >= DAY1_WEAPON_L2_TARGET:
+        if current_opening_stage(state) not in (STAGE_FUND, STAGE_APPLY, None):
             return False
-        if l2 < REQUIRED_OPENING_UPGRADES:
-            return jobs == 0
-        return jobs == 0 and day1_second_upgrade_fits(state)
+        l2 = live_l2_weapon_count(state)
+        if l2 >= REQUIRED_OPENING_UPGRADES:
+            return False
+        gold = state.team_our.gold_num if state.team_our else 0
+        if gold < item_cost('WeaponUpgradeVoucher1', state) and not any(
+            'WeaponUpgradeVoucher1' in (r.backpack or [])
+            for r in state.team_our.roles
+        ):
+            return False
+        return jobs == 0
     return jobs == 0
 
 
@@ -679,8 +684,10 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         return move_on_path(state, role, adjacent_path(role, target, walkable, state), reserved, '执行维修/升级道具任务')
 
     if state.team_our.gold_num < item_cost(item, state):
+        from .opening import survival_walls_locked
+        day0 = (state.round_no or 0) // DAY_NIGHT_CYCLE == 0
         trace(state, role.id, "insufficient_gold", "道具任务购买资金不足，释放任务", available_gold=state.team_our.gold_num, required_gold=item_cost(item, state), item=item)
-        if job.get('kind') == 'weapon':
+        if job.get('kind') == 'weapon' and not day0 and not survival_walls_locked(state):
             trace(state, role.id, 'weapon_upgrade_job_waiting_funds', '保留武器升级目标并继续筹资，不改做城墙/基地升级')
             return None
         del state.worker_item_jobs[role.id]

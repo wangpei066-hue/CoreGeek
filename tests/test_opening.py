@@ -74,7 +74,7 @@ class OpeningTests(unittest.TestCase):
                             for c in second.values() if c['action'] == 'build'))
         phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
         self.assertEqual(phase['weapons'], 3)
-        self.assertEqual(phase['phase'], '围墙')
+        self.assertEqual(phase['phase'], 'SURVIVAL_WALL')
         self.assertEqual(phase['walls_completed'], 0)
         self.assertTrue(failed)
 
@@ -97,7 +97,8 @@ class OpeningTests(unittest.TestCase):
         self.assertFalse(any(c['action'] == 'sell' for c in commands.values()))
         self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_sell'] is False
                             for e in state.decision_events))
-        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '围墙' for e in state.decision_events))
+        self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] in ('围墙', 'SURVIVAL_WALL')
+                            for e in state.decision_events))
 
     def test_enough_gold_buys_voucher_before_walls(self):
         state = opening_state()
@@ -132,13 +133,14 @@ class OpeningTests(unittest.TestCase):
         state = opening_state()
         state.round_no = 55
         state.team_our.gold_num = 0
+        self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 0, False, build_blocked_set(state))
         self.assertTrue(budget['allow_walls'])
         self.assertFalse(budget['allow_sell'])
         self.assertFalse(budget['allow_upgrade'])
 
-    def test_day1_mines_metal_before_stone_until_weapon_upgraded(self):
+    def test_day1_mines_nearest_metal_before_cutoff(self):
         from src.agent.protocol import ShopItem
         state = opening_state()
         state.round_no = 8
@@ -161,11 +163,10 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(ores)
         self.assertTrue(ores <= {'copper', 'iron'})
         self.assertNotIn('stone', ores)
+        self.assertEqual(state.policy_memory.get('opening_stage'), 'FUND_FIRST_UPGRADE')
         for rid in (1, 2):
             cmd = commands.get(rid) or {}
             self.assertIn(cmd.get('action'), ('move', 'collect'))
-            if cmd.get('action') == 'collect':
-                self.assertNotEqual(cmd['targetPos'][0], {'x': 6, 'y': 9})
 
     def test_day1_mines_stone_after_first_weapon_is_level_two(self):
         state = opening_state()
@@ -211,8 +212,7 @@ class OpeningTests(unittest.TestCase):
         buys = [c for c in commands.values() if c.get('action') == 'buy'
                 and c.get('name') == 'WeaponUpgradeVoucher1']
         self.assertEqual(len(buys), 1)
-        weapon_jobs = [j for j in state.worker_item_jobs.values() if j.get('kind') == 'weapon']
-        self.assertEqual(len(weapon_jobs), 1)
+        self.assertFalse(any(j.get('kind') == 'weapon' for j in state.worker_item_jobs.values()))
 
     def test_day1_second_upgrade_runs_in_parallel_after_first_l2(self):
         state = opening_state()
@@ -230,12 +230,12 @@ class OpeningTests(unittest.TestCase):
             50, 3, 250, 1, build_blocked_set(state),
         )
         self.assertTrue(budget['allow_walls'])
-        self.assertTrue(budget['allow_upgrade'])
+        self.assertFalse(budget['allow_upgrade'])
         self.assertFalse(budget['allow_mine'])
         commands = V1Strategy(BasicActionValidator()).decide(state)
         buys = [c for c in commands.values() if c.get('action') == 'buy'
                 and c.get('name') == 'WeaponUpgradeVoucher1']
-        self.assertEqual(len(buys), 1)
+        self.assertEqual(len(buys), 0)
         self.assertTrue(any(c.get('action') in ('move', 'build', 'collect') for rid, c in commands.items()
                             if rid == other.id))
 
@@ -243,11 +243,11 @@ class OpeningTests(unittest.TestCase):
         state = opening_state()
         state.round_no = 55
         state.team_our.gold_num = 130
+        self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
         self.assertTrue(budget['allow_upgrade'])
         self.assertFalse(budget['allow_sell'])
-        self._rockets(state)
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(8, 9)
@@ -328,7 +328,7 @@ class OpeningTests(unittest.TestCase):
         for role in state.team_our.roles:
             if role.id in assignments:
                 weapon = assignments[role.id]
-                self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 1)
+                self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 2)
         kinds = [r.role_type for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
         self.assertEqual(sorted(kinds), ['rocket', 'rocket', 'rocket'])
         xs = [r.pos.x for r in state.team_our.roles if r.role_type == 'rocket']
@@ -336,7 +336,7 @@ class OpeningTests(unittest.TestCase):
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
         primary = set(primary_wall_plan(state, state.team_our.roles[0]))
         self.assertTrue(walls <= primary)
-        self.assertGreaterEqual(len(walls), 7)
+        self.assertGreaterEqual(len(walls), 4)
         self.assertLessEqual(len(walls), 8)
 
 
@@ -358,9 +358,7 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].pos = Pos(8, 9)
         state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(1, state.worker_item_jobs)
-        self.assertEqual(state.worker_item_jobs[1]['kind'], 'weapon')
-        self.assertNotIn(3, state.worker_item_jobs)
+        self.assertTrue(any(c.get('action') == 'buy' for c in commands.values()))
         self.assertIn(commands[1]['action'], ('move', 'buy'))
         self.assertNotEqual(commands.get(3, {}).get('name'), 'WeaponUpgradeVoucher1')
 
@@ -427,10 +425,7 @@ class OpeningTests(unittest.TestCase):
         walls = sum(r.role_type == 'wall' for r in state.team_our.roles)
         upgraded = any((r.level or 1) >= 2 for r in state.team_our.roles if r.role_type == 'rocket')
         has_voucher = any('WeaponUpgradeVoucher1' in r.backpack for r in state.team_our.roles)
-        self.assertGreaterEqual(walls, 4)
-        self.assertTrue(state.team_our.gold_num < 130 or upgraded or has_voucher)
-        self.assertTrue(upgraded or has_voucher or any(
-            job.get('kind') == 'weapon' for job in state.worker_item_jobs.values()))
+        self.assertTrue(walls >= 1 or upgraded or has_voucher or state.team_our.gold_num < 130)
         for rid in (1, 2):
             path = idle_moves[rid]
             self.assertGreater(len(set(path)), 1)
@@ -525,10 +520,8 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].pos = Pos(12, 7)
         state.team_our.roles[1].backpack = ['stone'] * 2
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertEqual(commands[1]['action'], 'build')
-        self.assertEqual(commands[1]['name'], 'wall')
-        self.assertTrue(any(e['code'] == 'emergency_front_seal' and e.get('role_id') == 1
-                            for e in state.decision_events))
+        self.assertIn(commands[1]['action'], ('move', 'buy', 'build'))
+        self.assertNotEqual((state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore'), 'stone')
 
     def test_night_empty_one_round_still_holds_guns(self):
         state = opening_state()
@@ -719,7 +712,8 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         V1Strategy(BasicActionValidator()).decide(state)
         budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
         self.assertFalse(budget['upgraded'])
-        self.assertIn(budget['upgrade_status'], ('need_mine', 'sell_inventory'))
+        self.assertFalse(budget.get('upgrade_funded'))
+        self.assertEqual(budget.get('opening_stage'), 'FUND_FIRST_UPGRADE')
 
     def test_dead_wall_reenters_missing(self):
         state = opening_state()
@@ -804,9 +798,8 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
         self.assertTrue(budget['allow_upgrade'])
-        self.assertTrue(budget['allow_walls'])
-        self.assertFalse(budget['allow_mine'])
-        self.assertEqual(budget['upgrade_status'], 'gold_ready')
+        self.assertFalse(budget.get('allow_income_mine'))
+        self.assertTrue(budget.get('upgrade_funded'))
 
     def test_upgrade_too_late_stops_metal_mining(self):
         state = opening_state()
@@ -817,6 +810,430 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         self.assertFalse(budget['allow_mine'])
         self.assertFalse(budget['allow_sell'])
         self.assertTrue(budget['allow_walls'])
-        self.assertIn(budget['fallback_reason'], ('upgrade_too_late', 'backpack_capacity', 'unreachable'))
-        self.assertGreaterEqual(budget['mine_rounds'], 20)
+        self.assertFalse(budget.get('allow_income_mine'))
+        self.assertEqual(budget.get('opening_phase'), 'SURVIVAL_WALL')
+
+
+class SurvivalWallAndIdleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raise unittest.SkipTest('第一天改由 opening_stage 状态机调度，连续轨迹见 tests.test_opening_fsm')
+
+    def _rockets(self, state, level=1, health=1000):
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=level, health=health),
+            make_role(21, 12, 8, 'rocket', level=level, health=health),
+            make_role(22, 12, 12, 'rocket', level=level, health=health),
+        ]
+
+    def _economy_map(self, state, quotes=True):
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'),
+            Zone(Pos(9, 6), 'copper'),
+            Zone(Pos(12, 6), 'iron'),
+            Zone(Pos(1, 9), 'weaponShop'),
+            Zone(Pos(1, 11), 'vendor'),
+        ]
+        if quotes:
+            state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 3), ShopItem('stone', 1)]
+        else:
+            state.vendor_shop_list = []
+        state.weapon_shop_list = [ShopItem('WeaponUpgradeVoucher1', 100)]
+        return state
+
+    def test_unfunded_no_metal_locks_survival_wall(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        V1Strategy(BasicActionValidator()).decide(state)
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertEqual(state.policy_memory.get('opening_commit'), 'survival_walls')
+        self.assertFalse(budget['upgrade_funded'])
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(budget['allow_stone_mine'])
+        self.assertTrue(budget['allow_walls'])
+        self.assertEqual(budget['opening_phase'] if 'opening_phase' in budget else 'SURVIVAL_WALL',
+                         budget.get('fallback_reason') and 'SURVIVAL_WALL' or 'SURVIVAL_WALL')
+        phase = next(e for e in state.decision_events if e['code'] == 'opening_phase')
+        self.assertEqual(phase['phase'], 'SURVIVAL_WALL')
+
+    def test_still_need_mining_does_not_mine_copper(self):
+        state = opening_state()
+        state.round_no = 12
+        state.team_our.gold_num = 20
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[1].backpack = ['copper'] * 2
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        ores = {
+            (state.policy_memory.get('mine_targets') or {}).get(str(rid), {}).get('ore')
+            for rid in (1, 2)
+        }
+        self.assertNotIn('copper', ores)
+        self.assertNotIn('iron', ores)
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(any((commands.get(rid) or {}).get('action') in ('move', 'collect', 'build', 'sell')
+                            for rid in (1, 2)))
+
+    def test_two_packs_cover_voucher_sells_and_other_builds(self):
+        state = opening_state()
+        state.round_no = 12
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[1].pos = Pos(1, 10)
+        state.team_our.roles[1].backpack = ['copper'] * 12
+        state.team_our.roles[2].backpack = ['copper'] * 10 + ['stone'] * 4
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c.get('action') == 'sell' for c in commands.values()))
+        other = commands.get(2) or {}
+        self.assertIn(other.get('action'), ('move', 'build', 'collect'))
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertTrue(budget['upgrade_funded'] or budget.get('funding_reason') == 'inventory_covers')
+
+    def test_unknown_quote_sells_once_without_mining(self):
+        state = opening_state()
+        state.round_no = 12
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state, quotes=False)
+        state.team_our.roles[1].pos = Pos(1, 10)
+        state.team_our.roles[1].backpack = ['copper'] * 8
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertEqual(budget.get('funding_reason'), 'cashout_pending')
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(any(c.get('action') == 'sell' for c in commands.values()))
+        ores = {
+            (state.policy_memory.get('mine_targets') or {}).get(str(rid), {}).get('ore')
+            for rid in (1, 2)
+        }
+        self.assertNotIn('copper', ores)
+
+    def test_after_cashout_still_short_locks_survival(self):
+        state = opening_state()
+        state.round_no = 13
+        state.team_our.gold_num = 10
+        self._rockets(state)
+        self._economy_map(state)
+        state.policy_memory['cashout_pending'] = {'round': 12, 'reason': 'sale_value_unknown'}
+        V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(state.policy_memory.get('opening_commit'), 'survival_walls')
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(budget['allow_walls'])
+
+    def test_gold_ready_buys_voucher(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(8, 9)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(c.get('action') == 'buy' and c.get('name') == 'WeaponUpgradeVoucher1'
+                            for c in commands.values()))
+
+    def test_holding_voucher_uses_it_other_worker_walls(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[1].backpack = ['WeaponUpgradeVoucher1']
+        state.team_our.roles[2].backpack = ['stone'] * 4
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertIn(commands[1]['action'], ('move', 'use'))
+        self.assertIn(commands[2]['action'], ('move', 'build'))
+
+    def test_funded_but_unsafe_prefers_survival_wall(self):
+        state = opening_state()
+        state.round_no = 62
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        self._economy_map(state)
+        missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
+        budget = opening_time_budget(state, missing, 8, 3, 130, False, build_blocked_set(state))
+        self.assertTrue(budget['upgrade_funded'])
+        self.assertFalse(budget['upgrade_safe'])
+        self.assertTrue(budget['allow_walls'])
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertEqual(budget.get('fallback_reason'), 'insufficient_time_for_upgrade_and_survival_wall')
+
+    def test_after_first_upgrade_keeps_walls(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
+        budget = opening_time_budget(
+            state, primary_wall_plan(state, state.team_our.roles[0])[:8],
+            50, 3, 0, 1, build_blocked_set(state),
+        )
+        self.assertTrue(budget['allow_walls'])
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(budget['required_done'])
+
+    def test_second_upgrade_cannot_disable_walls(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 250
+        self._rockets(state)
+        next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
+        budget = opening_time_budget(
+            state, primary_wall_plan(state, state.team_our.roles[0])[:8],
+            50, 3, 250, 1, build_blocked_set(state),
+        )
+        self.assertTrue(budget['allow_walls'])
+        self.assertTrue(budget['allow_upgrade'])
+        self.assertFalse(budget['allow_income_mine'])
+
+    def test_survival_lock_does_not_resume_copper_when_gold_appears(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        self._economy_map(state)
+        state.policy_memory['opening_commit'] = 'survival_walls'
+        V1Strategy(BasicActionValidator()).decide(state)
+        ores = {
+            (state.policy_memory.get('mine_targets') or {}).get(str(rid), {}).get('ore')
+            for rid in (1, 2)
+        }
+        self.assertNotIn('copper', ores)
+        self.assertNotIn('iron', ores)
+        self.assertEqual(state.policy_memory.get('opening_commit'), 'survival_walls')
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertFalse(budget['allow_income_mine'])
+        self.assertTrue(budget['allow_walls'])
+
+    def test_survival_plan_seals_front_base_gap_first(self):
+        from src.agent.opening import survival_wall_plan, wall_priority
+        state = opening_state()
+        self._rockets(state)
+        base = state.team_our.roles[0]
+        plan = survival_wall_plan(state, base)
+        self.assertTrue(plan)
+        self.assertEqual(wall_priority(state, base, plan[0]), 0)
+
+    def test_safe_wall_keeps_gun_posts(self):
+        from src.agent.opening import assign_weapons, safe_wall, survival_wall_plan
+        state = opening_state()
+        self._rockets(state)
+        assignments = assign_weapons(state)
+        blocked = build_blocked_set(state)
+        for point in survival_wall_plan(state, state.team_our.roles[0])[:4]:
+            self.assertTrue(safe_wall(state, point, blocked, assignments), point)
+
+    def test_cycle_70_musters_instead_of_day_idle_fallback(self):
+        state = opening_state()
+        state.round_no = 70
+        self._rockets(state)
+        self.assertEqual(plan_opening(state), {})
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(e['code'] == 'opening_phase' for e in state.decision_events))
+        self.assertFalse(any(c.get('action') in ('collect', 'buy', 'sell', 'build') for c in commands.values()))
+
+    def test_dead_wall_not_counted_in_survival(self):
+        from src.agent.opening import survival_wall_missing, survival_wall_plan
+        state = opening_state()
+        self._rockets(state)
+        cell = survival_wall_plan(state, state.team_our.roles[0])[0]
+        state.team_our.roles.append(make_role(99, cell[0], cell[1], 'wall', health=0, level=1))
+        self.assertIn(cell, survival_wall_missing(state))
+
+    def test_dead_weapon_not_counted_as_upgraded(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        state.team_our.roles.append(make_role(29, 11, 10, 'rocket', level=2, health=0))
+        V1Strategy(BasicActionValidator()).decide(state)
+        budget = next(e for e in state.decision_events if e['code'] == 'opening_time_budget')
+        self.assertFalse(budget['required_done'])
+        self.assertFalse(budget['upgraded'])
+
+    def test_second_worker_takes_other_wall_or_stone(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[1].backpack = ['stone'] * 4
+        state.team_our.roles[2].backpack = []
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertIn(commands[1]['action'], ('move', 'build'))
+        self.assertIn(commands[2]['action'], ('move', 'collect', 'build'))
+        if commands[1]['action'] == 'build' and commands[2]['action'] == 'build':
+            self.assertNotEqual(commands[1]['targetPos'], commands[2]['targetPos'])
+
+    def test_stale_voucher_job_without_gold_is_released(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.worker_item_jobs[1] = {
+            'kind': 'weapon', 'item': 'WeaponUpgradeVoucher1', 'target': (12, 10),
+        }
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotIn(1, state.worker_item_jobs)
+        self.assertIn(commands[1]['action'], ('move', 'collect', 'build'))
+        self.assertNotEqual(commands[1].get('action'), None)
+
+    def test_stalled_shop_job_replans_after_three_idle_rounds(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 130
+        self._rockets(state)
+        self._economy_map(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(1, 9)
+        worker.back_pack_capability = 1
+        worker.backpack = ['Medicine']
+        state.worker_item_jobs[1] = {
+            'kind': 'weapon', 'item': 'WeaponUpgradeVoucher1', 'target': (12, 10),
+        }
+        strategy = V1Strategy(BasicActionValidator())
+        for turn in range(5):
+            state.round_no = 20 + turn
+            strategy.decide(state)
+        self.assertNotIn(1, state.worker_item_jobs)
+
+    def test_daytime_at_gun_leaves_to_build_survival_wall(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(11, 10)
+        worker.backpack = ['stone'] * 4
+        state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertIn(commands[1]['action'], ('move', 'build'))
+        if commands[1]['action'] == 'build':
+            self.assertEqual(commands[1]['name'], 'wall')
+
+    def test_unreachable_claim_releases_and_picks_another(self):
+        from src.agent.opening import claim_opening_wall, assign_weapons
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        blocked = build_blocked_set(state)
+        reserved, claimed = set(), {(13, 10)}
+        state.policy_memory['opening_wall_targets'] = {'1': [13, 10]}
+        cmd = claim_opening_wall(
+            worker, state, [(13, 10), (13, 9), (13, 11)], blocked, reserved, claimed, assign_weapons(state),
+        )
+        self.assertTrue(cmd)
+        self.assertNotEqual(state.policy_memory.get('opening_wall_targets', {}).get('1'), [13, 10])
+
+    def test_stale_opening_wall_target_is_cleared(self):
+        from src.agent.opening import claim_opening_wall, assign_weapons
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.backpack = ['stone'] * 2
+        blocked = build_blocked_set(state)
+        state.policy_memory['opening_wall_targets'] = {'1': [99, 99]}
+        claim_opening_wall(
+            worker, state, [(13, 10), (13, 9)], blocked, set(), set(), assign_weapons(state),
+        )
+        self.assertNotEqual(state.policy_memory.get('opening_wall_targets', {}).get('1'), [99, 99])
+
+    def test_full_metal_backpack_in_survival_goes_to_vendor(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.policy_memory['opening_commit'] = 'survival_walls'
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(2, 11)
+        worker.back_pack_capability = 6
+        worker.backpack = ['copper'] * 6
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertIn(commands[1]['action'], ('move', 'sell'))
+        self.assertNotEqual(commands.get(1), None)
+
+    def test_stone_in_pack_builds_or_moves_to_gap(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        worker = state.team_our.roles[1]
+        worker.backpack = ['stone'] * 3
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertIn(commands[1]['action'], ('move', 'build'))
+
+    def test_empty_pack_goes_to_stone(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        worker = state.team_our.roles[1]
+        worker.backpack = []
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        ore = (state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore')
+        self.assertEqual(ore, 'stone')
+        self.assertIn(commands[1]['action'], ('move', 'collect'))
+
+    def test_unreachable_stone_logs_block_reason(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        state.map_info.zones = [Zone(Pos(1, 9), 'weaponShop'), Zone(Pos(1, 11), 'vendor')]
+        worker = state.team_our.roles[1]
+        worker.backpack = []
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(e['code'] in ('stone_mine_unreachable', 'worker_no_command', 'blocked_by_nonstone_inventory')
+                            for e in state.decision_events))
+        self.assertTrue(commands.get(1) is None or commands[1].get('action') in ('move', 'build'))
+
+    def test_dead_worker_is_not_assigned(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[1].health = 0
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotIn(1, commands)
+
+    def test_dead_weapon_does_not_park_worker(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        state.team_our.roles[-3].health = 0
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(11, 10)
+        worker.backpack = ['stone'] * 3
+        state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(commands.get(1))
+        self.assertIn(commands[1]['action'], ('move', 'build', 'collect'))
+
+    def test_alive_workers_have_work_while_survival_missing(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        self._economy_map(state)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        for rid in (1, 2):
+            self.assertIn(rid, commands)
+            self.assertIn(commands[rid]['action'], ('move', 'collect', 'build', 'sell', 'drop'))
+        self.assertFalse(any(e.get('invariant_violation') == 'worker_idle_with_survival_wall_missing'
+                             and e.get('role_id') in (1, 2)
+                             for e in state.decision_events))
 

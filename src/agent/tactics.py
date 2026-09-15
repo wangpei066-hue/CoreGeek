@@ -22,6 +22,8 @@ def begin_round(state):
     state.bombed_robots = set()
     from .world_intel import ingest_news
     ingest_news(state)
+    from .opening import clear_opening_commit_after_first_night
+    clear_opening_commit_after_first_night(state)
     from .brain import is_day_round, own_station
     if is_day_round(state.round_no):
         state.policy_memory.pop('night_saw_threat', None)

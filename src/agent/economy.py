@@ -606,7 +606,7 @@ def liquidate(role, state, blocked, reserved):
     value = quoted_value
     triggers = []
     from .brain import should_upgrade_weapon
-    from .opening import OPENING_METAL_BATCH, day_rounds_remaining, live_l2_weapon_count, REQUIRED_OPENING_UPGRADES
+    from .opening import OPENING_METAL_BATCH, day_rounds_remaining, live_l2_weapon_count, REQUIRED_OPENING_UPGRADES, survival_walls_locked
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
     need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
     gap = voucher_funding_gap(state)
@@ -621,6 +621,11 @@ def liquidate(role, state, blocked, reserved):
                   if r.role_type == 'worker' and r.health > 0 and worker_has_metal(r))
     near_cutoff = day_rounds_remaining(state.round_no) <= PRE_NIGHT_CASHOUT_LEAD
     pack_full = fill >= 1.0 or (cap and len(role.backpack) >= cap)
+    if survival_walls_locked(state) and (state.round_no or 0) < 70:
+        pending = (state.policy_memory or {}).get('cashout_pending')
+        clear_pack = pack_full and metal_count and role.backpack.count('stone') == 0
+        if not pending and not clear_pack:
+            return False, None
     if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and (
             quoted_value >= gap or (value_unknown and metal_count)):
         triggers.append('卖掉本包后工人去买武器升级券')
@@ -835,23 +840,7 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
                 role, state, blocked, reserved, mine, remaining_value, prices=prices, path=path,
             )
             if plan is None:
-                if remaining_value <= 0 or prices.get(mine.neutral_type, 0) > 0:
-                    return None
-                path_len = len(path)
-                return_len = vendor_return_steps(mine, state, blocked, reserved)
-                batch = trip_collect_limit(
-                    role, state, path_len=path_len, return_len=return_len, purpose=purpose,
-                )
-                if batch <= 0:
-                    return None
-                plan = {
-                    'rounds': path_len + batch + return_len,
-                    'units': batch,
-                    'path_len': path_len,
-                    'vendor_len': return_len,
-                    'fits_backpack': True,
-                }
-                return -plan['rounds'], plan['units'], plan['path_len'], plan['vendor_len'], plan
+                return None
             if not plan['fits_backpack']:
                 return None
             return -plan['rounds'], plan['units'], plan['path_len'], plan['vendor_len'], plan
