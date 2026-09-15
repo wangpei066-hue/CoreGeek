@@ -456,18 +456,21 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
 
 
 def should_upgrade_weapon(state: "MatchState") -> bool:
-    """按日程控制升级节奏。首日最多两门并行（钱和回合都够才开第二张）；其后同一时刻只锁一门。"""
-    from .opening import DAY1_WEAPON_L2_TARGET, day1_second_upgrade_fits, live_l2_weapon_count
+    """按日程控制升级节奏。首日先完成第一门；第二门只用现金/余券并行。其后同一时刻只锁一门。"""
+    from .opening import (
+        DAY1_WEAPON_L2_TARGET, REQUIRED_OPENING_UPGRADES, day1_second_upgrade_fits, live_l2_weapon_count,
+    )
     jobs = sum(1 for job in state.worker_item_jobs.values() if job.get("kind") == "weapon")
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     if not weapon_upgrade_due(state):
         return False
     if day <= 0:
-        if live_l2_weapon_count(state) + jobs >= DAY1_WEAPON_L2_TARGET:
+        l2 = live_l2_weapon_count(state)
+        if l2 + jobs >= DAY1_WEAPON_L2_TARGET:
             return False
-        if jobs == 0:
-            return True
-        return day1_second_upgrade_fits(state)
+        if l2 < REQUIRED_OPENING_UPGRADES:
+            return jobs == 0
+        return jobs == 0 and day1_second_upgrade_fits(state)
     return jobs == 0
 
 
@@ -1613,8 +1616,8 @@ class V1Strategy(Strategy):
             trace(state, None, "missing_state", "缺少队伍或地图快照，不能生成指令")
             commands = {}
         elif isinstance(state.round_no, int) and own_station(state):
-            from .opening import first_night_economy_open, plan_opening
-            if 0 <= state.round_no < DAY_ROUNDS or first_night_economy_open(state):
+            from .opening import plan_opening
+            if 0 <= state.round_no < DAY_ROUNDS:
                 commands = plan_opening(state)
             elif is_day_round(state.round_no):
                 commands = plan_day(state)

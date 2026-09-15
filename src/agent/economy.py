@@ -57,6 +57,35 @@ def metal_inventory_value(role, state):
     return sum(prices.get(name, 0) for name in role.backpack if name in ('iron', 'copper'))
 
 
+def worker_metal_count(role):
+    return sum(1 for item in (role.backpack or []) if item in ('iron', 'copper'))
+
+
+def worker_has_metal(role):
+    return worker_metal_count(role) > 0
+
+
+def team_metal_inventory_value(state):
+    return sum(metal_inventory_value(r, state)
+               for r in (state.team_our.roles if state.team_our else [])
+               if r.role_type == 'worker' and r.health > 0)
+
+
+def opening_cashout_owner(state):
+    """第一门筹资时指定一名持矿工人去小贩，避免两人都空等。"""
+    committed = list(state.policy_memory.get('selling_roles') or [])
+    holders = [r for r in (state.team_our.roles if state.team_our else [])
+               if r.role_type == 'worker' and r.health > 0 and worker_has_metal(r)]
+    if not holders:
+        return None
+    for rid in committed:
+        owner = next((r for r in holders if r.id == rid), None)
+        if owner is not None:
+            return owner.id
+    holders.sort(key=lambda r: (-worker_metal_count(r), -metal_inventory_value(r, state), r.id))
+    return holders[0].id
+
+
 def worker_should_shop_weapon_voucher(role, state, blocked=None):
     """工人买券：本人已持券，或完整代价比较后轮到这名工人。"""
     from .brain import should_upgrade_weapon, weapon_upgrade_due
@@ -83,6 +112,14 @@ def voucher_funding_gap(state):
             job.get('kind') == 'weapon' for job in state.worker_item_jobs.values()):
         return 0
     return max(0, next_weapon_voucher_cost(state) - (state.team_our.gold_num if state.team_our else 0))
+
+
+def team_voucher_quote_covers(state):
+    """已知报价下，全队现金加工人铜铁是否够一张必要券。缺报价时返回 False，不假装够。"""
+    gap = voucher_funding_gap(state)
+    if gap <= 0:
+        return True
+    return team_metal_inventory_value(state) >= gap
 
 
 def _voucher_holder(role):
@@ -563,18 +600,50 @@ def liquidate(role, state, blocked, reserved):
             committed.remove(role.id)
         return False, None
     prices = ore_prices(state)
-    value = sum(prices.get(name, 0) * count for name, count in ores.items())
+    quoted_value = sum(prices.get(name, 0) * count for name, count in ores.items())
+    value_unknown = any(item in ('iron', 'copper') and prices.get(item, 0) <= 0
+                        for item in role.backpack)
+    value = quoted_value
     triggers = []
     from .brain import should_upgrade_weapon
+    from .opening import OPENING_METAL_BATCH, day_rounds_remaining, live_l2_weapon_count, REQUIRED_OPENING_UPGRADES
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
     need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
     gap = voucher_funding_gap(state)
     cap = role.back_pack_capability or 0
     fill = (len(role.backpack) / cap) if cap else 1.0
-    if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and value >= gap:
+    metal_count = worker_metal_count(role)
+    first_upgrade_open = live_l2_weapon_count(state) < REQUIRED_OPENING_UPGRADES
+    team_covers = team_voucher_quote_covers(state)
+    cashout_id = opening_cashout_owner(state)
+    designated = cashout_id == role.id or role.id in committed
+    holders = sum(1 for r in (state.team_our.roles if state.team_our else [])
+                  if r.role_type == 'worker' and r.health > 0 and worker_has_metal(r))
+    near_cutoff = day_rounds_remaining(state.round_no) <= PRE_NIGHT_CASHOUT_LEAD
+    pack_full = fill >= 1.0 or (cap and len(role.backpack) >= cap)
+    if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and (
+            quoted_value >= gap or (value_unknown and metal_count)):
         triggers.append('卖掉本包后工人去买武器升级券')
     if (state.round_no or 0) < 70:
-        if need_voucher and gap and state.team_our.gold_num + value >= next_weapon_voucher_cost(state):
+        if first_upgrade_open and metal_count:
+            if team_covers:
+                triggers.append('全队现金加已知矿物估值已够本次必要升级券')
+            if pack_full:
+                triggers.append('背包已满，主动变现铜铁')
+            if metal_count >= OPENING_METAL_BATCH:
+                triggers.append('铜铁达到批量阈值，前往小贩')
+            if near_cutoff:
+                triggers.append('接近白天截止，先卖掉铜铁')
+            if value_unknown:
+                triggers.append('小贩暂无报价，仍出售铜铁等待快照金币')
+            if designated and holders >= 2:
+                triggers.append('两名工人都持有铜铁，指定一人汇总变现')
+            if designated and pack_full:
+                if '持矿工人无法继续有效采矿，先去变现' not in triggers:
+                    triggers.append('持矿工人无法继续有效采矿，先去变现')
+            if not triggers and role.id not in committed:
+                return False, None
+        elif need_voucher and gap and state.team_our.gold_num + quoted_value >= next_weapon_voucher_cost(state):
             triggers.append('现金加本包估值已够本次必要升级券')
         elif not triggers and role.id not in committed:
             return False, None
@@ -613,8 +682,13 @@ def liquidate(role, state, blocked, reserved):
         return False, None
     if role.id not in committed:
         committed.append(role.id)
+    if value_unknown:
+        trace(state, role.id, 'sale_value_unknown',
+              '小贩暂无铜铁报价，仍执行出售并等待服务器快照金币',
+              sellable=dict(ores), quoted_value=quoted_value, known_prices=prices)
     trace(state, role.id, 'cashout_priority', '急用立即变现，入夜前清空背包换成火力', triggers=triggers,
-          sellable=dict(ores), quoted_value=value, known_prices=prices,
+          sellable=dict(ores), quoted_value=quoted_value, sale_value_unknown=value_unknown,
+          known_prices=prices,
           stone_reserved=role.backpack.count('stone')-ores.get('stone', 0),
           trip_rounds=sale_rounds, threat_eta=arrival, fill_ratio=round(fill, 2))
     if not path:
@@ -707,10 +781,9 @@ def voucher_collect_plan(role, state, blocked, reserved, mine, remaining_value, 
 
 
 def voucher_ore_remaining_value(role, state):
-    """当前金币加本人背包铜铁后，买一张武器升级券还差多少。"""
-    from .brain import item_cost
+    """当前金币加全队工人铜铁已知估值后，买一张武器升级券还差多少。无报价不计收益。"""
     gold = state.team_our.gold_num if state.team_our else 0
-    return max(0, item_cost('WeaponUpgradeVoucher1', state) - gold - metal_inventory_value(role, state))
+    return max(0, next_weapon_voucher_cost(state) - gold - team_metal_inventory_value(state))
 
 
 def vendor_return_steps(mine, state, blocked, reserved):
@@ -761,7 +834,25 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
             plan = voucher_collect_plan(
                 role, state, blocked, reserved, mine, remaining_value, prices=prices, path=path,
             )
-            if plan is None or not plan['fits_backpack']:
+            if plan is None:
+                if remaining_value <= 0 or prices.get(mine.neutral_type, 0) > 0:
+                    return None
+                path_len = len(path)
+                return_len = vendor_return_steps(mine, state, blocked, reserved)
+                batch = trip_collect_limit(
+                    role, state, path_len=path_len, return_len=return_len, purpose=purpose,
+                )
+                if batch <= 0:
+                    return None
+                plan = {
+                    'rounds': path_len + batch + return_len,
+                    'units': batch,
+                    'path_len': path_len,
+                    'vendor_len': return_len,
+                    'fits_backpack': True,
+                }
+                return -plan['rounds'], plan['units'], plan['path_len'], plan['vendor_len'], plan
+            if not plan['fits_backpack']:
                 return None
             return -plan['rounds'], plan['units'], plan['path_len'], plan['vendor_len'], plan
         path_len = len(path)

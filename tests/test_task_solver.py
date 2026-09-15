@@ -437,6 +437,42 @@ class TaskSolverTests(unittest.TestCase):
         self.assertIn('部署任务首次探查', DEPLOYMENT_SOP)
         self.assertNotIn(DEPLOYMENT_SOP, BASE_PROMPT)
         self.assertNotIn('部署任务首次探查', self.post()['prompt'])
+        self.assertIn('curl -G --data-urlencode', self.post()['prompt'])
+        self.assertIn('通用求解', self.post()['prompt'])
+        self.assertNotIn('部署修复 SOP', self.post()['prompt'])
+
+    def test_llm_curl_runs_raw_then_solver_paginates(self):
+        self.payload['phaseTask'] = (
+            '调用API查询北京遗产。密钥：tok-1。'
+            '提交{"city":"北京","total_count":0,"world_heritage_count":0,"types":[],"oldest_era":"名称"}'
+        )
+        first = self.post()
+        self.assertTrue(first['prompt'])
+        self.assertFalse(first.get('executeCmd'))
+        curl = (
+            'curl -sS -G --max-time 8 -w HTTPSTATUS:%{http_code} '
+            '--data-urlencode location=北京 '
+            'http://127.0.0.1:8080/api/v1/heritage/search'
+        )
+        issued = self.next_round(llmResp=json.dumps({'action': 'execute', 'command': curl}))
+        self.assertTrue(issued['executeCmd'].lstrip().startswith('curl '))
+        self.assertNotIn('python3', issued['executeCmd'])
+        records = [
+            {'id': i, 'name': 'n%s' % i, 'type': '坛庙', 'protected_level': '市级', 'era': 1400 + i}
+            for i in range(10)
+        ]
+        page = json.dumps({
+            'code': 200,
+            'data': {
+                'records': records,
+                'pagination': {'total_count': 15, 'offset': 0, 'limit': 10},
+            },
+        }, ensure_ascii=False)
+        cont = self.next_round(lastCmdResult='[exitCode:0]\n%s\nHTTPSTATUS:200' % page)
+        self.assertNotIn('10011', cont.get('roleCommandMap') or {})
+        self.assertTrue((cont.get('executeCmd') or '').lstrip().startswith('curl '))
+        self.assertIn('offset', cont['executeCmd'])
+        self.assertTrue(self.server.task_solver.session.get('apiReplay'))
 
     def test_long_check_output_token_is_taken_from_tail(self):
         solver = PioneerTaskSolver(self.root / 'state')
