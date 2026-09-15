@@ -132,7 +132,10 @@ def illegal_switches(trail):
         'backpack_full', 'gold_ready', 'have_voucher', 'muster', 'survival_wall',
         'build_weapons', 'wait_in_yard', 'blocked_by_nonstone_inventory', 'at_post',
         'stage_change', 'batch_not_ready', 'batch_ready', 'mine_exhausted',
-        'wall_stage_metal_unused', 'muster_cashout_before_night',
+        'wall_stage_metal_unused', 'muster_cashout_before_night', 'urgent_wall',
+        'clearly_closer', 'nearest_relaxed_reserved', 'sticky_relaxed_reserved',
+        'clearly_closer_relaxed_reserved', 'stalled_relaxed_reserved',
+        'sticky_gone_relaxed_reserved', 'sticky_stalled_relaxed_reserved',
     }
     return [row for row in trail if row.get('switch_reason') not in allowed]
 
@@ -263,8 +266,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
                       if e.get('code') == 'worker_no_command' and e.get('worker_state') == 'BUILD_WEAPONS']
         self.assertEqual(no_command, [])
 
-    def test_stone_batches_before_building_walls(self):
-        """回归：不能采一块石头就跑回去建一道墙，要先攒够一批再成片建造。"""
+    def test_stone_goes_to_wall_without_waiting_for_batch(self):
+        """第一天生存墙优先：采到石头就先补关键墙，不再等满一批。"""
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -274,21 +277,12 @@ class OpeningFsmTrailTests(unittest.TestCase):
         ]
         trail = run_opening(state, 40)
         wall_rows = [r for r in trail if r['worker_id'] == 1 and r['stage'] == STAGE_WALL]
-        collect_streak = 0
-        single_stone_builds = 0
-        for row in wall_rows:
-            if row['action'] == 'collect':
-                collect_streak += 1
-            elif row['action'] == 'build' and row['goal_type'] == 'wall':
-                if collect_streak == 1:
-                    single_stone_builds += 1
-                collect_streak = 0
         builds = [r for r in wall_rows if r['action'] == 'build' and r['goal_type'] == 'wall']
         self.assertGreater(len(builds), 0)
-        self.assertEqual(single_stone_builds, 0)
+        self.assertTrue(any(r.get('switch_reason') == 'urgent_wall' for r in wall_rows))
 
-    def test_opening_wall_work_keeps_mining_until_batch_ready(self):
-        """opening_wall_work 单测：手上只有 1 块石头、缺口还很多时应继续囤石，不直接去建墙。"""
+    def test_opening_wall_work_builds_with_one_stone(self):
+        """opening_wall_work 单测：手上只有 1 块石头也先补生存墙。"""
         from src.agent.opening_schedule import opening_wall_work
         from src.agent.opening import movement_avoid
         state = opening_state()
@@ -303,14 +297,52 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
-        self.assertEqual(tick.get('goal_type'), 'stone')
+        self.assertEqual(tick.get('goal_type'), 'wall')
+        self.assertEqual(tick.get('switch_reason'), 'urgent_wall')
 
         worker.backpack = ['stone'] * 6
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick2 = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
         self.assertEqual(tick2.get('goal_type'), 'wall')
-        self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
+        self.assertEqual(tick2.get('switch_reason'), 'urgent_wall')
+
+    def test_claimed_mine_does_not_force_large_detour(self):
+        from src.agent.opening_schedule import choose_nearest_mine
+        from src.agent.opening import movement_avoid
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(7, 9)
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone'), Zone(Pos(20, 20), 'stone')]
+        state.policy_memory['mine_targets'] = {'2': {'x': 6, 'y': 9, 'ore': 'stone'}}
+        blocked = build_blocked_set(state) | movement_avoid(state)
+        mine, path, reason = choose_nearest_mine(worker, state, blocked, set(), ('stone',))
+        self.assertEqual((mine.pos.x, mine.pos.y), (6, 9))
+        self.assertEqual(path, [])
+
+    def test_clearly_closer_mine_breaks_sticky_goal(self):
+        from src.agent.opening_schedule import choose_nearest_mine
+        from src.agent.opening import movement_avoid
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(7, 9)
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone'), Zone(Pos(20, 20), 'stone')]
+        state.policy_memory['opening_worker_goals'] = {
+            '1': {
+                'stage': STAGE_WALL, 'kind': 'mine', 'target_type': 'stone',
+                'target_pos': [20, 20], 'stalled_rounds': 0, 'last_pos': [7, 9],
+            }
+        }
+        blocked = build_blocked_set(state) | movement_avoid(state)
+        mine, path, reason = choose_nearest_mine(worker, state, blocked, set(), ('stone',))
+        self.assertEqual((mine.pos.x, mine.pos.y), (6, 9))
+        self.assertEqual(reason, 'clearly_closer')
 
     def test_wall_stage_sells_metal_even_when_backpack_not_full(self):
         """回归：修墙阶段背包没满也不能一直攥着铜铁不出手，浪费到入夜。"""

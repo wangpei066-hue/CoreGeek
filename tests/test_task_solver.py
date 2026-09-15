@@ -93,6 +93,16 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return '[exitCode:0]\n' + result.stdout
 
+    def sandbox_without_python(self, command):
+        sh_path = shutil.which('sh')
+        if not sh_path:
+            self.skipTest('需要 POSIX sh；请在 Linux 比赛运行环境补跑沙盒集成测试')
+        env = {'PATH': str(Path(sh_path).parent)}
+        result = subprocess.run(['sh', '-c', command], cwd=self.temp.name, capture_output=True,
+                                text=True, timeout=12, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
     def test_no_task_returns_empty_and_clears_session(self):
         commands = {}
         prompt, execute = self.solver.step(self._state(None), commands)
@@ -137,6 +147,22 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
 
+    def test_sandbox_command_falls_back_when_python3_missing(self):
+        doc = Path(self.temp.name) / 'fallback.md'
+        doc.write_text('fallback-ok', encoding='utf-8')
+        read_cmd = sandbox_command(READ_SCRIPT, dict(requestId='fallback-read', path=str(doc),
+                                                     offset=0, documentDir='', workspace=''))
+        read_back = self.sandbox_without_python(read_cmd)
+        self.assertIn('"event":"read_document"', read_back)
+        self.assertIn('fallback-ok', read_back)
+
+        exec_cmd = sandbox_command(EXEC_SCRIPT, dict(requestId='fallback-exec',
+                                                     command='printf tool-ok', workspace=''))
+        exec_back = self.sandbox_without_python(exec_cmd)
+        self.assertIn('"event":"execute_tool"', exec_back)
+        self.assertIn('tool-ok', exec_back)
+        self.assertIn('"exitCode":0', exec_back)
+
         state = self._state(state.phase_task, round_no=11,
                             llm_resp=json.dumps({'action': 'execute', 'command': 'echo ready'}))
         prompt, execute = self.solver.step(state, commands)
@@ -173,6 +199,25 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(any('submissionRejected' in item for item in self.solver.session['history']))
 
+    def test_empty_llm_response_waits_before_reasking(self):
+        state = self._state('直接提交一个答案')
+        commands = {}
+        prompt, _ = self.solver.step(state, commands)
+        self.assertTrue(prompt)
+        calls = self.solver.session['calls']
+
+        state = self._state(state.phase_task, round_no=11, llm_resp='')
+        prompt, execute = self.solver.step(state, commands)
+        self.assertEqual((prompt, execute), ('', ''))
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertEqual(self.solver.session['calls'], calls)
+
+        state = self._state(state.phase_task, round_no=12, llm_resp='')
+        prompt, _ = self.solver.step(state, commands)
+        self.assertTrue(prompt)
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertEqual(self.solver.session['calls'], calls + 1)
+
     def test_same_round_replay_returns_cached_response(self):
         doc = Path(self.temp.name) / 'guide.md'
         doc.write_text('答案是7')
@@ -198,3 +243,53 @@ class TaskSolverStepTests(unittest.TestCase):
         state = self._state('完全不同的第二个任务', round_no=20)
         self.solver.step(state, {})
         self.assertEqual(self.solver.session['paths'], [])
+
+    def test_business_error_read_result_not_added_as_document(self):
+        """not_found/ambiguous_path 等业务错误不能被当成读到的文档内容。"""
+        state = self._state('阅读 missing.md')
+        commands = {}
+        self.solver.step(state, commands)
+        rid = self.solver.session['requestId']
+        error_result = json.dumps({'marker': MARKER, 'requestId': rid, 'event': 'read_document',
+                                    'error': 'not_found', 'candidates': []})
+        state = self._state(state.phase_task, round_no=11, last_cmd_result=error_result)
+        self.solver.step(state, commands)
+        self.assertEqual(self.solver.session['documents'], [])
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertTrue(any(item.get('readError') == 'not_found' for item in self.solver.session['history']))
+
+    def test_ambiguous_result_reported_with_distinct_candidates(self):
+        state = self._state('阅读 spec.md')
+        commands = {}
+        self.solver.step(state, commands)
+        rid = self.solver.session['requestId']
+        amb_result = json.dumps({'marker': MARKER, 'requestId': rid, 'event': 'read_document',
+                                  'error': 'ambiguous_path', 'candidates': ['/a/spec.md', '/b/spec.md']})
+        state = self._state(state.phase_task, round_no=11, last_cmd_result=amb_result)
+        self.solver.step(state, commands)
+        entry = next(item for item in self.solver.session['history'] if item.get('readError') == 'ambiguous_path')
+        self.assertEqual(entry['candidates'], ['/a/spec.md', '/b/spec.md'])
+        self.assertEqual(len(set(entry['candidates'])), 2)
+
+    def test_malformed_json_result_does_not_spuriously_retry_forever(self):
+        """requestId 匹配但结构不合法（如缺字段）的结果要能明确识别为 malformed，
+        并在有限轮内转 ask，而不是被当成 None 陷入无穷等待/覆盖已成功结果。"""
+        state = self._state('阅读 x.md')
+        commands = {}
+        self.solver.step(state, commands)
+        rid = self.solver.session['requestId']
+        bad = json.dumps({'marker': MARKER, 'requestId': rid, 'event': 'read_document'})  # 缺 path/content 等字段
+        for round_no in (11, 12, 13):
+            state = self._state(state.phase_task, round_no=round_no, last_cmd_result=bad)
+            self.solver.step(state, commands)
+        # 3 次以内必须已经放弃重试、转去问 LLM，不再是 wait_read 死等。
+        self.assertIn(self.solver.session['stage'], ('wait_llm', 'ask'))
+
+    def test_documentDir_backward_compatible_default(self):
+        """旧会话文件没有 documentDir 字段时，应退化为旧的 workspace 值，不报错。"""
+        state = self._state('工作区为 /srv/app/，阅读 API_DOCS.md')
+        self.solver.step(state, {})
+        del self.solver.session['documentDir']
+        state = self._state(state.phase_task, round_no=state.round_no)
+        self.solver.step(state, {})
+        self.assertEqual(self.solver.session.get('documentDir'), self.solver.session.get('workspace'))

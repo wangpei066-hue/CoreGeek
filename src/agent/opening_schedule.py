@@ -20,6 +20,8 @@ LEGAL_TRANSITIONS = {
 FIRST_UPGRADE_CUTOFF = 40
 GOAL_SWITCH_PENALTY = 4
 GOAL_STALL_ROUNDS = 3
+MINE_CLEARLY_CLOSER_STEPS = 2
+CLAIMED_MINE_MAX_DETOUR = 3
 WORKER_GOALS_KEY = 'opening_worker_goals'
 
 
@@ -234,8 +236,9 @@ def _tick(state, role, stage, kind, target_type, target_pos, distance, action, s
 
 
 def choose_nearest_mine(role, state, blocked, reserved, want_ores):
-    """最近可达矿点。报价未知只用路径长度；已知报价才用 path/value。粘性目标加切换惩罚。"""
+    """选可达矿点。第一天优先少走冤枉路：明显更近的矿能打破粘性和占矿。"""
     from .economy import claimed_mines, ore_prices, set_mine_target
+    from .economy import vendor_return_steps
     from .opening import adjacent_path
     if state.map_info is None:
         return None, None, 'no_map'
@@ -246,48 +249,78 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
     sticky = None
     if goal and goal.get('kind') == 'mine' and goal.get('target_pos'):
         sticky = tuple(goal['target_pos'])
-    best = None
+    candidates = []
     sticky_cand = None
     for mine in state.map_info.zones:
         if mine.neutral_type not in want_ores:
             continue
         path = adjacent_path(role, mine.pos, blocked | reserved, state)
+        relaxed_reserved = False
+        if path is None and reserved:
+            path = adjacent_path(role, mine.pos, blocked, state)
+            relaxed_reserved = path is not None
         if path is None:
             continue
         pos = (mine.pos.x, mine.pos.y)
         length = len(path)
-        penalty = GOAL_SWITCH_PENALTY if sticky and pos != sticky else 0
         value = prices.get(mine.neutral_type, 0)
-        if known and value > 0:
-            score = (length + penalty) / value
+        if known and value > 0 and want_ores != ('stone',):
+            value_score = (length + vendor_return_steps(mine, state, blocked, reserved)) / value
         else:
-            score = length + penalty
+            value_score = length
         claimed = 1 if pos in occupied else 0
-        row = (claimed, score, length, mine, path)
+        row = dict(
+            claimed=claimed, value_score=value_score, length=length, mine=mine,
+            path=path, pos=pos, relaxed_reserved=relaxed_reserved,
+        )
+        candidates.append(row)
         if sticky and pos == sticky:
             sticky_cand = row
-        if best is None or row[:3] < best[:3]:
-            best = row
+    if not candidates:
+        return None, None, 'unreachable'
+
+    nearest = min(candidates, key=lambda row: (row['length'], row['claimed'], row['value_score'], row['pos']))
+    best_unclaimed = min(
+        (row for row in candidates if not row['claimed']),
+        key=lambda row: (row['value_score'], row['length'], row['pos']),
+        default=None,
+    )
+    if best_unclaimed is None:
+        best = nearest
+    elif best_unclaimed['length'] - nearest['length'] > CLAIMED_MINE_MAX_DETOUR:
+        best = nearest
+    else:
+        best = best_unclaimed
+
     if sticky_cand is not None:
         stalled = int((goal or {}).get('stalled_rounds') or 0)
         oscillating = bool((goal or {}).get('oscillation_detected'))
-        if oscillating or stalled < GOAL_STALL_ROUNDS:
-            mine, path = sticky_cand[3], sticky_cand[4]
+        clearly_closer = best['length'] + MINE_CLEARLY_CLOSER_STEPS <= sticky_cand['length']
+        if not clearly_closer and (oscillating or stalled < GOAL_STALL_ROUNDS):
+            mine, path = sticky_cand['mine'], sticky_cand['path']
             set_mine_target(state, role.id, mine)
-            return mine, path, 'sticky'
-        mine, path = sticky_cand[3], sticky_cand[4]
-        if best and (best[3].pos.x, best[3].pos.y) != (mine.pos.x, mine.pos.y):
-            set_mine_target(state, role.id, best[3])
-            return best[3], best[4], 'stalled'
+            reason = 'sticky_relaxed_reserved' if sticky_cand['relaxed_reserved'] else 'sticky'
+            return mine, path, reason
+        mine, path = sticky_cand['mine'], sticky_cand['path']
+        if best and best['pos'] != (mine.pos.x, mine.pos.y):
+            set_mine_target(state, role.id, best['mine'])
+            if clearly_closer:
+                reason = 'clearly_closer'
+            else:
+                reason = 'stalled'
+            if best['relaxed_reserved']:
+                reason += '_relaxed_reserved'
+            return best['mine'], best['path'], reason
         set_mine_target(state, role.id, mine)
-        return mine, path, 'sticky_stalled'
-    if best is None:
-        return None, None, 'unreachable'
-    set_mine_target(state, role.id, best[3])
+        reason = 'sticky_stalled_relaxed_reserved' if sticky_cand['relaxed_reserved'] else 'sticky_stalled'
+        return mine, path, reason
+    set_mine_target(state, role.id, best['mine'])
     reason = 'nearest'
-    if sticky and (best[3].pos.x, best[3].pos.y) != sticky:
+    if sticky and best['pos'] != sticky:
         reason = 'sticky_gone'
-    return best[3], best[4], reason
+    if best['relaxed_reserved']:
+        reason += '_relaxed_reserved'
+    return best['mine'], best['path'], reason
 
 
 def _backpack_full(role):
@@ -430,7 +463,7 @@ def opening_muster(role, state, blocked, reserved, assignments, stage):
 
 
 def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
-    """先攒够一批石头再回去成片建墙，不要采一块就往返建一道。"""
+    """首日生存墙优先：少量石头也先补关键缺口，避免囤石拖过入夜。"""
     from .opening import STONE_BATCH, claim_opening_wall, survival_wall_missing
     missing = survival_wall_missing(state)
     stones = (role.backpack or []).count('stone')
@@ -438,7 +471,8 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     pack_full = bool(cap and len(role.backpack or []) >= cap)
     # 只备够这名工人这趟真正用得上的量：不超过 STONE_BATCH，也不超过缺口数。
     batch_target = min(STONE_BATCH, len(missing)) if missing else 0
-    batch_ready = stones >= batch_target if batch_target else stones > 0
+    urgent_ready = stones > 0
+    batch_ready = (stones >= batch_target if batch_target else stones > 0) or urgent_ready
     mine_exhausted = False
     if missing and stones > 0 and not pack_full and not batch_ready:
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
@@ -461,7 +495,10 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
             if cmd.get('action') in ('build', 'move'):
                 tp = cmd.get('targetPos') or [{}]
                 target = (tp[0].get('x'), tp[0].get('y'))
-            switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
+            if urgent_ready:
+                switch = 'urgent_wall'
+            else:
+                switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
             return _tick(state, role, STAGE_WALL, 'wall', 'wall', target, 0 if cmd.get('action') == 'build' else 1,
                          cmd.get('action'), switch, cmd)
     if _metal_count(role):
