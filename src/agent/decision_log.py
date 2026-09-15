@@ -268,6 +268,9 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "diagnostics": metrics,
         "phase": phase, "phase_basis": "策略按roundNo从0起算；官方起点尚待核验",
+        # phaseTask 是 pioneer 接取任务后由系统返回的任务原文；写入决策日志，
+        # 使接取动作与后续收到的任务内容可以在同一日志序列中关联。
+        "phase_task": state.phase_task,
         "decision_ms": round(elapsed_ms, 3),
         "summary": {"gold": before["gold"], "weapons": sum(counts[t] for t in ("gatling", "railgun", "rocket")),
                     "walls": counts["wall"], "bases": [asdict(r) for r in roles if r.role_type == "station"],
@@ -320,3 +323,37 @@ def write_report(log_dir, report):
                          (".txt", render_text(report))):
         with (log_dir / (stem + suffix)).open("x", encoding="utf-8") as stream:
             stream.write(text)
+
+
+def emit_console_report(report):
+    """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
+
+    本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
+    任务原文、背包明细或重复路径事件刷满平台输出。
+    """
+    role_reports = []
+    for role in report["roles"]:
+        reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
+                   for event in role["events"]]
+        role_reports.append({
+            "id": role["role_id"], "type": role["role_type"],
+            "pos": role["position"], "status": role["status"],
+            "health": role["health"], "backpackCounts": role["backpack"],
+            "commandKey": role["command_key"], "command": role["command"],
+            "reasons": reasons, "pendingBuild": role["pending_build"],
+            "itemJob": role["item_job"],
+        })
+    record = {
+        "marker": CONSOLE_MARKER, "sequence": report["sequence"],
+        "roundNo": report["round"], "phase": report["phase"],
+        "summary": report["summary"], "roles": role_reports,
+        "globalEvents": [event for event in report["events"] if event["role_id"] is None],
+        "previousFeedback": report["previous_feedback"],
+        "systemErrors": report["system_errors"],
+        "observedChanges": report["observed_changes"],
+        "decisionMs": report["decision_ms"],
+        "schemaVersion": report['schema_version'],
+        "timestampUtc": report['timestamp_utc'],
+        "diagnostics": report.get('diagnostics', {}),
+    }
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
