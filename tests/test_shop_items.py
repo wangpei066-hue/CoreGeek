@@ -189,6 +189,39 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["kind"], "station")
         self.assertEqual(job["item"], "StationUpgradeVoucher1")
 
+    def test_day2_low_base_station_before_third_level2_weapon(self):
+        state = minimal_state(gold_num=200)
+        state.round_no = 140
+        state.team_our.roles[0].level = 1
+        state.team_our.roles[0].health = 700
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        self.assertEqual(job["kind"], "station")
+        self.assertEqual(job["item"], "StationUpgradeVoucher1")
+
+    def test_day2_healthy_base_third_weapon_before_station(self):
+        state = minimal_state(gold_num=200)
+        state.round_no = 140
+        state.team_our.roles[0].level = 1
+        state.team_our.roles[0].health = 1500
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        self.assertEqual(job["kind"], "weapon")
+        self.assertEqual(job["target"], (12, 12))
+        self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
+
     def test_station_voucher_held_during_day_when_base_unhurt(self):
         from src.agent.grid import build_blocked_set
         state = minimal_state(gold_num=0)

@@ -362,8 +362,8 @@ def station_voucher_use_now(state: "MatchState") -> bool:
 
 
 def defer_new_weapon_for_station(state: "MatchState") -> bool:
-    """第三天基地仍是 1 级且买得起/已持券时，新的武器升级让位。"""
-    if not structure_priority_day(state):
+    """基地券已成为当前优先级且买得起/已持券时，新的武器升级让位。"""
+    if not (structure_priority_day(state) or station_low_health_upgrade_pending(state)):
         return False
     station = own_station(state)
     if not station or (station.level or 1) >= 2:
@@ -381,6 +381,20 @@ def all_weapons_level_at_least(state: "MatchState", level: int, need: int = 3) -
     return len(weapons) >= need and all((w.level or 1) >= level for w in weapons)
 
 
+def station_low_health_upgrade_pending(state: "MatchState") -> bool:
+    """第二天起：两门武器已到2级且基地低于半血时，先升基地回血。"""
+    station = own_station(state)
+    if not station or (station.level or 1) >= 2:
+        return False
+    day = (state.round_no or 0) // DAY_NIGHT_CYCLE
+    if day < 1:
+        return False
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
+    if sum((w.level or 1) >= 2 for w in weapons) < 2:
+        return False
+    return station.health < max_health(station) * 0.5
+
+
 def station_first_upgrade_pending(state: "MatchState") -> bool:
     """三门炮都到 2 级且尚未开始三级时，先把基地升一次（1→2）。"""
     station = own_station(state)
@@ -395,10 +409,12 @@ def station_first_upgrade_pending(state: "MatchState") -> bool:
 
 
 def station_l2_upgrade_pending(state: "MatchState") -> bool:
-    """基地 1→2：第三天起优先；此前仍要求三炮二级且未进三级。"""
+    """基地 1→2：第二天低血抢救；第三天起优先；健康时仍要求三炮二级。"""
     station = own_station(state)
     if not station or (station.level or 1) >= 2:
         return False
+    if station_low_health_upgrade_pending(state):
+        return True
     if structure_priority_day(state):
         return True
     return station_first_upgrade_pending(state)
@@ -444,7 +460,7 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
         if day == 1:
             if l2 < 2:
                 return True
-            return walls >= DAY2_WALL_TARGET
+            return not station_l2_upgrade_pending(state)
         return True
     if station_first_upgrade_pending(state) or station_l2_upgrade_pending(state):
         return False
