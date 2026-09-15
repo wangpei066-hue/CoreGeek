@@ -10,6 +10,7 @@ from .protocol import (
 from .decision_log import trace, selected
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
+from .task_solver import MIN_TASK_TIMEOUT_ROUNDS
 
 
 DAY_ROUNDS = 70
@@ -869,12 +870,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
                   '无法在威胁到达前提交，或两门炮守不住当前波次，回炮；题目会话保留')
             return False, None
         return True, decide_emergency_heal(pioneer, state) or decide_self_heal(pioneer)
-    memory = getattr(state, "news_memory", None)
-    if memory is not None:
-        from .treasure import decide_treasure_action, treasure_should_claim_pioneer
-        if treasure_should_claim_pioneer(state, pioneer, memory):
-            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
-            return True, cmd
     if defense_due(pioneer, state, blocked):
         trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务')
         return False, None
@@ -885,11 +880,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         key=lambda t: (chebyshev(pioneer.pos, t.task_position), t.task_type),
     )
     if not candidates:
-        if memory is not None:
-            from .treasure import decide_treasure_action
-            cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
-            if cmd:
-                return True, cmd
         return False, None
     for task in candidates:
         from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
@@ -907,6 +897,11 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
         if not night_wave_cleared(state) and (arrival is None or required >= arrival):
             trace(state, pioneer.id, 'task_not_enough_time', '任务行程、执行与回防余量不足，不再接取',
                   required_rounds=required, threat_eta=arrival)
+            continue
+        if task.timeout_rounds is not None and task.timeout_rounds < MIN_TASK_TIMEOUT_ROUNDS:
+            trace(state, pioneer.id, 'task_timeout_too_short',
+                  '平台给出的时限不够完成探查、修复与提交，不接这单',
+                  task_type=task.task_type, timeout_rounds=task.timeout_rounds)
             continue
         if chebyshev(pioneer.pos, task.task_position) <= 1:
             return True, {"action": "acceptTask"}
@@ -942,10 +937,6 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
     if handled:
         return cmd
     handled, command = decide_pioneer_task(pioneer, state, blocked, reserved)
-    if handled:
-        return command
-    from .world_intel import decide_treasure
-    handled, command = decide_treasure(pioneer, state, blocked, reserved)
     if handled:
         return command
     cmd = tactical_action(pioneer, state, blocked, reserved)

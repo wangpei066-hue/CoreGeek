@@ -17,7 +17,7 @@
 | `BUILD_WALL` | 每回合 | 一层/二层进度、缺口、本回合砌墙或采石 |
 | `PIONEER_TASK` | 每回合总览；接取/解题时另有 solver 行 | `event=round` 看本回合接取/提交；`accept_requested` / `task_active` 看解题细节 |
 | `ECONOMY` | **仅采矿/卖矿有动作或相关事件时** | 本回合采集/出售 |
-| `NEWS_INFER` | **有新闻事件时**（不是每回合快照） | 官方消息、传闻、LLM 的 `promptText` 与 `parsedJson` |
+| `NEWS_INFER` | **有新闻事件或当前计划 JSON 时** | `official_plan` / `folk_plan` 决策 JSON（仅记录，不指挥角色）；LLM 的 `promptText` / `parsedJson` |
 
 完整分支原因、背包明细、路径事件仍在本地 `logs/decision_NNNNNN.json`。
 
@@ -65,28 +65,31 @@
 
 仅在本回合有采矿、卖矿或对应事件时输出。`thisRound` + `actors` 估值。
 
-## NEWS_INFER（有内容才打）
+## NEWS_INFER（官方消息 / 民间传闻 两条线）
 
-| event | 关键字段 |
-| --- | --- |
-| `official_ingested` | `officialNews` 全文、`oreEffect`（启发式可能为 null） |
-| `folk_ingested` | `newLegend`、累计 `legends` |
-| `prompt_sent` | `consumer` 为 `ore` / `treasure` / `intel`，**完整 `promptText`** |
-| `llm_output` | 同一 `promptText` + `llmRespRaw` + `parsedJson` + `parseOk` / `applied` |
-| `llm_empty` | 等待中的 LLM 空响应 |
-| `summon_result` | `resultCode` 召唤宝藏结果 |
+任务书把世界新闻分成两类，日志也按两类搜：
 
-不要把 `world_intel` 的 ingest 再记成一遍 `official_ingested`（与 `news_memory` 重复）。情报链路只记 `consumer=intel` 的 prompt/输出。
+| event | 存哪 | 看什么 |
+| --- | --- | --- |
+| `official_ingested` | — | 新官方消息原文 |
+| **`official_plan`** | **`news_memory.officialPlan`** | **`plan` JSON**：`oreEffects`、今日 `bannedOres` / `stockpileOres` / `priceUpOres`。当前不指挥工人 |
+| `folk_ingested` | — | 新传闻原文、累计 `legends` |
+| **`folk_plan`** | **`news_memory.folkPlan`** | **`plan` JSON**：`ready`、`confidence`(0–1)、`altarPos`、`items`、开启窗口、`notes`。仅 LLM 写入；当前不指挥开拓者 |
+| `prompt_sent` | LLM | `consumer` 为 `ore` 或 `treasure`（不再混合），完整 `promptText` |
+| `llm_output` | LLM | `parsedJson` + 落地后的 `plan` |
+| `llm_empty` | LLM | 等待中的响应为空 |
 
-同一回合可能先发 `intel` prompt、再申请 `treasure`/`ore`；HTTP 响应里的 `prompt` 只能带一条（自进化 > intel > news_memory）。stderr 会记下实际申请过的 prompt，下载时以 `prompt_sent` 为准。
+处理顺序：官方消息先启发式写入 `officialPlan`，再申请矿价 LLM 覆盖同一份 JSON；民间传闻只累积原文并申请宝藏 LLM，**不做正则启发式**。两份 JSON 只落盘并打日志，不改工人采矿/卖矿，也不改开拓者买物/召唤。
 
-无自进化 `phaseTask`、且本回合有新闻推断活动时，再经 `executeCmd` 的 `printf` 回传一份摘要（含 `worldNews`、`promptText`、`oreEffects`）。有自进化任务时不抢沙盒。
+每回合有日程时，`emit_console_report` 会再打一行当前 `official_plan` / `folk_plan`，平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"` 即可。
+
+不要再搜 `consumer=intel`：混合情报 prompt 已去掉。
 
 ## 建议搜索顺序
 
-1. `title` 或 `【武器】` / `【围墙】` / `【新闻】` / `【LLM】`
+1. `"event":"official_plan"` / `"event":"folk_plan"` 看当前决策 JSON
 2. `"marker":"NEWS_INFER"` 再筛 `"event":"llm_output"`
 3. `"marker":"BUILD_WEAPON"` 看 `thisRound`
-4. `"marker":"PIONEER_TASK"` 且 `event` 为 `accept_requested` 或 `task_active`
+4. `"marker":"PIONEER_TASK"` 且 `event` 为 `accept_requested`、`task_active`
 
 发出接取或提交不代表成功，需对照下一回合动作结果与系统错误。

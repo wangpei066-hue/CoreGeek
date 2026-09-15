@@ -16,6 +16,8 @@ BUILD_STONE_RESERVE = 4
 THIRD_NIGHT_ROUND = 330  # 第三天夜晚起点（round_no 从0起算的假设下）。
 PRE_NIGHT_CASHOUT_LEAD = 12  # 卖掉之后还要留出买券/用券时间。
 PRE_NIGHT3_CASHOUT_LEAD = 20  # 第三晚压力大，更早把背包换成火力。
+MINE_TRIP_CAP = 6  # 本趟收益只按还能采的几下算，不用整包空位去抬远矿。
+MINE_TARGETS_KEY = 'mine_targets'
 
 
 def live_pioneer(state):
@@ -419,13 +421,6 @@ def sellable_ores(role, state, dump_extra_stone=False):
         if base.health < max_health(base) * 0.7:
             reserve = min(reserve, 1)
     ores['stone'] = max(0, ores['stone'] - reserve)
-    from .world_intel import ores_in_spike, ores_to_stockpile
-    backpack_tight = bool(role.back_pack_capability and len(role.backpack) >= role.back_pack_capability * 0.9)
-    if not backpack_tight:
-        spike = ores_in_spike(state)
-        for name in ores_to_stockpile(state):
-            if name not in spike:
-                ores[name] = 0
     return +ores
 
 
@@ -473,8 +468,6 @@ def liquidate(role, state, blocked, reserved):
     gap = voucher_funding_gap(state)
     cap = role.back_pack_capability or 0
     fill = (len(role.backpack) / cap) if cap else 1.0
-    from .world_intel import ores_in_spike
-    spiked = bool(ores_in_spike(state) & set(ores))
     if role.role_type == 'worker' and worker_should_shop_weapon_voucher(role, state) and gap and value >= gap:
         triggers.append('卖掉本包后工人去买武器升级券')
     if (state.round_no or 0) < 70:
@@ -487,8 +480,6 @@ def liquidate(role, state, blocked, reserved):
             triggers.append('卖掉本包即可完成必要武器升级')
         if role.health < max_health(role) * 0.6:
             triggers.append('低血量携矿风险')
-        if spiked:
-            triggers.append('官方消息涨价窗口，优先卖出对应矿石')
         if fill >= BATCH_FILL_RATIO:
             triggers.append('背包过半，批量变现')
         if cap and cap - len(role.backpack) <= NEAR_CAP_SLOTS:
@@ -529,47 +520,182 @@ def liquidate(role, state, blocked, reserved):
     return True, move_on_path(state, role, path, reserved, '本趟批量变现，不采一点卖一点')
 
 
-def profitable_mine(role, state, blocked, reserved):
-    """按本趟实际能采的数量估算收益：受背包剩余格约束，不再固定按10次采集。仅工人可 collect。"""
-    from .opening import adjacent_path, move_on_path
-    from .world_intel import ore_blocked, ores_to_stockpile
-    if role.role_type != 'worker':
-        trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
+def claimed_mines(state, exclude_role_id=None):
+    claimed = set()
+    for rid, target in (state.policy_memory.get(MINE_TARGETS_KEY) or {}).items():
+        if exclude_role_id is not None and str(rid) == str(exclude_role_id):
+            continue
+        if not isinstance(target, dict):
+            continue
+        try:
+            claimed.add((int(target['x']), int(target['y'])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return claimed
+
+
+def get_mine_target(state, role_id):
+    target = (state.policy_memory.get(MINE_TARGETS_KEY) or {}).get(str(role_id))
+    return target if isinstance(target, dict) else None
+
+
+def set_mine_target(state, role_id, mine):
+    mem = dict(state.policy_memory.get(MINE_TARGETS_KEY) or {})
+    mem[str(role_id)] = {'x': mine.pos.x, 'y': mine.pos.y, 'ore': mine.neutral_type}
+    state.policy_memory[MINE_TARGETS_KEY] = mem
+
+
+def clear_mine_target(state, role_id):
+    mem = dict(state.policy_memory.get(MINE_TARGETS_KEY) or {})
+    if str(role_id) not in mem:
+        return
+    mem.pop(str(role_id), None)
+    if mem:
+        state.policy_memory[MINE_TARGETS_KEY] = mem
+    else:
+        state.policy_memory.pop(MINE_TARGETS_KEY, None)
+
+
+def trip_collect_limit(role, state, path_len=0, return_len=0, purpose='income'):
+    """本趟还能采几下：背包空位、单趟上限、入夜/清包前剩余工时。"""
+    slots = max(0, (role.back_pack_capability or 1) - len(role.backpack))
+    cap = min(slots, MINE_TRIP_CAP)
+    if cap <= 0:
+        return 0
+    from .brain import is_day_round
+    from .opening import MUSTER_BUFFER
+    from .tactics import night_wave_cleared, threat_eta_to_base
+    if night_wave_cleared(state) or not is_day_round(state.round_no):
+        return cap
+    arrival = threat_eta_to_base(state)
+    if arrival is None:
+        return cap
+    lead = dusk_cashout_lead(state) if purpose == 'income' else 0
+    slack = arrival - lead - MUSTER_BUFFER - path_len - return_len
+    return max(0, min(cap, slack))
+
+
+def vendor_return_steps(mine, state, blocked, reserved):
+    """从矿点走到小贩邻格的寻路长度；没有小贩时采石建墙不依赖回程。"""
+    from .opening import adjacent_path
+    if state.map_info is None:
+        return 0
+    vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor']
+    if not vendors:
+        return 0
+    proxy = Role(id=-1, pos=mine.pos, role_type='worker', health=1)
+    best = None
+    for vendor in vendors:
+        path = adjacent_path(proxy, vendor.pos, blocked | reserved, state)
+        if path is None:
+            continue
+        n = len(path)
+        if best is None or n < best:
+            best = n
+    if best is None:
+        return (state.map_info.width or 0) + (state.map_info.height or 0)
+    return best
+
+
+def _mine_at(state, x, y, want_ores):
+    if state.map_info is None:
         return None
-    if in_pre_night_cashout_window(role, state, blocked, reserved):
-        trace(state, role.id, 'cashout_skip_mine', '入夜前停止采矿，把背包收益换成金币和火力')
-        return None
-    if len(role.backpack) >= role.back_pack_capability:
-        trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
+    for mine in state.map_info.zones:
+        if mine.pos.x == x and mine.pos.y == y and mine.neutral_type in want_ores:
+            return mine
+    return None
+
+
+def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
+    """一人一矿：能沿用粘性目标就继续；否则未占用矿优先，按本趟可采数量打分。"""
+    from .opening import adjacent_path
+    want = set(want_ores)
+    if not want or state.map_info is None:
         return None
     prices = ore_prices(state)
-    vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor']
-    from .opening import stones_cover_wall_plan
-    skip_stone = stones_cover_wall_plan(state)
-    batch = max(1, (role.back_pack_capability or 1) - len(role.backpack))
+    occupied = claimed_mines(state, exclude_role_id=role.id)
+
+    def score_mine(mine, path):
+        path_len = len(path)
+        return_len = vendor_return_steps(mine, state, blocked, reserved) if purpose == 'income' else 0
+        batch = trip_collect_limit(role, state, path_len=path_len, return_len=return_len, purpose=purpose)
+        if batch <= 0:
+            return None
+        score = batch * prices.get(mine.neutral_type, 1) / (path_len + batch + return_len + 1)
+        return score, batch, path_len, return_len
+
+    sticky = get_mine_target(state, role.id)
+    if sticky:
+        try:
+            mine = _mine_at(state, int(sticky['x']), int(sticky['y']), want)
+        except (KeyError, TypeError, ValueError):
+            mine = None
+        if mine is not None:
+            path = adjacent_path(role, mine.pos, blocked | reserved, state)
+            ranked = None if path is None else score_mine(mine, path)
+            if ranked is not None:
+                score, batch, path_len, return_len = ranked
+                set_mine_target(state, role.id, mine)
+                trace(state, role.id, 'sticky_mine', '沿用尚未采完的矿点', mineral=mine.neutral_type,
+                      batch=batch, path_len=path_len, return_len=return_len, score=round(score, 4))
+                return mine, path
+
     candidates = []
     for mine in state.map_info.zones:
-        if mine.neutral_type not in ('stone', 'iron', 'copper'):
-            continue
-        if skip_stone and mine.neutral_type == 'stone':
-            continue
-        if ore_blocked(state, mine.neutral_type):
+        if mine.neutral_type not in want:
             continue
         path = adjacent_path(role, mine.pos, blocked | reserved, state)
         if path is None:
             continue
-        return_distance = min((chebyshev(mine.pos, v.pos) for v in vendors), default=0)
-        score = batch * prices.get(mine.neutral_type, 1) / (len(path) + batch + return_distance + 1)
-        if mine.neutral_type in ores_to_stockpile(state):
-            score *= 3
-        candidates.append((score, -len(path), mine, path))
+        ranked = score_mine(mine, path)
+        if ranked is None:
+            continue
+        score, batch, path_len, return_len = ranked
+        claimed = (mine.pos.x, mine.pos.y) in occupied
+        candidates.append((1 if claimed else 0, -score, path_len, mine, path, batch, return_len, score))
     if not candidates:
         trace(state, role.id, 'no_reachable_mine', '当前没有可达矿点')
         return None
-    _, _, mine, path = max(candidates, key=lambda c: c[:2])
-    trace(state, role.id, 'income_mine', '按本趟可装容量、报价与运输成本估算矿点收益', mineral=mine.neutral_type,
-          price=prices.get(mine.neutral_type), batch=batch,
-          estimate_note='未知报价按等权比较；返售距离是几何估计')
+    claimed_flag, _, path_len, mine, path, batch, return_len, score = min(candidates, key=lambda c: c[:3])
+    set_mine_target(state, role.id, mine)
+    trace(state, role.id, 'income_mine', '按本趟可采数量、报价与寻路成本估算矿点收益',
+          mineral=mine.neutral_type, price=prices.get(mine.neutral_type), batch=batch,
+          path_len=path_len, return_len=return_len, claimed=bool(claimed_flag), score=round(score, 4),
+          estimate_note='未知报价按等权比较；回程是到小贩的寻路长度')
+    return mine, path
+
+
+def go_mine(role, state, blocked, reserved, want_ores, purpose='income',
+            travel_reason='', collect_reason=''):
+    from .opening import move_on_path
+    picked = pick_mine(role, state, blocked, reserved, want_ores, purpose=purpose)
+    if picked is None:
+        clear_mine_target(state, role.id)
+        return None
+    mine, path = picked
     if path:
-        return move_on_path(state, role, path, reserved, '前往本趟批量收益较高的可达矿点')
-    return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, '采集矿石，凑够一趟再出售')
+        reason = travel_reason or '前往本趟批量收益较高的可达矿点'
+        return move_on_path(state, role, path, reserved, reason)
+    reason = collect_reason or '采集矿石，凑够一趟再出售'
+    return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, reason)
+
+
+def profitable_mine(role, state, blocked, reserved):
+    """按本趟真正采得完的数量估算收益，并粘住已占矿点。仅工人可 collect。"""
+    from .opening import stones_cover_wall_plan
+    if role.role_type != 'worker':
+        trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
+        return None
+    if in_pre_night_cashout_window(role, state, blocked, reserved):
+        clear_mine_target(state, role.id)
+        trace(state, role.id, 'cashout_skip_mine', '入夜前停止采矿，把背包收益换成金币和火力')
+        return None
+    if len(role.backpack) >= role.back_pack_capability:
+        clear_mine_target(state, role.id)
+        trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
+        return None
+    skip_stone = stones_cover_wall_plan(state)
+    want = {'iron', 'copper'}
+    if not skip_stone:
+        want.add('stone')
+    return go_mine(role, state, blocked, reserved, want_ores=want, purpose='income')

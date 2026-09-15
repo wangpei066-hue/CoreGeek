@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy, item_cost
-from src.agent.economy import liquidate, profitable_mine, sellable_ores
+from src.agent.economy import liquidate, pick_mine, profitable_mine, sellable_ores
 from src.agent.tactics import begin_round, tactical_action
 from src.agent.opening import funnel_gap, wall_ring, movement_avoid, safe_wall, assign_weapons
 from src.agent.grid import build_blocked_set
@@ -180,7 +180,77 @@ class EconomyTests(unittest.TestCase):
         state, role = economy_state()
         role.back_pack_capability = 1
         role.backpack = ['Medicine']
+        state.policy_memory['mine_targets'] = {str(role.id): {'x': 2, 'y': 1, 'ore': 'copper'}}
         self.assertIsNone(profitable_mine(role, state, build_blocked_set(state), set()))
+        self.assertNotIn(str(role.id), state.policy_memory.get('mine_targets') or {})
+
+    def test_two_workers_claim_different_mines(self):
+        state, a = economy_state()
+        b = make_role(2, 1, 2, 'worker', health=220, back_pack_capability=100)
+        state.team_our.roles.append(b)
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(6, 5), 'weaponShop'),
+            Zone(Pos(2, 1), 'copper'),
+            Zone(Pos(2, 10), 'copper'),
+        ]
+        blocked = build_blocked_set(state)
+        self.assertIsNotNone(profitable_mine(a, state, blocked, set()))
+        self.assertIsNotNone(profitable_mine(b, state, blocked, set()))
+        ta = state.policy_memory['mine_targets'][str(a.id)]
+        tb = state.policy_memory['mine_targets'][str(b.id)]
+        self.assertNotEqual((ta['x'], ta['y']), (tb['x'], tb['y']))
+
+    def test_two_workers_can_share_the_only_stone_mine(self):
+        state, a = economy_state()
+        b = make_role(2, 1, 2, 'worker', health=220, back_pack_capability=100)
+        state.team_our.roles.append(b)
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'stone'),
+        ]
+        blocked = build_blocked_set(state)
+        first = pick_mine(a, state, blocked, set(), want_ores=('stone',), purpose='stone')
+        second = pick_mine(b, state, blocked, set(), want_ores=('stone',), purpose='stone')
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual((first[0].pos.x, first[0].pos.y), (second[0].pos.x, second[0].pos.y))
+
+    def test_sticky_mine_survives_a_better_score_appearing(self):
+        state, role = economy_state()
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(8, 1), 'copper'),
+        ]
+        blocked = build_blocked_set(state)
+        self.assertIsNotNone(profitable_mine(role, state, blocked, set()))
+        sticky = dict(state.policy_memory['mine_targets'][str(role.id)])
+        state.map_info.zones.append(Zone(Pos(2, 1), 'copper'))
+        self.assertIsNotNone(profitable_mine(role, state, blocked, set()))
+        self.assertEqual(state.policy_memory['mine_targets'][str(role.id)], sticky)
+
+    def test_trip_cap_prefers_near_iron_over_far_copper(self):
+        state, role = economy_state()
+        role.back_pack_capability = 100
+        role.backpack = []
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'iron'),
+            Zone(Pos(25, 25), 'copper'),
+        ]
+        blocked = build_blocked_set(state)
+        self.assertIsNotNone(profitable_mine(role, state, blocked, set()))
+        target = state.policy_memory['mine_targets'][str(role.id)]
+        self.assertEqual(target['ore'], 'iron')
+        self.assertEqual((target['x'], target['y']), (2, 1))
+
+    def test_cashout_window_clears_mine_target(self):
+        state, role = defended_state()
+        state.round_no = 310
+        role.backpack = ['copper']
+        state.policy_memory['mine_targets'] = {str(role.id): {'x': 2, 'y': 1, 'ore': 'copper'}}
+        self.assertIsNone(profitable_mine(role, state, build_blocked_set(state), set()))
+        self.assertNotIn(str(role.id), state.policy_memory.get('mine_targets') or {})
 
     def test_multiround_ore_is_converted_to_gold(self):
         state, role = economy_state()

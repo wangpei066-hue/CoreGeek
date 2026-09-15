@@ -7,6 +7,7 @@ import json
 
 
 from .log_format import command_text, emit_stderr
+from .news_logging import log_folk_plan, log_official_plan
 
 CONSOLE_MARKER = "STRATEGY_DECISION"
 WEAPON_BUILD_NAMES = ("gatling", "railgun", "rocket")
@@ -24,6 +25,8 @@ WEAPON_EVENT_CODES = {
 PIONEER_EVENT_CODES = {
     "pioneer_task", "task_yields_to_defense", "task_yields_to_voucher",
     "task_not_enough_time", "no_pioneer_action", "pioneer_task_active_at_night",
+    "treasure_buy_deferred", "treasure_wait_window", "treasure_wait_open_day",
+    "treasure_decoded", "legend_appended",
 }
 ECONOMY_EVENT_CODES = {
     "income_mine", "cashout_priority", "sale_unreachable", "sale_too_late",
@@ -78,6 +81,13 @@ def emit_console_report(report):
             for role in roles
         ],
     )
+    news_plans = report.get("newsPlans") or {}
+    official = news_plans.get("official") or {}
+    folk = news_plans.get("folk") or {}
+    if official.get("oreEffects"):
+        log_official_plan(round_no, official)
+    if folk:
+        log_folk_plan(round_no, folk)
 
     weapon_actions, wall_actions, pioneer_actions, economy_actions = [], [], [], []
     for role in roles:
@@ -100,8 +110,10 @@ def emit_console_report(report):
                 "Weapon" in (cmd.get("name") or "") or "Voucher" in (cmd.get("name") or "")
                 or cmd.get("name") in WEAPON_BUILD_NAMES):
             weapon_actions.append(row)
-        elif action in ("acceptTask", "submitAnswer"):
-            pioneer_actions.append({**row, "taskAnswer": cmd.get("taskAnswer")})
+        elif action in ("acceptTask", "submitAnswer", "summonTreasure"):
+            pioneer_actions.append({**row, "taskAnswer": cmd.get("taskAnswer"), "item": cmd.get("item")})
+        elif action == "buy" and cmd.get("name") and "Voucher" not in (cmd.get("name") or "") and "Weapon" not in (cmd.get("name") or ""):
+            pioneer_actions.append(row)
         elif action == "sell":
             economy_actions.append(row)
         elif action == "attack":
@@ -214,6 +226,16 @@ def snapshot(state):
     }
 
 
+def _news_plans(state):
+    memory = getattr(state, "news_memory", None)
+    if memory is None:
+        return {"official": {}, "folk": {}}
+    return {
+        "official": memory.store_official_plan(state.round_no),
+        "folk": memory.data.get("folkPlan") or memory.pioneer_json(),
+    }
+
+
 def build_report(state, commands, previous_commands, before, previous_snapshot, sequence, elapsed_ms, phase):
     roles = state.team_our.roles if state.team_our else []
     counts = Counter(r.role_type for r in roles)
@@ -278,6 +300,7 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
         "roles": decisions, "events": events, "previous_feedback": feedback,
         "system_errors": [asdict(error) for error in state.errors],
         "observed_changes": changes,
+        "newsPlans": _news_plans(state),
         "changes_note": "仅为快照差异，不代表由上一条指令造成。" if comparable else "无同局更早快照可比较（首请求、重启或上下文变化）。",
     }
 
@@ -294,9 +317,11 @@ def render_text(report):
     diagnostic = report.get('diagnostics', {})
     for alert in diagnostic.get('alerts', []):
         lines.append('【重点】' + json.dumps(alert, ensure_ascii=False))
-    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons'):
-        if key in diagnostic:
-            lines.append(f'{key}: ' + json.dumps(diagnostic[key], ensure_ascii=False))
+    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons', 'newsPlans'):
+        if key in diagnostic or key in report:
+            payload = diagnostic.get(key) if key in diagnostic else report.get(key)
+            if payload:
+                lines.append(f'{key}: ' + json.dumps(payload, ensure_ascii=False))
     for base in summary["bases"]:
         lines.append(f"基地 {base['id']}：血量 {base['health']}，等级 {base['level']}")
     for role in report["roles"]:

@@ -6,7 +6,7 @@ from typing import Optional
 from .decision_log import selected, trace
 from .news_logging import log_news_event
 from .grid import build_blocked_set, chebyshev, move_towards
-from .news_memory import NewsMemory, game_day
+from .news_memory import NewsMemory, game_day, TREASURE_ACT_CONFIDENCE, clamp_confidence
 from .protocol import MatchState, Pos, Role
 
 TREASURE_URGENCY_ROUNDS = 15
@@ -39,6 +39,21 @@ def shop_buy_allowed(name: str, state: MatchState, emergency: bool = False) -> b
 SUMMON_BAD_PLACE_OR_TIME = 2
 SUMMON_BAD_ITEMS = 3
 SUMMON_EMPTY = 4
+
+
+def hypothesis_confidence(memory: NewsMemory) -> float:
+    hyp = memory.data.get("treasureHypothesis") or {}
+    return clamp_confidence(hyp.get("confidence", 0))
+
+
+def hypothesis_actionable(memory: NewsMemory) -> bool:
+    hyp = memory.data.get("treasureHypothesis") or {}
+    return bool(
+        hyp.get("ready")
+        and altar_pos(memory)
+        and hypothesis_items(memory)
+        and hypothesis_confidence(memory) >= TREASURE_ACT_CONFIDENCE
+    )
 
 
 def hypothesis_items(memory: NewsMemory) -> list:
@@ -108,8 +123,7 @@ def treasure_should_claim_pioneer(state: MatchState, pioneer: Role, memory: News
     """开启窗内且物品齐，或窗口将至且正在筹备时，占用开拓者。"""
     if memory.data.get("treasureEmpty"):
         return False
-    hyp = memory.data.get("treasureHypothesis") or {}
-    if not hyp.get("ready") or not altar_pos(memory) or not hypothesis_items(memory):
+    if not hypothesis_actionable(memory):
         return False
     if pioneer.health <= 0:
         return False
@@ -188,7 +202,11 @@ def decide_treasure_action(pioneer: Role, state: MatchState, memory: NewsMemory,
     if memory.data.get("treasureEmpty"):
         return None
     hyp = memory.data.get("treasureHypothesis") or {}
-    if not hyp.get("ready") or not altar_pos(memory) or not hypothesis_items(memory):
+    if not hypothesis_actionable(memory):
+        if hyp.get("ready") and hypothesis_confidence(memory) < TREASURE_ACT_CONFIDENCE:
+            trace(state, pioneer.id, "treasure_low_confidence",
+                  "传闻 JSON 置信度不足，不开拓者去买物或召唤",
+                  confidence=hypothesis_confidence(memory), threshold=TREASURE_ACT_CONFIDENCE)
         return None
 
     width, height = state.map_info.width, state.map_info.height

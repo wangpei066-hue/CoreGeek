@@ -1,12 +1,11 @@
-"""世界新闻：官方消息影响采矿/卖矿时机；民间传闻拼祭坛宝藏。
+"""世界新闻：官方消息与民间传闻写入记忆与决策 JSON。
 
-解析与启发式是策略参数，不是官方合法坐标或固定任务用品表。
+解析与启发式只生成 `officialPlan`/`folkPlan` 日志，当前不指挥采矿或宝藏动作。
 """
 import json
 import re
 
 from .decision_log import trace, selected
-from .news_logging import log_news_event
 from .grid import chebyshev, move_towards
 from .protocol import Pos
 
@@ -80,12 +79,10 @@ def ingest_news(state):
               day=day, ores=sorted(parsed), forecast=parsed)
     if folk and (not mem["legends"] or mem["legends"][-1]["text"] != folk):
         mem["legends"].append({"day": day, "round": state.round_no, "text": folk})
-        merge_treasure_plan(mem, parse_legend_clues(mem, state))
-        trace(state, None, "folk_legend_ingested", "累计民间传闻并尝试抽出祭坛线索",
-              day=day, legends=len(mem["legends"]), treasure=mem.get("treasure"))
+        trace(state, None, "folk_legend_ingested", "累计民间传闻，祭坛线索改由 LLM 解码",
+              day=day, legends=len(mem["legends"]))
     if state.last_summon_treasure_result in (1, 4):
         mem.setdefault("treasure", {})["done"] = True
-    apply_llm_result(state, mem)
     return mem
 
 
@@ -111,6 +108,10 @@ def parse_official_forecast(text, event_day):
 
 
 def ore_blocked(state, mineral):
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .news_memory import game_day
+        return mineral in memory.banned_ores(game_day(state.round_no))
     spec = intel_memory(state).get("forecast", {}).get(mineral)
     if not spec:
         return False
@@ -120,6 +121,10 @@ def ore_blocked(state, mineral):
 
 def ores_to_stockpile(state):
     """停工前一天抢收，涨价窗口内不再囤。"""
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .news_memory import game_day
+        return memory.ores_to_stockpile(game_day(state.round_no))
     day = day_index(state)
     held = set()
     for ore, spec in intel_memory(state).get("forecast", {}).items():
@@ -129,6 +134,11 @@ def ores_to_stockpile(state):
 
 
 def ores_in_spike(state):
+    memory = getattr(state, "news_memory", None)
+    if memory is not None:
+        from .news_memory import game_day
+        day = game_day(state.round_no)
+        return memory.price_boosted_ores(day) | memory.banned_ores(day)
     day = day_index(state)
     spiked = set()
     for ore, spec in intel_memory(state).get("forecast", {}).items():
@@ -174,48 +184,6 @@ def merge_treasure_plan(mem, update):
         plan["openDay"] = update["openDay"]
 
 
-def apply_llm_result(state, mem):
-    if not mem.get("awaiting_llm"):
-        return
-    raw = state.llm_resp or ""
-    parsed = parse_intel_llm(raw)
-    mem["awaiting_llm"] = False
-    prompt_text = mem.get("last_prompt") or ""
-    if not (raw or "").strip():
-        log_news_event(
-            event="llm_empty", roundNo=state.round_no,
-            title="【LLM】intel 响应为空",
-            consumer="intel", promptText=prompt_text,
-        )
-    else:
-        log_news_event(
-            event="llm_output", roundNo=state.round_no,
-            title="【LLM】intel " + ("解析成功" if parsed else "输出无法解析"),
-            consumer="intel", promptText=prompt_text, llmRespRaw=raw,
-            parsedJson=parsed, parseOk=bool(parsed), applied=bool(parsed),
-        )
-    if not parsed:
-        trace(state, None, "news_llm_unparsed", "新闻/传闻 LLM 返回无法解析，继续用启发式")
-        return
-    for row in parsed.get("forecast") or []:
-        ore = row.get("ore")
-        if ore in ORE_ALIASES:
-            mem.setdefault("forecast", {})[ore] = {
-                "event_day": int(row.get("eventDay", day_index(state))),
-                "block_from": int(row.get("blockFromDay", day_index(state) + 1)),
-                "block_to": int(row.get("blockToDay", day_index(state) + 2)),
-            }
-    update = {}
-    if isinstance(parsed.get("altar"), dict) and isinstance(parsed["altar"].get("x"), int) and isinstance(parsed["altar"].get("y"), int):
-        update["altar"] = {"x": parsed["altar"]["x"], "y": parsed["altar"]["y"]}
-    if isinstance(parsed.get("items"), list) and all(isinstance(n, str) and n for n in parsed["items"]):
-        update["items"] = parsed["items"]
-    if isinstance(parsed.get("openDay"), int):
-        update["openDay"] = parsed["openDay"]
-    merge_treasure_plan(mem, update)
-    trace(state, None, "news_llm_applied", "已合并新闻/传闻 LLM 推断", treasure=mem.get("treasure"), forecast=mem.get("forecast"))
-
-
 def parse_intel_llm(text):
     text = (text or "").strip()
     if not text:
@@ -236,53 +204,11 @@ def parse_intel_llm(text):
 
 
 def maybe_prompt(state):
-    """自进化未占用 prompt 时，用每日额度推断新闻停工和祭坛条件。不发 executeCmd。"""
-    if state.phase_task:
-        return "", ""
-    mem = intel_memory(state)
-    if mem.get("treasure", {}).get("done"):
-        return "", ""
-    apply_llm_result(state, mem)
-    news = state.world_news
-    has_signal = bool(mem.get("legends") or mem.get("official"))
-    if not has_signal:
-        return "", ""
-    plan = mem.get("treasure") or {}
-    complete = bool(plan.get("altar") and plan.get("items"))
-    heuristic_forecast = bool(mem.get("forecast"))
-    official = (news.official_news or "").strip() if news else ""
-    need_forecast = official and official not in ("今日无重大新闻", "无重大新闻") and not heuristic_forecast
-    if complete and not need_forecast:
-        return "", ""
-    day = str(day_index(state))
-    calls = mem.setdefault("llm_calls_by_day", {})
-    if calls.get(day, 0) >= DAILY_NEWS_LLM_LIMIT:
-        return "", ""
-    calls[day] = calls.get(day, 0) + 1
-    mem["awaiting_llm"] = True
-    prompt = (
-        "你是比赛世界新闻分析器。根据官方消息推断矿石停工/涨价窗口；根据累计民间传闻推断祭坛坐标、献祭物品英文名、开启日。"
-        "开启日按 roundNo 从0起算的天数（0=第一天）。只返回一个JSON对象，不要Markdown："
-        '{"forecast":[{"ore":"iron","eventDay":0,"blockFromDay":1,"blockToDay":2}],'
-        '"altar":{"x":12,"y":8},"items":["AcientTablet"],"openDay":3}'
-        "未知字段请省略，不要编造坐标或物品。\n"
-        + json.dumps({
-            "roundNo": state.round_no,
-            "day": day_index(state),
-            "official": [row["text"] for row in mem.get("official", [])[-4:]],
-            "legends": [row["text"] for row in mem.get("legends", [])[-8:]],
-            "shopItems": [i.name for i in (state.weapon_shop_list or [])],
-            "currentTreasure": plan,
-        }, ensure_ascii=False)
-    )
-    mem["last_prompt"] = prompt
-    trace(state, None, "news_llm_prompt", "提交新闻/传闻推断 prompt", day=day, calls=calls[day])
-    log_news_event(
-        event="prompt_sent", consumer="intel", roundNo=state.round_no,
-        title="【LLM】发送世界情报 prompt",
-        promptText=prompt, used=calls[day],
-    )
-    return prompt, ""
+    """官方消息 / 民间传闻已拆到 PromptRouter 两条 LLM；此处不再发混合 prompt。"""
+    mem = state.policy_memory.get("world_intel") if getattr(state, "policy_memory", None) else None
+    if isinstance(mem, dict):
+        mem["awaiting_llm"] = False
+    return "", ""
 
 
 def treasure_ready(state):

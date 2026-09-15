@@ -8,7 +8,11 @@ import tempfile
 import unittest
 
 from src.agent import GameServer
-from src.agent.task_solver import extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT, task_context
+from src.agent.task_solver import (
+    extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT, PROBE_SCRIPT, task_context,
+    harvest_api_call, matching_api_experience, build_api_answer, is_plain_int,
+    PROMPT_HASH, PROMPT_VERSION, PioneerTaskSolver, BASE_PROMPT, DEPLOYMENT_SOP, API_SOP,
+)
 
 
 class TaskSolverTests(unittest.TestCase):
@@ -88,10 +92,13 @@ class TaskSolverTests(unittest.TestCase):
         (self.root / 'task.md').write_text('错误目录的任务')
         self.payload['phaseTask'] = f'工作区路径：`{workspace}`，读取 `task.md` 并完成任务'
         first = self.post()
+        self.assertIn('deploy_probe', first['executeCmd'])
         prompt = self.next_round(lastCmdResult=self.sandbox(first['executeCmd']))['prompt']
         self.assertIn('将 result.txt', prompt)
         self.assertNotIn('错误目录的任务', prompt)
         self.assertEqual(self.server.task_solver.session['taskKind'], 'workspace')
+        self.assertIn('部署任务首次探查', prompt)
+        self.assertIn(PROMPT_VERSION, prompt)
         action = self.next_round(llmResp=json.dumps(dict(action='execute', command='printf done > result.txt')))
         feedback = self.sandbox(action['executeCmd'])
         self.assertEqual((workspace / 'result.txt').read_text(), 'done')
@@ -117,7 +124,12 @@ class TaskSolverTests(unittest.TestCase):
         self.assertEqual(task_context('调用API http://service/query'), dict(taskKind='api', workspace=None))
         self.assertEqual(task_context('工作区路径：/app/project，任务描述 task.md')['workspace'], '/app/project')
         self.payload['phaseTask'] = '调用API查询天气，接口说明已在任务中给出'
-        self.assertIn('"taskKind": "api"', self.post()['prompt'])
+        prompt = self.post()['prompt']
+        self.assertIn('"taskKind": "api"', prompt)
+        self.assertIn('优先复用', prompt)
+        self.assertNotIn('部署任务首次探查', prompt)
+        self.assertNotIn('部署修复 SOP', prompt)
+        self.assertIn(PROMPT_HASH, prompt)
         workspace = self.root / 'api'
         workspace.mkdir()
         action = self.next_round(llmResp=json.dumps(dict(
@@ -142,8 +154,10 @@ class TaskSolverTests(unittest.TestCase):
         self.payload['phaseTask'] = task.replace(
             r'/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws\_3/', str(workspace) + '/')
         response = self.post()
+        self.assertIn('deploy_probe', response['executeCmd'])
         prompt = self.next_round(lastCmdResult=self.sandbox(response['executeCmd']))['prompt']
         self.assertIn('修复deployment.txt', prompt)
+        self.assertIn('部署任务首次探查', prompt)
         action = self.next_round(llmResp=json.dumps(dict(action='execute', command='./check')))
         feedback = self.sandbox(action['executeCmd'])
         self.assertEqual(json.loads(feedback.split('\n', 1)[1])['exitCode'], 1)
@@ -152,11 +166,10 @@ class TaskSolverTests(unittest.TestCase):
             action='execute', command='printf ready > deployment.txt && ./check')))
         feedback = self.sandbox(action['executeCmd'])
         self.assertIn('TOKEN:gamma-verified', feedback)
-        self.next_round(lastCmdResult=feedback)
-        response = self.next_round(llmResp=json.dumps(dict(
-            action='submit', taskAnswer=json.dumps({'token': 'gamma-verified'}))))
+        response = self.next_round(lastCmdResult=feedback)
         answer = response['roleCommandMap']['10011']['taskAnswer']
         self.assertEqual(json.loads(answer), {'token': 'gamma-verified'})
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'sent')
 
     def test_ambiguous_workspace_and_api_url_are_not_guessed(self):
         self.assertIsNone(task_context('部署环境可能位于 /tmp/one/ 或 /tmp/two/ ，进入工作区阅读spec.md')['workspace'])
@@ -170,9 +183,9 @@ class TaskSolverTests(unittest.TestCase):
         (workspace / 'verify.py').write_text(
             'from pathlib import Path\nassert Path("deployed").read_text() == "yes"\nprint("RECEIPT=delta-ok")\n')
         self.payload['phaseTask'] = f'工作目录：`{workspace}`。根据目录中的说明修复应用。'
-        self.assertTrue(self.post()['prompt'])
-        action = self.next_round(llmResp=json.dumps(dict(action='execute', command='ls')))
-        prompt = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))['prompt']
+        first = self.post()
+        self.assertTrue(first['executeCmd'])
+        prompt = self.next_round(lastCmdResult=self.sandbox(first['executeCmd']))['prompt']
         self.assertIn('repair.txt', prompt)
         action = self.next_round(llmResp=json.dumps(dict(action='read', path='repair.txt')))
         page = self.next_round(lastCmdResult=self.sandbox(action['executeCmd']))
@@ -231,7 +244,7 @@ class TaskSolverTests(unittest.TestCase):
     def test_request_logging_preserves_main_behavior(self):
         self.payload['llmResp'] = '原始响应' * 2000
         self.post()
-        record = json.loads((self.root / 'logs/request_000001.json').read_text())
+        record = json.loads((self.root / 'logs/request_000001.json').read_text(encoding='utf-8'))
         self.assertEqual(record, self.payload)
         self.assertNotIn('PIONEER_TASK_EXCHANGE', self.output.getvalue())
 
@@ -281,6 +294,297 @@ class TaskSolverTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_llm('{"action":"submit","taskAnswer":{"result":2}}')
 
+    def test_task_switch_archives_and_keeps_experience(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage',
+        }]
+        self.post()
+        response = self.next_round(phaseTask='新的题目', llmResp='{"action":"submit","taskAnswer":"旧答案"}')
+        self.assertNotIn('10011', response['roleCommandMap'])
+        self.assertTrue(self.server.task_solver.archives)
+        self.assertEqual(self.server.task_solver.experience['api'][0]['path'], '/api/v1/heritage/search')
+        restored = self.next_round(phaseTask='请计算1+1，仅返回数字')
+        self.assertTrue(self.server.task_solver.session.get('restored'))
+        self.assertIn('请计算1+1', restored['prompt'])
+
+    def test_empty_sandbox_waits_before_reasking_llm(self):
+        self.post()
+        tool = self.next_round(llmResp='{"action":"execute","command":"echo test"}')
+        self.assertTrue(tool['executeCmd'])
+        first = self.next_round(lastCmdResult='')
+        self.assertEqual(first['prompt'], '')
+        self.assertEqual(first['executeCmd'] or '', '')
+        self.assertEqual(self.server.task_solver.session['stage'], 'wait_tool')
+        self.next_round(lastCmdResult='')
+        self.assertEqual(self.server.task_solver.session['stage'], 'wait_tool')
+        recovered = self.next_round(lastCmdResult='')
+        self.assertIn('等待沙盒结果超时', recovered['prompt'])
+
+    def test_read_retry_does_not_bypass_holding(self):
+        from src.agent.protocol import MatchState
+        state = MatchState()
+        self.payload['phaseTask'] = '阅读 `guide.md`'
+        state.update(self.payload)
+        solver = self.server.task_solver
+        solver.session = dict(
+            key=[state.team_our.team_id, state.team_our.type, state.phase_task],
+            stage='wait_read', requestId='rid', pendingCommand='OLD_READ',
+            paths=['guide.md'], documents=[], history=[], index=0, offset=0,
+            calls=0, retries=0, round=9, taskKind='unknown', workspace=None,
+            metrics={}, promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
+        )
+        state.round_no = 10
+        state.last_cmd_result = '[TIMEOUT]'
+        prompt, execute = solver.step(state, {10011: {'action': 'move', 'targetPos': [{'x': 1, 'y': 1}]}})
+        self.assertEqual((prompt, execute), ('', ''))
+        self.assertEqual(solver.session['stage'], 'wait_read')
+        self.assertTrue(solver.session.get('resendPending'))
+        state.round_no = 11
+        prompt, execute = solver.step(state, {})
+        self.assertEqual(execute, 'OLD_READ')
+
+    def test_accepted_submit_is_not_confirmed_until_task_clears(self):
+        self.post()
+        submitted = self.next_round(llmResp='{"action":"submit","taskAnswer":"2"}')
+        self.assertEqual(submitted['roleCommandMap']['10011']['taskAnswer'], '2')
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'sent')
+        waiting = self.next_round(lastRoundRoleActionResults={'10011': True})
+        self.assertNotIn('10011', waiting['roleCommandMap'])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'accepted')
+        self.assertEqual(waiting['prompt'], '')
+        still = self.next_round(lastRoundRoleActionResults={'10011': True},
+                                errors=[{'errorCode': 4, 'description': '建造失败'}])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'accepted')
+        self.assertEqual(still['prompt'], '')
+        self.next_round(phaseTask='')
+        self.assertEqual(self.server.task_solver.session, {})
+
+    def test_heritage_experience_is_reused_for_nanjing(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'extraParams': {'limit': '1000'}, 'recordsPath': 'data.records',
+            'pagination': None, 'serviceHint': 'heritage',
+        }]
+        self.payload['phaseTask'] = (
+            '调用API查询南京遗产。密钥：tok-1。'
+            '提交{"city":"南京","total_count":0,"type_count":0,"oldest_era":"名称"}'
+        )
+        first = self.post()
+        self.assertIn('/api/v1/heritage/search', first['executeCmd'])
+        self.assertIn('location', first['executeCmd'])
+        self.assertTrue(self.server.task_solver.session.get('experienceHit'))
+        rid = self.server.task_solver.session['requestId']
+        result = dict(
+            marker='PIONEER_TASK', requestId=rid, event='api_fetch', ok=True,
+            recordsComplete=True, completenessEvidence='total=2 records=2',
+            totalCount=2, typeCount=1, oldestEraName='明孝陵', city='南京',
+            status=200, path='/api/v1/heritage/search',
+        )
+        response = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(result, ensure_ascii=False))
+        answer = json.loads(response['roleCommandMap']['10011']['taskAnswer'])
+        self.assertEqual(answer, {'city': '南京', 'total_count': 2, 'type_count': 1, 'oldest_era': '明孝陵'})
+        self.assertIsInstance(answer['total_count'], int)
+
+    def test_crlf_experience_is_injected_into_next_deploy_prompt(self):
+        self.server.task_solver.experience['deploy'] = [{
+            'kind': 'crlf', 'method': 'python_newline', 'paths': ['start.sh'],
+            'sourceTask': 'alpha', 'environment': '/tmp/alpha', 'evidence': 'probe_crlf',
+        }]
+        self.payload['phaseTask'] = '修复应用gamma部署，工作区路径：`/tmp/gamma/`，阅读spec.md'
+        first = self.post()
+        self.assertIn('deploy_probe', first['executeCmd'])
+        rid = self.server.task_solver.session['requestId']
+        probe = dict(
+            marker='PIONEER_TASK', requestId=rid, event='deploy_probe',
+            workspace='/tmp/gamma', listing=['spec.md', 'start.sh'],
+            files=[
+                {'path': 'spec.md', 'exists': True, 'crlf': False, 'contentHead': '修复后运行./check，输出TOKEN'},
+                {'path': 'start.sh', 'exists': True, 'crlf': True, 'shebang': '#!/bin/bash'},
+            ],
+        )
+        prompt = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(probe, ensure_ascii=False))['prompt']
+        self.assertIn('python_newline', prompt)
+        self.assertIn('CRLF', prompt)
+        self.assertIn('deployPhase', prompt)
+
+    def test_harvest_api_call_strips_secrets_and_keeps_city_param(self):
+        item = harvest_api_call(
+            'curl -H "Authorization: Bearer SECRET" '
+            '"http://svc/api/v1/heritage/search?location=北京&limit=1000"',
+            json.dumps({'code': 200, 'data': {'records': [{'name': '天坛'}], 'pagination': {'total': 1, 'page': 1}}}, ensure_ascii=False),
+            '查询北京遗产')
+        self.assertEqual(item['path'], '/api/v1/heritage/search')
+        self.assertEqual(item['cityParam'], 'location')
+        self.assertEqual(item['authStyle'], 'Authorization: Bearer')
+        self.assertEqual(item['extraParams']['limit'], '1000')
+        self.assertIsNone(item['pagination'])
+        self.assertNotIn('SECRET', json.dumps(item))
+        self.assertEqual(
+            matching_api_experience({'api': [item]}, '调用API查询南京遗产')['path'],
+            '/api/v1/heritage/search')
+
+    def test_prompt_hash_and_kind_specific_sop(self):
+        self.assertEqual(len(PROMPT_HASH), 16)
+        self.assertIn('优先复用', API_SOP)
+        self.assertIn('部署任务首次探查', DEPLOYMENT_SOP)
+        self.assertNotIn(DEPLOYMENT_SOP, BASE_PROMPT)
+        self.assertNotIn('部署任务首次探查', self.post()['prompt'])
+
+    def test_long_check_output_token_is_taken_from_tail(self):
+        solver = PioneerTaskSolver(self.root / 'state')
+        session = dict(taskKind='workspace', metrics={})
+        result = dict(exitCode=0, output='noise' * 100, outputTail='All passed\nTOKEN:tail-ok\n')
+        self.assertTrue(solver._finish_from_tool(session, result, '修复应用', None))
+        self.assertEqual(json.loads(session['answer']), {'token': 'tail-ok'})
+        self.assertEqual(session['stage'], 'submit')
+
+    def test_duplicate_failed_read_is_blocked(self):
+        self.payload['phaseTask'] = '阅读 `/does-not-exist/task.md` 并完成任务'
+        first = self.post()
+        rid = self.server.task_solver.session['requestId']
+        feedback = '[exitCode:0]\n' + json.dumps(dict(
+            marker='PIONEER_TASK', requestId=rid, event='read_document', error='not_found',
+            path='/does-not-exist/task.md'))
+        prompt = self.next_round(lastCmdResult=feedback)['prompt']
+        self.assertIn('error', prompt)
+        blocked = self.next_round(llmResp=json.dumps(dict(action='read', path='/does-not-exist/task.md')))
+        self.assertFalse(blocked.get('executeCmd'))
+        self.assertTrue(blocked['prompt'])
+        self.assertGreaterEqual(self.server.task_solver.session['metrics']['duplicateBlocked'], 1)
+        self.assertTrue(any('拦截' in item or '失败' in item for item in self.server.task_solver.session.get('facts') or []))
+
+    def test_failed_read_switches_to_verified_api_experience(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage', 'callVerified': True,
+        }]
+        self.payload['phaseTask'] = (
+            '调用API查询南京遗产。阅读 `/does-not-exist/beijing.md`。密钥：tok-n。'
+            '提交{"city":"南京","total_count":0,"type_count":0,"oldest_era":"名称"}'
+        )
+        first = self.post()
+        self.assertIn('/api/v1/heritage/search', first['executeCmd'])
+        self.assertNotIn('beijing.md', first['executeCmd'])
+
+    def test_harvest_requires_business_code_200(self):
+        self.assertIsNone(harvest_api_call(
+            'curl "http://svc/api/v1/heritage/search?location=北京"',
+            json.dumps({'data': {'records': [{'name': '天坛'}]}}, ensure_ascii=False),
+            '查询北京遗产'))
+        item = harvest_api_call(
+            'curl "http://svc/api/v1/heritage/search?location=北京"',
+            json.dumps({'code': 200, 'data': {'records': [{'name': '天坛'}],
+                                             'pagination': {'total': 1}}}, ensure_ascii=False),
+            '查询北京遗产')
+        self.assertTrue(item['callVerified'])
+        self.assertFalse(item['recordsComplete'])
+        self.assertEqual(item['recordsPath'], 'data.records')
+
+    def test_bool_is_not_accepted_as_int_in_api_answer(self):
+        self.assertFalse(is_plain_int(True))
+        self.assertIsNone(build_api_answer(
+            '提交{"city":"南京","total_count":0,"type_count":0,"oldest_era":"名称"}',
+            dict(recordsComplete=True, totalCount=True, typeCount=1,
+                 oldestEraName='明孝陵', city='南京')))
+
+    def test_unrelated_role_error_does_not_recompute_answer(self):
+        self.post()
+        self.next_round(llmResp='{"action":"submit","taskAnswer":"2"}')
+        self.next_round(lastRoundRoleActionResults={'10011': True})
+        again = self.next_round(lastRoundRoleActionResults={'10011': True},
+                                errors=[{'errorCode': 4, 'description': '工人指令错误'}])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'accepted')
+        self.assertEqual(again['prompt'], '')
+        self.assertNotIn('10011', again['roleCommandMap'])
+
+    def test_answer_error_rejects_after_legal_submit(self):
+        self.post()
+        self.next_round(llmResp='{"action":"submit","taskAnswer":"2"}')
+        retry = self.next_round(lastRoundRoleActionResults={'10011': True},
+                                errors=[{'errorCode': 2, 'description': '答案错误'}])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'rejected')
+        self.assertIn('答案错误', retry['prompt'])
+
+    def test_unrelated_diagnostic_does_not_fail_waiting_tool(self):
+        self.post()
+        tool = self.next_round(llmResp='{"action":"execute","command":"echo test"}')
+        diagnostic = json.dumps({'marker': 'PIONEER_TASK', 'event': 'task_active', 'requestId': 'diag'})
+        waiting = self.next_round(lastCmdResult='[exitCode:0]\n' + diagnostic)
+        self.assertEqual(waiting['prompt'], '')
+        self.assertEqual(waiting.get('executeCmd') or '', '')
+        self.assertEqual(self.server.task_solver.session['stage'], 'wait_tool')
+
+    def test_probe_converts_crlf_and_does_not_mark_task_success(self):
+        workspace = self.root / 'alpha'
+        workspace.mkdir()
+        (workspace / 'start.sh').write_bytes(b'#!/bin/sh\r\necho keep\r\n')
+        (workspace / 'spec.md').write_text('修复后运行./check\n')
+        result = subprocess.run(
+            [__import__('sys').executable, '-c', PROBE_SCRIPT,
+             json.dumps(dict(requestId='probe', workspace=str(workspace)))],
+            capture_output=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
+        payload = json.loads(result.stdout.decode('utf-8'))
+        self.assertIn('start.sh', payload.get('convertedCrlf') or [])
+        self.assertTrue(payload.get('precheckOnly'))
+        self.assertNotIn(b'\r\n', (workspace / 'start.sh').read_bytes())
+        self.assertIn(b'echo keep', (workspace / 'start.sh').read_bytes())
+
+    def test_auth_failed_fetch_does_not_keep_paginating(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage', 'callVerified': True,
+        }]
+        self.payload['phaseTask'] = (
+            '调用API查询南京遗产。密钥：bad。'
+            '提交{"city":"南京","total_count":0,"type_count":0,"oldest_era":"名称"}'
+        )
+        first = self.post()
+        rid = self.server.task_solver.session['requestId']
+        result = dict(marker='PIONEER_TASK', requestId=rid, event='api_fetch',
+                      error='auth_failed', httpStatus=401, businessCode=401,
+                      callVerified=False, recordsComplete=False, httpRequestCount=1,
+                      path='/api/v1/heritage/search')
+        prompt = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(result))['prompt']
+        self.assertIn('auth_failed', prompt)
+        self.assertEqual(self.server.task_solver.session['stage'], 'wait_llm')
+        self.assertFalse(self.server.task_solver.session.get('metrics', {}).get('dataComplete'))
+
+    def test_code_200_fetch_submits_without_status_success_field(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage', 'callVerified': True,
+        }]
+        self.payload['phaseTask'] = (
+            '调用API查询南京遗产。密钥：tok-1。'
+            '提交{"city":"南京","total_count":0,"world_heritage_count":0,"types":[],"oldest_era":"名称"}'
+        )
+        self.post()
+        rid = self.server.task_solver.session['requestId']
+        result = dict(
+            marker='PIONEER_TASK', requestId=rid, event='api_fetch', ok=True,
+            callVerified=True, recordsComplete=True,
+            completenessEvidence='pagination.total=2 records=2',
+            totalCount=2, typeCount=1, types=['陵墓'], worldHeritageCount=1,
+            oldestEraName='明孝陵', oldestEraEvidence='year=1381', city='南京',
+            businessCode=200, httpStatus=200, path='/api/v1/heritage/search',
+        )
+        response = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(result, ensure_ascii=False))
+        answer = json.loads(response['roleCommandMap']['10011']['taskAnswer'])
+        self.assertEqual(answer['city'], '南京')
+        self.assertEqual(answer['total_count'], 2)
+        self.assertEqual(answer['world_heritage_count'], 1)
+        self.assertEqual(answer['types'], ['陵墓'])
+        self.assertEqual(answer['oldest_era'], '明孝陵')
+        self.assertIsInstance(answer['world_heritage_count'], int)
+
 
 if __name__ == '__main__':
     unittest.main()
+

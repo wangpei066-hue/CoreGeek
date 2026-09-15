@@ -7,7 +7,7 @@ from .log_format import emit_stderr
 MARKER = "PIONEER_TASK"
 
 
-def task_diagnostics(state, commands, previous_commands, solver_stage="idle"):
+def task_diagnostics(state, commands, previous_commands, solver_stage="idle", occupy_sandbox=True):
     pioneers = [r for r in state.team_our.roles if r.role_type == "pioneer"] if state.team_our else []
     event = "task_active" if state.phase_task else "task_idle"
     if any(c.get("action") == "acceptTask" for c in commands.values()):
@@ -35,8 +35,8 @@ def task_diagnostics(state, commands, previous_commands, solver_stage="idle"):
             phaseTask=state.phase_task, lastCmdResult=state.last_cmd_result,
             llmResp=state.llm_resp,
         )
-    if not state.phase_task:
-        return ""  # 接取当回合尚未确认任务生效，禁止提前调用沙盒。
+    if not state.phase_task or not occupy_sandbox:
+        return ""  # 接取未生效、或正在等待工具/LLM时不占用沙盒。
     # 分片限制单次输出在接口的64KB内；每回合轮换，长原文可按chunkIndex重组。
     chunks = [state.phase_task[i:i + 4000] for i in range(0, len(state.phase_task), 4000)]
     index = (state.round_no or 0) % len(chunks)

@@ -42,6 +42,12 @@ class PioneerTaskTests(unittest.TestCase):
                 task.update(invalid)
             self.assertNotEqual(self.decide(data).get(10011, {}).get('action'), 'acceptTask')
 
+    def test_short_platform_timeout_is_not_accepted(self):
+        data = self.payload()
+        for task in data['teamOur']['playerTasks']:
+            task['timeoutRounds'] = 2
+        self.assertNotEqual(self.decide(data).get(10011, {}).get('action'), 'acceptTask')
+
     def test_active_task_stays_day_and_night_even_after_restart(self):
         for round_no in (10, 80):
             data = self.payload(round_no)
@@ -69,19 +75,15 @@ class PioneerTaskTests(unittest.TestCase):
             data.update(roundNo=11, phaseTask="查询天气：'；$(exit 9) `exit 8`\n下一行",
                         lastRoundRoleActionResults={'10011': True})
             response = client.post('/', json=data)
-            result = subprocess.run(['sh', '-c', response.json['executeCmd']], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0)
-            record = json.loads(result.stdout)
-            self.assertEqual(record['marker'], 'PIONEER_TASK')
-            self.assertEqual(record['phaseTaskChunk'], data['phaseTask'])
-            data.update(roundNo=12, lastCmdResult='[exitCode:0]\n' + result.stdout)
+            self.assertTrue(response.json.get('prompt'))
+            self.assertFalse(response.json.get('executeCmd'))
+            data.update(roundNo=12, lastCmdResult='')
             self.assertEqual(client.post('/', json=data).status_code, 200)
             records = [record for line in stderr.getvalue().splitlines()
                        if (record := json.loads(line)).get('marker') == 'PIONEER_TASK'
                        and record.get('event') in ('accept_requested', 'task_active')]
             self.assertEqual(records[1]['pioneers'][0]['previousCommand'], {'action': 'acceptTask'})
             self.assertTrue(records[1]['pioneers'][0]['lastActionLegal'])
-            self.assertIn('PIONEER_TASK', records[2]['lastCmdResult'])
             data.update(roundNo=13, phaseTask='')
             for task in data['teamOur']['playerTasks']:
                 task.update(isValid=False, coldDownRounds=30)

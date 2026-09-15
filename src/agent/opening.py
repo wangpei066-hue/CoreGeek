@@ -675,6 +675,8 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
     trace(state, role.id, 'persistent_wall_plan', '按阶段补墙，缺石就采石', missing=sorted(missing),
           wall_goal=len(staged), outer_unlocked=outer_wall_ready(state))
     if 'stone' in role.backpack:
+        from .economy import clear_mine_target
+        clear_mine_target(state, role.id)
         if not allow_build:
             trace(state, role.id, 'stones_reserved_for_late_day',
                   '正面已封，侧翼和外层留到回炮工时足够时再施工', stones=role.backpack.count('stone'), missing=len(missing))
@@ -684,14 +686,15 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
             state.policy_memory['wall_work_attempted'] = True
             return True, cmd
         return False, None
-    paths = [adjacent_path(role, z.pos, blocked | reserved, state) for z in state.map_info.zones if z.neutral_type == 'stone']
-    mines = [z for z in state.map_info.zones if z.neutral_type == 'stone']
-    choices = [(p, z) for p, z in zip(paths, mines) if p is not None]
-    if choices and len(role.backpack) < role.back_pack_capability:
-        path, mine = min(choices, key=lambda pair: len(pair[0]))
-        if path:
-            return True, move_on_path(state, role, path, reserved, '双层墙尚未完成，专程采石')
-        return True, selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, '采集下一段城墙所需石料')
+    from .economy import go_mine
+    if len(role.backpack) < role.back_pack_capability:
+        cmd = go_mine(
+            role, state, blocked, reserved, want_ores=('stone',), purpose='stone',
+            travel_reason='双层墙尚未完成，专程采石',
+            collect_reason='采集下一段城墙所需石料',
+        )
+        if cmd:
+            return True, cmd
     trace(state, role.id, 'wall_material_blocked', '缺墙但石矿不可达或背包已满', backpack_count=len(role.backpack))
     return False, None
 
@@ -804,7 +807,7 @@ def plan_opening(state):
         maybe_start_shop_item_job, own_station, plan_pioneer_tasks, pick_weapon_name,
         release_stale_repair_job, should_upgrade_weapon,
     )
-    from .economy import liquidate, muster_for_night, profitable_mine
+    from .economy import clear_mine_target, go_mine, liquidate, muster_for_night, profitable_mine
     from copy import copy
     base = own_station(state)
     if base is None:
@@ -975,25 +978,18 @@ def plan_opening(state):
             stones = role.backpack.count('stone')
             at_stone = any(z.neutral_type == 'stone' and chebyshev(role.pos, z.pos) <= 1 for z in state.map_info.zones)
             if stones == 0 or (at_stone and stones < min(STONE_BATCH, (len(missing)+1)//2) and remaining > 12):
-                mines = sorted((z for z in state.map_info.zones if z.neutral_type == 'stone'),
-                               key=lambda z: chebyshev(role.pos, z.pos))
-                for mine in mines:
-                    path = adjacent_path(role, mine.pos, blocked | reserved, state)
-                    if path is None:
-                        continue
-                    if not path and len(role.backpack) < role.back_pack_capability:
-                        commands[role.id] = selected(
-                            state, role.id,
-                            {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]},
-                            '为连续建墙批量采石')
-                    elif path and len(role.backpack) < role.back_pack_capability:
-                        commands[role.id] = move_on_path(state, role, path, reserved, '前往可达石矿准备建墙材料')
-                    break
-                if role.id in commands:
+                cmd = go_mine(
+                    role, state, blocked, reserved, want_ores=('stone',), purpose='stone',
+                    travel_reason='前往可达石矿准备建墙材料',
+                    collect_reason='为连续建墙批量采石',
+                )
+                if cmd:
+                    commands[role.id] = cmd
                     continue
             if stones == 0:
                 trace(state, role.id, 'wall_no_stone', '没有石头，且没有可执行的采石行动')
                 continue
+            clear_mine_target(state, role.id)
         else:
             cmd = profitable_mine(role, budget_state, blocked, reserved)
             if cmd:

@@ -92,6 +92,15 @@ class TreasureUnitTests(unittest.TestCase):
         self.assertTrue(any(e.get("code") == "treasure_buy_deferred" for e in state.decision_events))
         self.assertFalse(treasure_should_claim_pioneer(state, pioneer, self.memory))
 
+    def test_low_confidence_does_not_claim_or_buy(self):
+        self.memory.data["treasureHypothesis"]["confidence"] = 0.4
+        self.memory.data["treasureHypothesis"]["ready"] = True
+        state, pioneer = make_state(round_no=400, pioneer_pos=(14, 15), backpack=[])
+        blocked, reserved = build_blocked_set(state), set()
+        self.assertFalse(treasure_should_claim_pioneer(state, pioneer, self.memory))
+        self.assertIsNone(decide_treasure_action(pioneer, state, self.memory, blocked, reserved))
+        self.assertTrue(any(e.get("code") == "treasure_low_confidence" for e in state.decision_events))
+
     def test_wait_outside_window(self):
         state, pioneer = make_state(round_no=100, backpack=["AcientTablet", "StarSand"])
         blocked, reserved = set(), set()
@@ -113,7 +122,7 @@ class TreasureUnitTests(unittest.TestCase):
         self.assertIsNone(self.memory.data["treasureHypothesis"])
         self.assertTrue(self.memory.data["needTreasureDecode"])
 
-    def test_treasure_preempts_accept_task(self):
+    def test_treasure_json_does_not_preempt_accept_task(self):
         state, pioneer = make_state(
             round_no=210, pioneer_pos=(12, 13),
             backpack=["AcientTablet", "StarSand"], tasks_valid=True,
@@ -122,8 +131,7 @@ class TreasureUnitTests(unittest.TestCase):
         blocked, reserved = build_blocked_set(state), set()
         self.assertTrue(treasure_should_claim_pioneer(state, pioneer, self.memory))
         handled, cmd = decide_pioneer_task(pioneer, state, blocked, reserved)
-        self.assertTrue(handled)
-        self.assertEqual(cmd["action"], "summonTreasure")
+        self.assertNotEqual((cmd or {}).get("action"), "summonTreasure")
 
 
 class TreasureHttpTests(unittest.TestCase):
@@ -152,12 +160,11 @@ class TreasureHttpTests(unittest.TestCase):
         for task in self.payload["teamOur"]["playerTasks"]:
             task["isValid"] = False
 
-    def test_decode_then_summon_via_http(self):
+    def test_decode_writes_folk_plan_without_summon(self):
         first = self.client.post("/", json=self.payload)
         self.assertEqual(first.status_code, 200)
         body = first.get_json()
         self.assertIn("民间传闻", body["prompt"])
-        # 下一回合注入 LLM 结果
         self.payload["roundNo"] = 201
         self.payload["llmResp"] = json.dumps({
             "ready": True,
@@ -170,9 +177,12 @@ class TreasureHttpTests(unittest.TestCase):
         second = self.client.post("/", json=self.payload)
         self.assertEqual(second.status_code, 200)
         cmds = second.get_json()["roleCommandMap"]
-        self.assertIn("10011", cmds)
-        self.assertEqual(cmds["10011"]["action"], "summonTreasure")
-        # 解码结果应写入本回合决策报告，不被 decision_events 清空冲掉
+        pioneer_cmd = cmds.get("10011") or {}
+        self.assertNotEqual(pioneer_cmd.get("action"), "summonTreasure")
+        plan = self.server.news_memory.data.get("folkPlan") or {}
+        self.assertEqual(plan.get("altarPos"), {"x": 12, "y": 12})
+        self.assertEqual(plan.get("items"), ["AcientTablet", "StarSand"])
+        self.assertEqual(plan.get("source"), "llm")
         reports = sorted((self.root / "logs").glob("decision_*.json"))
         self.assertTrue(reports)
         decoded = json.loads(reports[-1].read_text(encoding="utf-8"))
