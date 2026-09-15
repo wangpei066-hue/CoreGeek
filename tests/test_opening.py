@@ -22,14 +22,17 @@ def opening_state():
 
 
 class OpeningTests(unittest.TestCase):
-    def test_wanted_loadout_is_three_rockets(self):
+    def test_wanted_loadout_is_two_rockets_one_railgun(self):
         state = opening_state()
         self.assertEqual(pick_weapon_name(state), 'rocket')
         state.team_our.roles.append(make_role(20, 12, 10, 'rocket', level=1))
         self.assertEqual(pick_weapon_name(state), 'rocket')
         state.team_our.roles.append(make_role(21, 11, 10, 'rocket', level=1))
+        self.assertEqual(pick_weapon_name(state), 'railgun')
+        # extra_names 表示本回合已规划的建造，视同已占用该槽位，不再重复要电磁炮。
+        self.assertEqual(pick_weapon_name(state, ('railgun',)), 'rocket')
+        state.team_our.roles.append(make_role(22, 13, 10, 'railgun', level=1))
         self.assertEqual(pick_weapon_name(state), 'rocket')
-        self.assertEqual(pick_weapon_name(state, ('rocket',)), 'rocket')
 
     def test_initial_workers_build_rockets_before_walls(self):
         state = opening_state()
@@ -312,12 +315,13 @@ class OpeningTests(unittest.TestCase):
                     role.backpack.append('stone')
                 elif cmd['action'] == 'build':
                     if cmd['name'] == 'wall':
-                        self.assertGreaterEqual(sum(r.role_type == 'rocket' for r in state.team_our.roles), 3)
+                        self.assertGreaterEqual(
+                            sum(r.role_type in ('rocket', 'railgun') for r in state.team_our.roles), 3)
                         role.backpack.remove('stone')
                         wall_built = True
                     else:
                         self.assertFalse(wall_built)
-                        self.assertEqual(cmd['name'], 'rocket')
+                        self.assertIn(cmd['name'], ('rocket', 'railgun'))
                         state.team_our.gold_num -= 25
                     pos = cmd['targetPos'][0]
                     state.team_our.roles.append(make_role(100+len(state.team_our.roles), pos['x'], pos['y'], cmd['name'], level=1, attack_range=10))
@@ -330,8 +334,8 @@ class OpeningTests(unittest.TestCase):
                 weapon = assignments[role.id]
                 self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 2)
         kinds = [r.role_type for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
-        self.assertEqual(sorted(kinds), ['rocket', 'rocket', 'rocket'])
-        xs = [r.pos.x for r in state.team_our.roles if r.role_type == 'rocket']
+        self.assertEqual(sorted(kinds), ['railgun', 'rocket', 'rocket'])
+        xs = [r.pos.x for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
         self.assertEqual(len(set(xs)), 2)
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
         primary = set(primary_wall_plan(state, state.team_our.roles[0]))
