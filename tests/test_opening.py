@@ -160,12 +160,14 @@ class OpeningTests(unittest.TestCase):
             if cmd.get('action') == 'collect':
                 self.assertNotEqual(cmd['targetPos'][0], {'x': 6, 'y': 9})
 
-    def test_day1_mines_stone_after_front_weapon_is_level_two(self):
+    def test_day1_mines_stone_after_two_weapons_are_level_two(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 0
         self._rockets(state)
-        next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
+        rockets = [r for r in state.team_our.roles if r.role_type == 'rocket']
+        rockets[0].level = 2
+        rockets[1].level = 2
         state.map_info.zones = [
             Zone(Pos(6, 9), 'stone'),
             Zone(Pos(9, 6), 'copper'),
@@ -180,6 +182,23 @@ class OpeningTests(unittest.TestCase):
         self.assertIn('stone', ores)
         self.assertNotIn('copper', ores)
         self.assertNotIn('iron', ores)
+
+    def test_day1_second_upgrade_when_gold_and_time_allow(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 250
+        self._rockets(state)
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        pioneer.pos = Pos(8, 9)
+        worker.pos = Pos(8, 10)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        buys = [c for c in commands.values() if c.get('action') == 'buy'
+                and c.get('name') == 'WeaponUpgradeVoucher1']
+        self.assertGreaterEqual(len(buys), 2)
+        weapon_jobs = [j for j in state.worker_item_jobs.values() if j.get('kind') == 'weapon']
+        self.assertGreaterEqual(len(weapon_jobs), 2)
 
     def test_gold_in_hand_still_buys_voucher_when_wall_time_is_tight(self):
         state = opening_state()
@@ -208,7 +227,7 @@ class OpeningTests(unittest.TestCase):
 
     def test_cooldown_does_not_assign_same_weapon_twice(self):
         state = opening_state()
-        state.round_no = 75
+        state.round_no = 80
         state.team_our.roles += [make_role(20, 9, 10, 'rocket', cooldown=2, level=1),
                                  make_role(21, 12, 10, 'gatling', level=1),
                                  make_role(22, 10, 11, 'railgun', level=1)]
@@ -683,12 +702,56 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         self.assertEqual(day_rounds_remaining(70), 0)
         self.assertEqual(day_rounds_remaining(129), 0)
 
+    def test_day1_defense_slack_is_not_official_night(self):
+        from src.agent.opening import (
+            DAY1_L2_GUNNER_READY_CYCLE, DAY1_OTHER_READY_CYCLE,
+            defense_ready_cycle, defense_rounds_remaining, first_night_economy_open,
+        )
+        state = opening_state()
+        self._rockets(state)
+        state.round_no = 69
+        self.assertEqual(day_rounds_remaining(69), 1)
+        self.assertEqual(defense_ready_cycle(state), DAY1_OTHER_READY_CYCLE)
+        self.assertEqual(defense_rounds_remaining(state), 7)
+        self.assertFalse(first_night_economy_open(state))
+        next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
+        self.assertEqual(defense_ready_cycle(state), DAY1_L2_GUNNER_READY_CYCLE)
+        from src.agent.opening import assign_weapons
+        mapping = assign_weapons(state)
+        l2 = next(r for r in state.team_our.roles if r.role_type == 'rocket' and (r.level or 1) >= 2)
+        gunner = next(role for role in state.team_our.roles if mapping.get(role.id) and mapping[role.id].id == l2.id)
+        other = next(role for role in state.team_our.roles if mapping.get(role.id) and mapping[role.id].id != l2.id)
+        self.assertEqual(defense_rounds_remaining(state, gunner), DAY1_L2_GUNNER_READY_CYCLE - 69)
+        self.assertEqual(defense_rounds_remaining(state, other), DAY1_OTHER_READY_CYCLE - 69)
+
+    def test_first_night_without_robots_keeps_opening_until_ready(self):
+        state = opening_state()
+        self._rockets(state)
+        state.round_no = 72
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        state.team_our.gold_num = 130
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertTrue(any(e['code'] == 'opening_phase' for e in state.decision_events))
+        self.assertFalse(any(e['code'] == 'opening_night_guard' for e in state.decision_events))
+        self.assertTrue(commands)
+
     def test_night_does_not_restart_opening_economy(self):
         state = opening_state()
         self._rockets(state)
-        state.round_no = 75
+        state.round_no = 80
         self.assertEqual(plan_opening(state), {})
         self.assertTrue(any(e['code'] == 'opening_night_guard' for e in state.decision_events))
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertFalse(any(e['code'] == 'opening_phase' for e in state.decision_events))
+        self.assertFalse(any(c.get('action') in ('collect', 'buy', 'sell') for c in commands.values()))
+
+    def test_first_night_robots_cut_opening_economy(self):
+        from src.agent.protocol import RobotRole
+        state = opening_state()
+        self._rockets(state)
+        state.round_no = 72
+        state.robot.roles = [RobotRole(100, Pos(20, 10), 'largeRobot', 100)]
+        self.assertEqual(plan_opening(state), {})
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertFalse(any(e['code'] == 'opening_phase' for e in state.decision_events))
         self.assertFalse(any(c.get('action') in ('collect', 'buy', 'sell') for c in commands.values()))

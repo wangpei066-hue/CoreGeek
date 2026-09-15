@@ -400,7 +400,6 @@ class TacticalTests(unittest.TestCase):
         buys = [c.get('name') for c in commands.values() if c.get('action') == 'buy']
         self.assertNotIn('AcientTablet', buys)
         self.assertFalse(any(isinstance(name, str) and name.endswith('SummonOrder') for name in buys))
-        self.assertFalse(any(isinstance(name, str) and name.startswith('StationUpgrade') for name in buys))
 
     def test_no_offense_when_base_is_in_danger_or_budget_low(self):
         for health, gold in ((500, 400), (1500, 110)):

@@ -12,8 +12,13 @@ from .decision_log import trace, selected
 WALL_MARGIN = 2
 STONE_BATCH = 6  # 墙阶段两名工人各备半圈，减少往返。
 MUSTER_BUFFER = 3
+# 首日夜防到位是观测参数，不是官方昼夜分界（官方仍是白天70、夜晚60）。
+# 约 70–80 机器人在走路；2 级火箭约 76 开火。操作 2 级火箭的人 75 前到位，其他人 76 前到位。
+DAY1_L2_GUNNER_READY_CYCLE = 75
+DAY1_OTHER_READY_CYCLE = 76
 DAY1_WALL_TARGET = 8
 DAY2_WALL_TARGET = 12
+DAY1_WEAPON_L2_TARGET = 2  # 首日最好升两门到 2 级；钱或回合不够则只升一门。
 WALL_STEP_SLACK = 1    # 每段墙在建造外再留1回合走位。
 LATE_BUILD_SLACK = 2   # 墙工时 overrun 的初值，随后按入夜时是否仍缺墙调整。
 MAX_WALL_OVERRUN = 12
@@ -227,7 +232,7 @@ def wall_finish_rounds(state, missing, blocked):
 
 
 def day_rounds_remaining(round_no):
-    """当前白天周期内距离入夜的剩余回合；夜间为 0，不把负数传给开局预算。"""
+    """当前白天周期内距离官方入夜（cycle 70）的剩余回合；夜间为 0。"""
     from .brain import DAY_NIGHT_CYCLE, DAY_ROUNDS
     if round_no is None:
         return DAY_ROUNDS
@@ -235,6 +240,39 @@ def day_rounds_remaining(round_no):
     if cycle >= DAY_ROUNDS:
         return 0
     return DAY_ROUNDS - cycle
+
+
+def defense_ready_cycle(state, role=None):
+    """本周期应回到炮位的 cycle。次日仍按官方 70；首日按 2 级火箭开火观测放宽。"""
+    from .brain import DAY_ROUNDS, WEAPON_TYPES
+    if (state.round_no or 0) // 130 > 0:
+        return DAY_ROUNDS
+    if role is not None:
+        weapon = assign_weapons(state).get(role.id)
+        if weapon and weapon.role_type == 'rocket' and (weapon.level or 1) >= 2:
+            return DAY1_L2_GUNNER_READY_CYCLE
+        return DAY1_OTHER_READY_CYCLE
+    rockets = [r for r in (state.team_our.roles if state.team_our else [])
+               if r.role_type == 'rocket' and r.health > 0 and (r.level or 1) >= 2]
+    return DAY1_L2_GUNNER_READY_CYCLE if rockets else DAY1_OTHER_READY_CYCLE
+
+
+def defense_rounds_remaining(state, role=None):
+    """距该角色夜防到位点的剩余回合；过点为 0。"""
+    from .brain import DAY_NIGHT_CYCLE
+    cycle = (state.round_no or 0) % DAY_NIGHT_CYCLE
+    return max(0, defense_ready_cycle(state, role) - cycle)
+
+
+def first_night_economy_open(state):
+    """首日官方入夜后、2 级火箭开火前：无可见敌人时仍走开局经济。"""
+    n = state.round_no or 0
+    if n >= 130 or n < 70:
+        return False
+    from .tactics import imminent_contact, pressure, threat_robots
+    if pressure(state) or imminent_contact(state) or threat_robots(state):
+        return False
+    return (n % 130) < DAY1_OTHER_READY_CYCLE
 
 
 def _actor_at(role, pos):
@@ -421,14 +459,17 @@ def _estimate_actor_upgrade(role, state, blocked, gold, voucher_cost, weapon, pr
     )
 
 
-def estimate_opening_upgrade(state, blocked, gold=None):
+def estimate_opening_upgrade(state, blocked, gold=None, pending_targets=None):
     """按真实连续路线估算升一门到 2 级所需回合；不可达返回 ok=False、total=None。"""
     from .brain import WEAPON_TYPES, _pick_upgradeable, item_cost
     from .economy import metal_inventory_value, ore_prices
     gold = state.team_our.gold_num if gold is None and state.team_our else (0 if gold is None else gold)
     voucher_cost = item_cost('WeaponUpgradeVoucher1', state)
     prices = ore_prices(state)
-    weapon = _pick_upgradeable(state, WEAPON_TYPES, set(), max_current_level=2)
+    pending = set() if pending_targets is None else set(pending_targets)
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, pending, max_current_level=1)
+    if weapon is None:
+        weapon = _pick_upgradeable(state, WEAPON_TYPES, pending, max_current_level=2)
     fighters = [r for r in (state.team_our.roles if state.team_our else [])
                 if r.role_type in ('worker', 'pioneer') and r.health > 0]
     inventory_total = sum(metal_inventory_value(r, state) for r in fighters if r.role_type == 'worker')
@@ -478,13 +519,60 @@ def voucher_trip_rounds(state, blocked, gold, need_sell=True):
     return est['total'] if est.get('ok') else None
 
 
+def reserved_unbought_weapon_gold(state):
+    from .brain import item_cost
+    total = 0
+    for role in (state.team_our.roles if state.team_our else []):
+        job = state.worker_item_jobs.get(role.id)
+        if job and job.get('kind') == 'weapon' and job.get('item') not in role.backpack:
+            total += item_cost(job['item'], state)
+    return total
+
+
+def live_l2_weapon_count(state):
+    from .brain import WEAPON_TYPES
+    return sum(1 for r in (state.team_our.roles if state.team_our else [])
+               if r.role_type in WEAPON_TYPES and r.health > 0 and (r.level or 1) >= 2)
+
+
+def day1_second_upgrade_fits(state, blocked=None):
+    """首日第二门：现金+背包矿够一张券，且升级链路能在到位点前完成。"""
+    from .brain import _pending_item_job_targets, item_cost
+    from .economy import metal_inventory_value
+    from .grid import build_blocked_set
+    if (state.round_no or 0) // 130 > 0:
+        return False
+    if blocked is None:
+        blocked = build_blocked_set(state)
+    cost = item_cost('WeaponUpgradeVoucher1', state)
+    gold = (state.team_our.gold_num if state.team_our else 0) - reserved_unbought_weapon_gold(state)
+    inventory = sum(metal_inventory_value(r, state)
+                    for r in (state.team_our.roles if state.team_our else [])
+                    if r.role_type == 'worker' and r.health > 0)
+    if gold + inventory < cost:
+        return False
+    remaining = defense_rounds_remaining(state)
+    est = estimate_opening_upgrade(
+        state, blocked, gold=max(0, gold), pending_targets=_pending_item_job_targets(state),
+    )
+    total = est.get('total')
+    if not est.get('ok') or total is None:
+        return False
+    return remaining > total + MUSTER_BUFFER
+
+
 def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked):
     """首日切换点：完整升级链路来得及则采铜铁升炮；券/金币就绪则升炮与修墙并行。"""
     wall_need = wall_finish_rounds(state, missing, blocked)
     wall_deadline = wall_need + muster_need
     can_finish_walls = remaining > wall_deadline
-    est = estimate_opening_upgrade(state, blocked, gold)
-    if upgraded_once:
+    upgraded_count = int(upgraded_once) if isinstance(upgraded_once, bool) else int(upgraded_once or 0)
+    pending = None
+    if upgraded_count >= 1:
+        from .brain import _pending_item_job_targets
+        pending = _pending_item_job_targets(state)
+    est = estimate_opening_upgrade(state, blocked, gold, pending_targets=pending)
+    if upgraded_count >= DAY1_WEAPON_L2_TARGET:
         est = dict(est)
         est['status'] = 'already_upgraded'
         est['ok'] = True
@@ -500,8 +588,9 @@ def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_o
         'action_rounds': est.get('action_rounds') or 0,
         'total_upgrade_rounds': est.get('total'),
         'fallback_reason': est.get('fallback_reason'),
+        'upgraded_count': upgraded_count,
     }
-    if upgraded_once:
+    if upgraded_count >= DAY1_WEAPON_L2_TARGET:
         budget.update(allow_walls=True, allow_upgrade=False, allow_sell=False, allow_mine=False)
         return budget
     has_voucher = any(
@@ -546,19 +635,40 @@ def staged_wall_missing(state):
     return [p for p in staged_wall_plan(state, base) if p not in existing]
 
 
-def station_return_steps(role, state, blocked, from_pos=None):
-    """走到操炮位（或基地旁）的步数；找不到路返回 None，不能当成固定 8 回合可达。"""
+def station_return_detail(role, state, blocked, from_pos=None):
+    """回炮步数及原因。已在操炮/基地邻格可以为 0；无路径、无炮位、无基地是未知，不能记成 0。"""
     from dataclasses import replace
     actor = replace(role, pos=from_pos) if from_pos is not None else role
+    stand = {'x': actor.pos.x, 'y': actor.pos.y}
     weapon = assign_weapons(state).get(role.id)
+    if weapon is not None and chebyshev(actor.pos, weapon.pos) <= 1 and actor.pos != weapon.pos:
+        return dict(steps=0, reason='already_at_weapon', alreadyAtPost=True,
+                    weaponId=weapon.id, stand=stand)
     if weapon is None:
-        base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+        base = next((r for r in state.team_our.roles if r.role_type == 'station' and r.health > 0), None)
         if base is None:
-            return 0
+            return dict(steps=None, reason='no_station_or_weapon', alreadyAtPost=False,
+                        weaponId=None, stand=stand)
+        if chebyshev(actor.pos, base.pos) <= 1 and actor.pos != base.pos:
+            return dict(steps=0, reason='already_at_station', alreadyAtPost=True,
+                        weaponId=None, stand=stand)
         path = adjacent_path(actor, base.pos, blocked, state)
-        return None if path is None else len(path)
+        if path is None:
+            return dict(steps=None, reason='no_path_to_station', alreadyAtPost=False,
+                        weaponId=None, stand=stand)
+        return dict(steps=len(path), reason='already_at_station' if not path else 'path_to_station',
+                    alreadyAtPost=not path, weaponId=None, stand=stand)
     path = station_path(actor, weapon, blocked, state)
-    return None if path is None else len(path)
+    if path is None:
+        return dict(steps=None, reason='no_path_to_weapon', alreadyAtPost=False,
+                    weaponId=weapon.id, stand=stand)
+    return dict(steps=len(path), reason='already_at_weapon' if not path else 'path_to_weapon',
+                alreadyAtPost=not path, weaponId=weapon.id, stand=stand)
+
+
+def station_return_steps(role, state, blocked, from_pos=None):
+    """走到操炮位（或基地旁）的步数；找不到路返回 None，不能当成固定 8 回合可达。"""
+    return station_return_detail(role, state, blocked, from_pos=from_pos)['steps']
 
 
 def wall_overrun_margin(state):
@@ -635,30 +745,34 @@ def full_wall_build_window(state, role=None):
     from .tactics import night_wave_cleared
     if night_wave_cleared(state):
         return True
-    if (state.round_no or 0) < 70:
+    if first_night_economy_open(state) or (state.round_no or 0) < 70:
         return True
-    cycle = (state.round_no or 0) % 130
-    if cycle >= 70:
+    if defense_rounds_remaining(state, role) <= 0:
         return False
     missing = staged_wall_missing(state)
     if not missing:
         return False
-    remaining = 70 - cycle
-    return remaining <= worker_wall_muster_rounds(state, role, missing)
+    return defense_rounds_remaining(state, role) <= worker_wall_muster_rounds(state, role, missing)
 
 
 def worker_should_build_walls(state, role=None):
     """正面缺口有石就补；侧翼和外层等基本防线形成后再按回炮工时安排。"""
+    from .brain import structure_priority_day
     from .tactics import night_wave_cleared, night_near_work_allowed
     if night_wave_cleared(state):
         return True
-    if (state.round_no or 0) < 70:
+    if first_night_economy_open(state) or (state.round_no or 0) < 70:
         return True
-    cycle = (state.round_no or 0) % 130
-    if cycle >= 70:
+    if defense_rounds_remaining(state, role) <= 0:
         return bool(night_near_work_allowed(state) and critical_wall_missing(state))
     if critical_wall_missing(state):
         return True
+    if structure_priority_day(state):
+        missing = staged_wall_missing(state)
+        if not missing:
+            return False
+        need = worker_wall_muster_rounds(state, role, missing)
+        return defense_rounds_remaining(state, role) > need
     return full_wall_build_window(state, role)
 
 
@@ -971,7 +1085,7 @@ def emergency_front_seal(role, state, blocked, reserved):
     if job and job.get('item') in role.backpack:
         return None
     travel = station_return_steps(role, state, blocked)
-    arrival = threat_eta_to_base(state)
+    arrival = threat_eta_to_base(state, role)
     if travel is None:
         return None
     if arrival is not None and 1 + travel + MUSTER_BUFFER >= arrival and not threat_robots(state):
@@ -1044,9 +1158,10 @@ def plan_opening(state):
     )
     from .economy import clear_mine_target, go_mine, liquidate, muster_for_night, profitable_mine
     from copy import copy
-    if not is_day_round(state.round_no):
-        trace(state, None, 'opening_night_guard', '开局计划只在白天运行，夜间不采矿买券修墙',
-              round_no=state.round_no, remaining=day_rounds_remaining(state.round_no))
+    if not is_day_round(state.round_no) and not first_night_economy_open(state):
+        trace(state, None, 'opening_night_guard', '开局计划只在白天和首日入夜后到位点前运行',
+              round_no=state.round_no, remaining=day_rounds_remaining(state.round_no),
+              defense_remaining=defense_rounds_remaining(state))
         return {}
     base = own_station(state)
     if base is None:
@@ -1060,7 +1175,7 @@ def plan_opening(state):
     blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
     commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
     assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
-    remaining = day_rounds_remaining(state.round_no)
+    remaining = defense_rounds_remaining(state)
     travel = [weapon_approach_path(r, assignments[r.id], blocked, set(), state)
               for r in fighters if r.id in assignments]
     reachable = [len(p) for p in travel if p is not None]
@@ -1069,20 +1184,23 @@ def plan_opening(state):
     else:
         muster_need = max(reachable + [0]) + MUSTER_BUFFER
     muster = bool(weapons) and remaining <= muster_need
-    upgraded_once = any((w.level or 1) >= 2 for w in weapons)
+    upgraded_count = sum(1 for w in weapons if (w.level or 1) >= 2)
+    upgraded_once = upgraded_count >= 1
     has_three = len(weapons) >= 3
     gold, builds = state.team_our.gold_num, 0
-    budget = opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_once, blocked)
-    if missing and state.policy_memory.get('opening_commit') == 'walls':
+    budget = opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_count, blocked)
+    if missing and state.policy_memory.get('opening_commit') == 'walls' and not budget.get('allow_mine'):
         budget['allow_mine'] = False
         budget['allow_sell'] = False
+    if budget.get('allow_upgrade') and budget.get('allow_mine'):
+        state.policy_memory.pop('opening_commit', None)
     allow_walls = has_three and budget['allow_walls']
     allow_upgrade = has_three and budget['allow_upgrade']
     allow_sell = has_three and budget['allow_sell']
     allow_mine = has_three and budget['allow_mine']
-    if has_three and missing and allow_walls and not allow_mine:
+    if has_three and missing and allow_walls and not allow_mine and not allow_upgrade:
         state.policy_memory['opening_commit'] = 'walls'
-    elif not missing or not has_three:
+    elif not missing or not has_three or (allow_upgrade and allow_mine):
         state.policy_memory.pop('opening_commit', None)
     if has_three:
         from .economy import pick_weapon_voucher_buyer
@@ -1098,8 +1216,13 @@ def plan_opening(state):
                 del state.worker_item_jobs[role_id]
                 trace(state, buyer.id, 'weapon_upgrade_job_transferred',
                       '武器升级券改派给完整代价更低的人', from_id=role_id)
-        if allow_upgrade and should_upgrade_weapon(state) and buyer:
-            maybe_start_shop_item_job(buyer, state)
+        if allow_upgrade:
+            for extra in (False, True):
+                if not should_upgrade_weapon(state):
+                    break
+                buyer = pick_weapon_voucher_buyer(state, blocked, extra=extra)
+                if buyer and buyer.id not in state.worker_item_jobs:
+                    maybe_start_shop_item_job(buyer, state)
     if muster:
         phase = '就位'
     elif not has_three:
@@ -1114,13 +1237,14 @@ def plan_opening(state):
         phase = '就位'
     trace(state, None, 'opening_phase', '第一天阶段计划', phase=phase, weapons=len(weapons),
           wall_goal=len(ring), walls_completed=len(ring)-len(missing), wall_missing=missing,
-            geometry_note='先三座火箭，再采铜铁升最前一门到2级，迎敌墙约8段；格子合法性由执行反馈确认',
-          rounds_to_night=remaining,
+            geometry_note='先三座火箭，再采铜铁升最多两门到2级（钱或回合不够则一门），迎敌墙约8段；格子合法性由执行反馈确认',
+          rounds_to_night=day_rounds_remaining(state.round_no),
+          rounds_to_defense=remaining,
           attack_from='右侧' if attack_direction(state, base) == 1 else '左侧', direction_source='用户确认的刷新规则')
     trace(state, None, 'opening_time_budget', '按完整升级链路判断继续升炮还是改去修墙',
           remaining=remaining, wall_need=budget['wall_need'], wall_deadline=budget['wall_deadline'],
           sell_trip=budget['sell_trip'], allow_walls=allow_walls, allow_upgrade=allow_upgrade,
-          allow_sell=allow_sell, gold=gold, upgraded=upgraded_once,
+          allow_sell=allow_sell, gold=gold, upgraded=upgraded_once, upgraded_count=upgraded_count,
           upgrade_status=budget.get('upgrade_status'), funding_deficit=budget.get('funding_deficit'),
           inventory_sale_value=budget.get('inventory_sale_value'), mine_rounds=budget.get('mine_rounds'),
           route_rounds=budget.get('route_rounds'), action_rounds=budget.get('action_rounds'),
@@ -1142,6 +1266,7 @@ def plan_opening(state):
         budget_state = copy(state)
         budget_state.team_our = copy(state.team_our)
         budget_state.team_our.gold_num = gold
+        role_muster = bool(weapons) and defense_rounds_remaining(state, role) <= muster_need
         if has_three and role.role_type == 'worker':
             from .opening import emergency_front_seal
             seal = emergency_front_seal(role, state, blocked, reserved)
@@ -1160,8 +1285,20 @@ def plan_opening(state):
         if handled:
             if cmd:
                 commands[role.id] = cmd
-            continue
-        trace(state, role.id, 'opening_rockets_first', '首日先三座火箭，再采铜铁升最前一门到2级，再补迎敌7-8段墙')
+                continue
+            from .economy import defense_occupancy
+            occupancy, snap = defense_occupancy(role, state, blocked)
+            if occupancy == 'must_hold':
+                trace(state, role.id, 'mandatory_hold_no_action',
+                      '必须留守或操炮，本回合不转去买券或采矿', occupancy=occupancy,
+                      defenseDueReasons=snap.get('defenseDueReasons'),
+                      threatEta=snap.get('threatEta'), travel=snap.get('travel'))
+                continue
+            trace(state, role.id, 'muster_empty_continue_economy',
+                  '已到家但无强制留守，muster 空返回不阻断后续经济评估',
+                  occupancy=occupancy, defenseDue=snap.get('defenseDue'),
+                  defenseDueReasons=snap.get('defenseDueReasons'))
+        trace(state, role.id, 'opening_rockets_first', '首日先三座火箭，再采铜铁升最多两门到2级，再补迎敌墙')
         if has_three:
             if allow_upgrade and role.role_type == 'worker':
                 cmd = decide_shop_item_job(role, budget_state, blocked, reserved)
@@ -1184,12 +1321,12 @@ def plan_opening(state):
                         del state.worker_item_jobs[role.id]
                         trace(state, role.id, 'weapon_upgrade_job_transferred',
                               '当前工人买不到券，转交给另一名工人', other_id=other.id)
-            if not muster and allow_sell and any(z.neutral_type == 'vendor' for z in state.map_info.zones):
+            if not role_muster and allow_sell and any(z.neutral_type == 'vendor' for z in state.map_info.zones):
                 handled, cmd = liquidate(role, budget_state, blocked, reserved)
                 if cmd:
                     commands[role.id] = cmd
                     continue
-            if not muster and allow_mine and not allow_walls and role.role_type == 'worker':
+            if not role_muster and allow_mine and not allow_walls and role.role_type == 'worker':
                 cmd = go_mine(
                     role, budget_state, blocked, reserved, want_ores=('iron', 'copper'), purpose='voucher',
                     travel_reason='按小贩报价前往凑够升级券总回合最短的铜铁矿',
@@ -1198,7 +1335,7 @@ def plan_opening(state):
                 if cmd:
                     commands[role.id] = cmd
                     continue
-        if muster:
+        if role_muster:
             weapon = assignments.get(role.id)
             if weapon:
                 trace(state, role.id, 'weapon_assignment', '夜间一人一炮，提前就位', weapon_id=weapon.id)
@@ -1240,7 +1377,7 @@ def plan_opening(state):
                 continue
             clear_mine_target(state, role.id)
         else:
-            if upgraded_once and role.role_type == 'worker':
+            if upgraded_count >= DAY1_WEAPON_L2_TARGET and role.role_type == 'worker':
                 cmd = profitable_mine(role, budget_state, blocked, reserved)
                 if cmd:
                     commands[role.id] = cmd

@@ -25,7 +25,7 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '武器' for e in state.decision_events))
 
     def test_opening_active_task_yields_at_muster_time(self):
-        for round_no in (0, 69):
+        for round_no in (0, 75):
             with self.subTest(round_no=round_no):
                 state = opening_state()
                 state.round_no = round_no

@@ -14,13 +14,25 @@ MARKER = 'PIONEER_TASK'
 EMPTY_WAIT_LIMIT = 2
 ARCHIVE_LIMIT = 8
 MIN_TASK_TIMEOUT_ROUNDS = 4
-PROMPT_VERSION = '20260915-failloop'
+PROMPT_VERSION = '20260915-solver3'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
 TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
 URL_RE = re.compile(r'https?://[^\s\'"\\]+')
 CITY_RE = re.compile(r'(北京|南京|成都|上海|广州|深圳|杭州|武汉|西安|重庆|天津|苏州|长沙|郑州|青岛|合肥|福州|厦门|昆明|哈尔滨|沈阳|济南|南昌|南宁|太原|石家庄)')
+CITY_LATIN = {
+    '北京': 'beijing', '南京': 'nanjing', '成都': 'chengdu', '上海': 'shanghai',
+    '广州': 'guangzhou', '深圳': 'shenzhen', '杭州': 'hangzhou', '武汉': 'wuhan',
+    '西安': 'xian', '重庆': 'chongqing', '天津': 'tianjin', '苏州': 'suzhou',
+    '长沙': 'changsha', '郑州': 'zhengzhou', '青岛': 'qingdao', '合肥': 'hefei',
+    '福州': 'fuzhou', '厦门': 'xiamen', '昆明': 'kunming', '哈尔滨': 'harbin',
+    '沈阳': 'shenyang', '济南': 'jinan', '南昌': 'nanchang', '南宁': 'nanning',
+    '太原': 'taiyuan', '石家庄': 'shijiazhuang',
+}
 SECRET_RE = re.compile(r'(?:Bearer\s+|密钥[:：]\s*|api[_-]?key[:：\s]+)([A-Za-z0-9._\-]+)', re.IGNORECASE)
+PAGE_PARAM_KEYS = frozenset({
+    'page', 'pageNo', 'page_no', 'offset', 'limit', 'size', 'pageSize', 'page_size',
+})
 INCOMPLETE_STAGES = (
     'read', 'wait_read', 'ask', 'wait_llm', 'tool', 'wait_tool',
     'probe', 'wait_probe', 'submit', 'wait_submit',
@@ -45,6 +57,7 @@ DEPLOYMENT_SOP = DEPLOYMENT_SOP_TEMPLATE + '''
 '''
 API_SOP = '''同一服务已有已验证调用经验时，优先复用路径、认证方式和城市参数，不重新猜测接口，也不要去读其他城市旧任务文件。
 缺少经验或经验失效时，再阅读当前任务的API文档并依据错误响应调整。
+已知接口用 curl -G --data-urlencode 查询，不要再包一层 python/urllib。中文参数交给 curl 编码。
 已知接口使用实际响应的 code、data.records、data.pagination；不要假定存在 status=success 或 items。
 HTTP/shell 成功不等于业务成功。code 非 200 时停止分页和统计。401 时停止依赖步骤并修正认证；参数错误时先改参数。
 查询成功不等于全量读取已验证。按 pagination 分页，检测重复页面、重复ID、总量不一致及无进展。
@@ -72,6 +85,8 @@ def extract_md_paths(task):
 
 def task_context(task):
     """优先工作区标签；运维描述允许唯一的绝对目录，不猜测歧义路径。"""
+    if not isinstance(task, str):
+        task = ''
     task = task.replace(r'\_', '_')
     match = re.search(
         r'(?:工作区(?:路径|目录)?|工作目录|项目(?:路径|目录)|workspace(?:\s*(?:path|directory))?)'
@@ -93,7 +108,8 @@ def task_context(task):
             workspace = candidates[0]
     if workspace or operations:
         kind = 'workspace'
-    elif re.search(r'(?<![a-z])API(?![a-z])|接口', task, re.IGNORECASE):
+    elif (extract_city(task)
+          or re.search(r'(?<![a-z])API(?![a-z])|接口|遗产|heritage', task, re.IGNORECASE)):
         kind = 'api'
     else:
         kind = 'unknown'
@@ -115,6 +131,35 @@ def extract_city(task):
         return match.group(1)
     match = re.search(r'(?:location|城市|city)\s*[=:：]\s*["\']?([^\s"\',，]+)', task or '', re.IGNORECASE)
     return match.group(1) if match else None
+
+
+def path_basename(path):
+    return normalize_target(path).rsplit('/', 1)[-1]
+
+
+def path_refers_to_other_city(path, city):
+    if not city or not path:
+        return False
+    text = str(path).replace('\\', '/')
+    lowered = text.lower()
+    for name, latin in CITY_LATIN.items():
+        if name == city:
+            continue
+        if name in text:
+            return True
+        if re.search(r'(?:^|[/_.-])%s(?:[/_.-]|\.md$|$)' % re.escape(latin), lowered):
+            return True
+    return False
+
+
+def relevant_md_paths(task):
+    city = extract_city(task)
+    return [path for path in extract_md_paths(task) if not path_refers_to_other_city(path, city)]
+
+
+def replay_extra_params(item):
+    extra = dict(item.get('extraParams') or {})
+    return {key: value for key, value in extra.items() if key not in PAGE_PARAM_KEYS}
 
 
 def extract_task_secret(task):
@@ -164,7 +209,31 @@ def match_key(state):
 
 def empty_experience(key=None):
     return dict(matchKey=key, promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
-                api=[], deploy=[])
+                api=[], deploy=[], durations={'workspace': [], 'api': [], 'unknown': []})
+
+
+def record_duration_sample(experience, session, reason, round_no):
+    """归档时记下领取到就绪/结束的回合差；失败和超时也计入，避免只学成功快题。"""
+    if not session:
+        return
+    kind = session.get('taskKind') or 'unknown'
+    metrics = session.get('metrics') or {}
+    accepted = metrics.get('acceptedRound')
+    if accepted is None or round_no is None:
+        return
+    ready = metrics.get('answerReadyRound')
+    if ready is not None:
+        duration = max(1, int(ready) - int(accepted))
+        outcome = 'answer_ready'
+    else:
+        duration = max(1, int(round_no) - int(accepted))
+        outcome = reason or session.get('endReason') or 'incomplete'
+    bucket = experience.setdefault('durations', {}).setdefault(kind, [])
+    bucket.append(dict(
+        duration=duration, outcome=outcome, kind=kind,
+        timeoutRounds=metrics.get('timeoutRounds'), archivedRound=round_no,
+    ))
+    experience['durations'][kind] = bucket[-8:]
 
 
 def empty_metrics(round_no):
@@ -238,6 +307,9 @@ def last_cmd_kind(text):
             return 'unrelated'
         if marker == MARKER:
             return 'payload'
+    status, payload, _raw = parse_curl_output(text)
+    if payload is not None and ('code' in payload or 'data' in payload):
+        return 'payload'
     return 'unmatched'
 
 
@@ -274,10 +346,12 @@ def service_hint(path, url, task):
 
 
 def matching_api_experience(experience, task):
-    items = [item for item in ((experience or {}).get('api') or []) if item.get('callVerified') or item.get('path')]
+    items = [item for item in ((experience or {}).get('api') or [])
+             if item.get('path') and not item.get('invalidReason')]
     urls = URL_RE.findall(task or '')
     task_hint = service_hint('', urls[0] if urls else '', task)
-    for item in items:
+    city = extract_city(task)
+    for item in reversed(items):
         base = item.get('baseUrl') or ''
         path = item.get('path') or ''
         if urls:
@@ -291,12 +365,15 @@ def matching_api_experience(experience, task):
         hint = item.get('serviceHint')
         if hint and (hint == task_hint or hint in (task or '')):
             return item
-    api_like = bool(re.search(r'(?<![a-z])API(?![a-z])|接口|遗产|heritage|location|查询', task or '', re.IGNORECASE))
     heritage_items = [item for item in items if item.get('serviceHint') == 'heritage']
+    if city and heritage_items:
+        return heritage_items[-1]
+    api_like = bool(city or re.search(
+        r'(?<![a-z])API(?![a-z])|接口|遗产|heritage|location|查询', task or '', re.IGNORECASE))
     if api_like and len(heritage_items) == 1:
         return heritage_items[0]
-    if api_like and len(items) == 1:
-        return items[0]
+    if api_like and items:
+        return items[-1]
     return None
 
 
@@ -319,6 +396,11 @@ def harvest_api_call(command, output, task):
     records_path = 'data.records' if isinstance(records, list) else None
     pagination = dotted_get(payload, 'data.pagination')
     params = {key: values[0] for key, values in parse_qs(parsed.query).items() if values}
+    for token in re.findall(r'--data-urlencode\s+(\'[^\']+\'|"[^"]+"|\S+)', command or ''):
+        pair = token.strip('\'"')
+        if '=' in pair:
+            key, value = pair.split('=', 1)
+            params.setdefault(key, value)
     city_param = 'location' if 'location' in params else next(
         (key for key in ('city', 'q', 'query') if key in params), None)
     method = 'POST' if re.search(r'\bPOST\b|method\s*=\s*[\'"]POST', command or '', re.IGNORECASE) else 'GET'
@@ -331,7 +413,10 @@ def harvest_api_call(command, output, task):
         method=method,
         authStyle=auth_style,
         cityParam=city_param,
-        extraParams={key: value for key, value in params.items() if key != city_param},
+        extraParams={
+            key: value for key, value in params.items()
+            if key != city_param and key not in PAGE_PARAM_KEYS
+        },
         recordsPath=records_path or 'data.records',
         paginationShape=sorted(pagination)[:12] if isinstance(pagination, dict) else None,
         pagination=None,
@@ -488,6 +573,24 @@ try:
         out['workspace'] = os.getcwd()
     else:
         out['workspace'] = os.getcwd()
+    converted = []
+    try:
+        for name in os.listdir('.'):
+            if name == 'check' or not os.path.isfile(name):
+                continue
+            if not (name.endswith('.sh') or name in ('start.sh', 'run.sh', 'app.sh', 'daemon.sh')):
+                continue
+            raw = open(name, 'rb').read()
+            if b'\r\n' not in raw:
+                continue
+            if not (raw.startswith(b'#!') or name.endswith('.sh')):
+                continue
+            open(name, 'wb').write(raw.replace(b'\r\n', b'\n'))
+            converted.append(name)
+    except OSError:
+        pass
+    if converted:
+        out['convertedCrlf'] = converted
     out_dir = q.get('outputDir') or tempfile.mkdtemp(prefix='pioneer_task_')
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, q['requestId'] + '.out')
@@ -602,249 +705,236 @@ out.update(listing=listing, files=files)
 print(json.dumps(out, ensure_ascii=False))
 '''
 
-FETCH_SCRIPT = r'''
-import json, re, sys, urllib.error, urllib.parse, urllib.request
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-except Exception:
-    pass
-q = json.loads(sys.argv[1])
-out = dict(marker='PIONEER_TASK', requestId=q.get('requestId'), event='api_fetch',
-           ok=False, callVerified=False, recordsComplete=False, completenessEvidence=None,
-           totalCount=0, typeCount=0, types=[], worldHeritageCount=0,
-           oldestEraName=None, oldestEraEvidence=None, city=q.get('city'),
-           httpStatus=None, businessCode=None, path=q.get('path'),
-           httpRequestCount=0, pagination=None)
+def sandbox_command(script, query):
+    return 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(json.dumps(query, ensure_ascii=False))
 
-def dotted(data, path):
-    cur = data
-    for part in (path or '').split('.'):
-        if not part:
-            continue
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        else:
-            return None
-    return cur
 
-def is_plain_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
-
-def request(params):
-    out['httpRequestCount'] = out.get('httpRequestCount', 0) + 1
-    url = q['baseUrl'].rstrip('/') + q['path']
-    if q.get('method', 'GET').upper() != 'GET':
-        raise RuntimeError('only GET replay is implemented')
-    query = urllib.parse.urlencode(params)
-    full = url + ('?' + query if query else '')
-    headers = {}
-    if q.get('token') and q.get('authStyle') == 'Authorization: Bearer':
-        headers['Authorization'] = 'Bearer ' + q['token']
-    req = urllib.request.Request(full, headers=headers, method='GET')
+def parse_curl_output(text):
+    """从 lastCmdResult 拆出 curl 正文和 -w HTTPSTATUS。"""
+    body = text or ''
+    if body.startswith('[exitCode:') and '\n' in body:
+        body = body.split('\n', 1)[1]
+    status = None
+    match = re.search(r'HTTPSTATUS:(\d+)\s*$', body)
+    if match:
+        status = int(match.group(1))
+        body = body[:match.start()].rstrip()
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            body = resp.read().decode('utf-8', errors='replace')
-            try:
-                parsed = json.loads(body)
-            except Exception:
-                parsed = {'error': body[:1000]}
-            return resp.status, parsed
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace')
-        try:
-            parsed = json.loads(body)
-        except Exception:
-            parsed = {'error': body[:1000]}
-        return e.code, parsed
+        payload = json.loads(body)
+    except ValueError:
+        return status, None, body
+    if not isinstance(payload, dict):
+        return status, None, body
+    return status, payload, body
 
-def stop(error):
-    out['error'] = error
-    print(json.dumps(out, ensure_ascii=False))
-    raise SystemExit
 
-params = dict(q.get('extraParams') or {})
-if q.get('cityParam') and q.get('city'):
-    params[q['cityParam']] = q['city']
-http_status, payload = request(params)
-out['httpStatus'] = http_status
-code = payload.get('code') if isinstance(payload, dict) else None
-out['businessCode'] = code
-if http_status == 401 or code in (401, '401'):
-    stop('auth_failed')
-if not isinstance(payload, dict):
-    stop('payload_not_object')
-if code not in (200, '200'):
-    stop('business_code_%s' % code)
-data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
-records = data.get('records')
-if not isinstance(records, list):
+def curl_api_command(query):
+    """沙盒只跑 curl；中文参数由 --data-urlencode 编码，分页由求解器续发。"""
+    if not query or not query.get('baseUrl') or not query.get('path'):
+        return ''
+    url = query['baseUrl'].rstrip('/') + query['path']
+    args = ['curl', '-sS', '-G', '--max-time', '8', '-w', 'HTTPSTATUS:%{http_code}']
+    token = query.get('token')
+    if token and query.get('authStyle') == 'Authorization: Bearer':
+        args += ['-H', 'Authorization: Bearer %s' % token]
+    params = dict(query.get('extraParams') or {})
+    for key in list(params):
+        if key in PAGE_PARAM_KEYS:
+            params.pop(key, None)
+    if query.get('cityParam') and query.get('city'):
+        params[query['cityParam']] = query['city']
+    if query.get('offset') is not None:
+        params['offset'] = str(query['offset'])
+    if query.get('limit') is not None:
+        params['limit'] = str(query['limit'])
+    for key, value in params.items():
+        args += ['--data-urlencode', '%s=%s' % (key, value)]
+    args.append(url)
+    return ' '.join(shlex.quote(part) for part in args)
+
+
+def _page_records(payload):
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else None
+    if data is not None and 'records' in data:
+        return data.get('records')
+    if 'records' in payload:
+        return payload.get('records')
+    return None
+
+
+def _page_meta(payload):
+    data = payload.get('data') if isinstance(payload, dict) and isinstance(payload.get('data'), dict) else {}
+    pag = data.get('pagination') if isinstance(data.get('pagination'), dict) else {}
+    sources = (pag, data, payload if isinstance(payload, dict) else {})
+
+    def get(*keys):
+        for src in sources:
+            for key in keys:
+                if key in src:
+                    return src.get(key)
+        return None
+
+    shown = {}
+    for src in sources:
+        for key, value in list(src.items())[:12]:
+            if key in ('total', 'totalCount', 'total_count', 'offset', 'limit', 'page',
+                       'pageNo', 'page_no', 'size', 'pageSize', 'page_size', 'hasNext', 'has_more'):
+                shown[key] = value
+    has_next = get('hasNext')
+    if has_next is None:
+        has_next = get('has_more')
+    return dict(
+        total=_pick_plain_int(get('total'), get('totalCount'), get('total_count')),
+        offset=_pick_plain_int(get('offset')),
+        limit=_pick_plain_int(get('limit'), get('pageSize'), get('page_size'), get('size')),
+        page=_pick_plain_int(get('page'), get('pageNo'), get('page_no')),
+        has_next=has_next,
+        shown=shown,
+    )
+
+
+def _pick_plain_int(*values):
+    for value in values:
+        if is_plain_int(value):
+            return value
+    return None
+
+
+def summarize_heritage_records(records, total=None, complete=False):
+    types = []
+    world_heritage = 0
+    oldest_name = None
+    oldest_year = None
+    fuzzy = []
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        kind = rec.get('type')
+        if isinstance(kind, str) and kind not in types:
+            types.append(kind)
+        if rec.get('protected_level') == '世界遗产':
+            world_heritage += 1
+        era = rec.get('era') or rec.get('age') or rec.get('year') or rec.get('dynasty')
+        name = rec.get('name') or rec.get('title') or rec.get('heritage')
+        year = None
+        if is_plain_int(era):
+            year = era
+        elif isinstance(era, str):
+            digits = re.findall(r'-?\d+', era)
+            if len(digits) == 1:
+                year = int(digits[0])
+            elif name:
+                fuzzy.append({'name': name, 'era': era})
+        elif era not in (None, '') and name:
+            fuzzy.append({'name': name, 'era': era})
+        if name and year is not None and (oldest_year is None or year < oldest_year):
+            oldest_year = year
+            oldest_name = name
+    stats = dict(
+        types=types, typeCount=len(types), worldHeritageCount=world_heritage,
+        oldestEraName=oldest_name,
+        oldestEraEvidence=None if oldest_year is None else ('year=%s' % oldest_year),
+        recordsCollected=len(records or []),
+        expectedTotal=total,
+        recordsComplete=bool(complete),
+        totalCount=total if complete and is_plain_int(total) else len(records or []),
+    )
+    if fuzzy and oldest_name is None:
+        stats['fuzzyEras'] = fuzzy
+    return stats
+
+
+def ingest_api_page(collected, payload, http_status=None):
+    """合并一页 API JSON。records 缺失不得变成空列表。未查全时带 nextOffset。"""
+    out = dict(
+        event='api_fetch', ok=False, callVerified=False, recordsComplete=False,
+        httpStatus=http_status, businessCode=None, error=None, nextOffset=None, nextLimit=None,
+        pagination=None, completenessEvidence=None,
+    )
+    if http_status == 401:
+        out['error'] = 'auth_failed'
+        return out
+    if not isinstance(payload, dict):
+        out['error'] = 'payload_not_object'
+        return out
+    code = payload.get('code')
+    out['businessCode'] = code
+    if code in (401, '401'):
+        out['error'] = 'auth_failed'
+        return out
+    if code not in (200, '200'):
+        out['error'] = 'business_code_%s' % code
+        return out
+    records = _page_records(payload)
+    if not isinstance(records, list):
+        out['callVerified'] = True
+        out['error'] = 'records_not_list'
+        return out
+    meta = _page_meta(payload)
+    out['pagination'] = meta.get('shown') or {}
     out['callVerified'] = True
-    stop('records_not_list')
-pagination = data.get('pagination') if isinstance(data.get('pagination'), dict) else {}
-out['pagination'] = {key: pagination[key] for key in list(pagination)[:12]}
-out['callVerified'] = True
-
-all_records = []
-seen = []
-def add_batch(batch):
+    seen = {rec.get('id') for rec in collected if isinstance(rec, dict) and rec.get('id') is not None}
     added = 0
-    for rec in batch or []:
+    for rec in records:
         if not isinstance(rec, dict):
             continue
         rid = rec.get('id')
         if rid is not None and rid in seen:
             continue
         if rid is not None:
-            seen.append(rid)
-        all_records.append(rec)
+            seen.add(rid)
+        collected.append(rec)
         added += 1
-    return added
-
-if add_batch(records) == 0 and records:
-    stop('duplicate_page')
-
-total = pagination.get('total')
-if not is_plain_int(total):
-    total = pagination.get('totalCount')
-has_next = pagination.get('hasNext')
-if has_next is None:
-    has_next = pagination.get('has_more')
-page_no = pagination.get('page') or pagination.get('pageNo') or 1
-if not is_plain_int(page_no):
-    page_no = 1
-
-while True:
-    if is_plain_int(total) and len(all_records) >= total:
-        break
-    if has_next is False:
-        break
-    if out['httpRequestCount'] >= 8 or page_no >= 50:
-        out['completenessEvidence'] = 'request_budget records=%s total=%s' % (len(all_records), total)
-        break
-    if not is_plain_int(total) and has_next is None and page_no == 1:
-        page_no += 1
-        extra = dict(params)
-        extra['page'] = page_no
-        http_status, more_payload = request(extra)
-        more_code = more_payload.get('code') if isinstance(more_payload, dict) else None
-        if http_status == 401 or more_code in (401, '401'):
-            stop('auth_failed')
-        if more_code not in (200, '200') or not isinstance(more_payload, dict):
-            out['recordsComplete'] = False
-            out['completenessEvidence'] = 'no_pagination_total; page2_not_success'
-            break
-        more_data = more_payload.get('data') if isinstance(more_payload.get('data'), dict) else {}
-        more = more_data.get('records')
-        if not isinstance(more, list) or not more:
-            out['recordsComplete'] = True
-            out['completenessEvidence'] = 'page2_empty'
-            break
-        added = add_batch(more)
-        if added == 0:
-            out['error'] = 'duplicate_page'
-            out['completenessEvidence'] = 'duplicate_ids page=%s' % page_no
-            break
-        out['recordsComplete'] = False
-        out['completenessEvidence'] = 'page2_nonempty=%s; need pagination.total' % added
-        break
-    page_no += 1
-    extra = dict(params)
-    extra['page'] = page_no
-    http_status, more_payload = request(extra)
-    more_code = more_payload.get('code') if isinstance(more_payload, dict) else None
-    if http_status == 401 or more_code in (401, '401'):
-        stop('auth_failed')
-    if more_code not in (200, '200') or not isinstance(more_payload, dict):
-        out['error'] = 'page_business_code_%s' % more_code
-        out['completenessEvidence'] = 'stopped_on_page_error'
-        break
-    more_data = more_payload.get('data') if isinstance(more_payload.get('data'), dict) else {}
-    more = more_data.get('records')
-    pag = more_data.get('pagination') if isinstance(more_data.get('pagination'), dict) else {}
-    if is_plain_int(pag.get('total')):
-        total = pag.get('total')
-    if 'hasNext' in pag:
-        has_next = pag.get('hasNext')
-    elif 'has_more' in pag:
-        has_next = pag.get('has_more')
-    if not isinstance(more, list) or not more:
-        if is_plain_int(total) and len(all_records) < total:
-            out['error'] = 'total_mismatch'
-            out['completenessEvidence'] = 'empty_page_before_total=%s records=%s' % (total, len(all_records))
-        else:
-            out['recordsComplete'] = True
-            out['completenessEvidence'] = 'empty_next_page records=%s' % len(all_records)
-        break
-    added = add_batch(more)
-    if added == 0:
+    if added == 0 and records:
         out['error'] = 'duplicate_page'
-        out['completenessEvidence'] = 'duplicate_ids page=%s' % page_no
-        break
-
-if is_plain_int(total):
-    out['recordsComplete'] = len(all_records) == total and out.get('error') not in ('duplicate_page', 'auth_failed')
-    out['completenessEvidence'] = out.get('completenessEvidence') or (
-        'pagination.total=%s records=%s' % (total, len(all_records)))
-    if len(all_records) != total and not out.get('error'):
+        out['completenessEvidence'] = 'duplicate_ids records=%s' % len(collected)
+        return out
+    total = meta.get('total')
+    limit = meta.get('limit')
+    has_next = meta.get('has_next')
+    stats = summarize_heritage_records(collected, total=total, complete=False)
+    out.update(stats)
+    out['callVerified'] = True
+    if is_plain_int(total) and len(collected) == total:
+        out['recordsComplete'] = True
+        out['completenessEvidence'] = 'pagination.total=%s records=%s' % (total, len(collected))
+        out['totalCount'] = total
+        out['ok'] = True
+        return out
+    if has_next is False and not is_plain_int(total):
+        out['recordsComplete'] = True
+        out['completenessEvidence'] = 'has_next_false records=%s' % len(collected)
+        out['ok'] = True
+        return out
+    if is_plain_int(total) and len(collected) < total:
         out['error'] = 'total_mismatch'
-
-types = []
-world_heritage = 0
-oldest_name = None
-oldest_year = None
-fuzzy = []
-for rec in all_records:
-    if not isinstance(rec, dict):
-        continue
-    kind = rec.get('type')
-    if isinstance(kind, str) and kind not in types:
-        types.append(kind)
-    if rec.get('protected_level') == '世界遗产':
-        world_heritage += 1
-    era = rec.get('era') or rec.get('age') or rec.get('year') or rec.get('dynasty')
-    name = rec.get('name') or rec.get('title') or rec.get('heritage')
-    year = None
-    if is_plain_int(era):
-        year = era
-    elif isinstance(era, str):
-        digits = re.findall(r'-?\d+', era)
-        if len(digits) == 1:
-            year = int(digits[0])
-        elif name:
-            fuzzy.append({'name': name, 'era': era})
-    elif era not in (None, '') and name:
-        fuzzy.append({'name': name, 'era': era})
-    if name and year is not None and (oldest_year is None or year < oldest_year):
-        oldest_year = year
-        oldest_name = name
-out['types'] = types
-out['typeCount'] = len(types)
-out['worldHeritageCount'] = world_heritage
-out['oldestEraName'] = oldest_name
-out['oldestEraEvidence'] = None if oldest_year is None else ('year=%s' % oldest_year)
-if fuzzy and oldest_name is None:
-    out['fuzzyEras'] = fuzzy
-out['totalCount'] = len(all_records)
-out['ok'] = bool(out['callVerified'] and out.get('error') is None)
-print(json.dumps(out, ensure_ascii=False))
-'''
+        out['completenessEvidence'] = 'pagination.total=%s records=%s' % (total, len(collected))
+        out['nextOffset'] = len(collected)
+        out['nextLimit'] = limit if is_plain_int(limit) else 10
+        return out
+    out['error'] = 'total_mismatch'
+    out['completenessEvidence'] = 'no_total records=%s; refuse to treat first page as complete' % len(collected)
+    return out
 
 
-def sandbox_command(script, query):
-    return 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(json.dumps(query, ensure_ascii=False))
-
-
-def api_fetch_query(item, task, request_id):
+def api_fetch_query(item, task, request_id, offset=None, limit=None):
     city = extract_city(task)
     if not item.get('baseUrl') or not item.get('path') or not city:
         return None
-    return dict(
+    query = dict(
         requestId=request_id, baseUrl=item['baseUrl'], path=item['path'],
         method=item.get('method') or 'GET', authStyle=item.get('authStyle'),
         token=extract_task_secret(task), cityParam=item.get('cityParam') or 'location',
-        city=city, extraParams=item.get('extraParams') or {},
+        city=city, extraParams=replay_extra_params(item),
         recordsPath=item.get('recordsPath') or 'data.records',
     )
+    if offset is not None:
+        query['offset'] = int(offset)
+    if limit is not None:
+        query['limit'] = int(limit)
+    return query
 
 
 def parse_llm(text):
@@ -938,6 +1028,7 @@ class PioneerTaskSolver:
         s = self.session
         if not s or not s.get('fingerprint'):
             return
+        record_duration_sample(self.experience, s, reason, round_no)
         record = dict(s)
         record.pop('response', None)
         record['archiveReason'] = reason
@@ -960,7 +1051,7 @@ class PioneerTaskSolver:
             metrics['deadlineRound'] = state.round_no + timeout
             metrics['deadlineEstimated'] = True
         s = dict(
-            key=key, stage='read', paths=extract_md_paths(state.phase_task),
+            key=key, stage='read', paths=relevant_md_paths(state.phase_task),
             documents=[], history=[], facts=[], failedActions=[], index=0, offset=0,
             calls=0, retries=0, emptyWaits=0, emptyLlmWaits=0,
             fingerprint=fingerprint,
@@ -969,12 +1060,14 @@ class PioneerTaskSolver:
             llmPending=False, submitStatus=None,
             promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
             metrics=metrics, resendPending=False, **ctx)
-        hit = matching_api_experience(self.experience, state.phase_task) if s.get('taskKind') == 'api' else None
+        hit = matching_api_experience(self.experience, state.phase_task) if s.get('taskKind') != 'workspace' else None
         if hit and api_fetch_query(hit, state.phase_task, 'preview'):
             s['apiReplay'] = hit
             s['stage'] = 'api_fetch'
             s['experienceHit'] = True
             s['metrics']['experienceHit'] = True
+            s['metrics']['memoryMatched'] = True
+            s['metrics']['memoryInjected'] = True
             s['facts'].append('复用已验证API: %s %s cityParam=%s' % (
                 hit.get('method'), hit.get('path'), hit.get('cityParam')))
             s['history'].append({'experienceReuse': {
@@ -1000,6 +1093,12 @@ class PioneerTaskSolver:
                     and item.get('requestId') == request_id
                     and item.get('event') in ('read_document', 'execute_tool', 'deploy_probe', 'api_fetch')):
                 return item
+        status, payload, raw = parse_curl_output(state.last_cmd_result)
+        if payload is not None and ('code' in payload or 'data' in payload):
+            return dict(
+                marker=MARKER, requestId=request_id, event='api_curl',
+                httpStatus=status, payload=payload, output=raw,
+            )
         return None
 
     def _fact(self, s, text):
@@ -1021,6 +1120,12 @@ class PioneerTaskSolver:
         return fingerprint
 
     def _is_duplicate_failure(self, s, action, target, workspace, error_class):
+        if action == 'read':
+            name = path_basename(target)
+            for item in s.get('failedActions') or []:
+                if item.get('action') == 'read' and item.get('errorClass') == error_class:
+                    if name and path_basename(item.get('target')) == name:
+                        return True
         fingerprint = failure_fingerprint(action, target, workspace, error_class)
         return any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or [])
 
@@ -1057,6 +1162,16 @@ class PioneerTaskSolver:
             dataComplete=bool(metrics.get('dataComplete')), submitStatus=s.get('submitStatus'),
             endReason=reason or s.get('endReason'), deadlineRound=metrics.get('deadlineRound'),
             deadlineEstimated=metrics.get('deadlineEstimated'), stage=s.get('stage'),
+            codeVersion=PROMPT_VERSION, taskInstance=s.get('instanceId'),
+            memoryMatched=bool(s.get('apiReplay') or metrics.get('memoryMatched') or s.get('experienceHit')),
+            memoryInjected=bool(metrics.get('memoryInjected') or s.get('experienceHit')),
+            recordsCollected=metrics.get('recordsCollected'), expectedTotal=metrics.get('expectedTotal'),
+            checkPassed=bool(metrics.get('checkPassed')), answerReady=bool(s.get('answer')),
+            submitSent=bool(metrics.get('submitSentRound')),
+            submitAccepted=s.get('submitStatus') == 'accepted',
+            submitRejected=s.get('submitStatus') == 'rejected',
+            taskExpired=reason in ('phase_task_cleared', 'phase_task_changed') or s.get('endReason') in (
+                'phase_task_cleared', 'phase_task_changed', 'budget_insufficient'),
         )
 
     def _remember_api(self, item):
@@ -1098,9 +1213,20 @@ class PioneerTaskSolver:
                     result.get('path'), '', task)
                 updated['sourceTask'] = updated.get('sourceTask') or task_fingerprint(task)
                 updated['evidence'] = result.get('completenessEvidence') or 'code=200'
+                if result.get('baseUrl'):
+                    updated['baseUrl'] = result.get('baseUrl')
+                if result.get('authStyle'):
+                    updated['authStyle'] = result.get('authStyle')
+                if result.get('cityParam'):
+                    updated['cityParam'] = result.get('cityParam')
                 if result.get('pagination'):
                     updated['paginationShape'] = sorted(result['pagination'])[:12]
                 self._remember_api(updated)
+                metrics = self.session.setdefault('metrics', {}) if isinstance(self.session, dict) else {}
+                metrics['recordsCollected'] = result.get('recordsCollected')
+                metrics['expectedTotal'] = result.get('expectedTotal')
+                metrics['dataComplete'] = bool(result.get('recordsComplete'))
+                metrics['httpRequests'] = metrics.get('httpRequests', 0) + int(result.get('httpRequestCount') or 0)
             elif result.get('error') in ('auth_failed', 'records_not_list') or str(result.get('error') or '').startswith('business_code_'):
                 if hit:
                     hit = dict(hit)
@@ -1139,6 +1265,52 @@ class PioneerTaskSolver:
                 break
         return stats
 
+    def _apply_api_tool_result(self, s, result, command, task):
+        if result.get('event') == 'api_curl':
+            collected = s.setdefault('apiRecords', [])
+            stats = ingest_api_page(collected, result.get('payload'), result.get('httpStatus'))
+            replay = s.get('apiReplay') or {}
+            stats['path'] = replay.get('path')
+            stats['baseUrl'] = replay.get('baseUrl')
+            stats['authStyle'] = replay.get('authStyle')
+            stats['cityParam'] = replay.get('cityParam')
+            stats['city'] = extract_city(task) or replay.get('city')
+            stats['httpRequestCount'] = 1
+            envelope = dict(stats, event='api_fetch')
+            self._harvest(envelope, command, task, s.get('workspace'))
+            if stats.get('recordsComplete'):
+                s['_apiStats'] = stats
+                return 'done'
+            if stats.get('error') == 'total_mismatch' and stats.get('nextOffset') is not None:
+                s['apiOffset'] = stats['nextOffset']
+                s['apiLimit'] = stats.get('nextLimit')
+                self._fact(s, '未查全，继续分页 offset=%s' % stats['nextOffset'])
+                return 'continue'
+            if stats.get('error'):
+                self._record_failure(s, 'api_fetch', stats.get('path'), s.get('workspace'),
+                                     classify_tool_error(stats))
+            return 'ask'
+        if result.get('event') != 'api_fetch':
+            return None
+        if result.get('recordsComplete'):
+            s['_apiStats'] = result
+            return 'done'
+        if result.get('error') in ('auth_failed', 'records_not_list') or str(result.get('error') or '').startswith('business_code_'):
+            self._record_failure(s, 'api_fetch', result.get('path'), s.get('workspace'),
+                                 classify_tool_error(result))
+            return 'ask'
+        expected = result.get('expectedTotal')
+        got = result.get('recordsCollected') or 0
+        if is_plain_int(expected) and got < expected:
+            s['apiOffset'] = got
+            s['apiLimit'] = s.get('apiLimit') or result.get('nextLimit') or 10
+            self._fact(s, '未查全，继续分页 offset=%s' % got)
+            return 'continue'
+        if result.get('error'):
+            self._record_failure(s, 'api_fetch', result.get('path'), s.get('workspace'),
+                                 classify_tool_error(result))
+        return 'ask'
+
     def _finish_from_tool(self, s, result, task, stats=None):
         output = (result.get('output') or '') + '\n' + (result.get('outputTail') or '')
         check_tail = result.get('checkTail') or ''
@@ -1153,18 +1325,16 @@ class PioneerTaskSolver:
                 self._fact(s, '验收TOKEN已提取')
                 return True
         if s.get('taskKind') == 'api':
-            stats = stats or {}
-            if result.get('event') == 'api_fetch':
+            stats = s.get('_apiStats') or stats or {}
+            if result.get('event') == 'api_fetch' and result.get('recordsComplete'):
                 stats = result
-            for item in extract_json_objects(output):
-                if item.get('marker') == MARKER:
-                    continue
-                if 'totalCount' in item or 'recordsComplete' in item or item.get('code') in (200, '200'):
-                    stats = item
-                    break
-            if result.get('httpRequestCount'):
-                s.setdefault('metrics', {})['httpRequests'] = (
-                    s['metrics'].get('httpRequests', 0) + int(result['httpRequestCount']))
+            elif result.get('event') not in ('api_curl', 'api_fetch'):
+                for item in extract_json_objects(output):
+                    if item.get('marker') == MARKER:
+                        continue
+                    if 'totalCount' in item or 'recordsComplete' in item or item.get('code') in (200, '200'):
+                        stats = item
+                        break
             if stats_ready_for_answer(stats) and stats.get('oldestEraName'):
                 answer = build_api_answer(task, stats)
                 if answer:
@@ -1252,11 +1422,15 @@ class PioneerTaskSolver:
                     redacted[key] = redact_secrets(redacted[key], [secret])
         s['history'].append(redacted)
         stats = self._harvest(result, command, state.phase_task, s.get('workspace'))
-        if result.get('event') == 'api_fetch':
-            stats = result
-            if result.get('error'):
-                self._record_failure(s, 'api_fetch', result.get('path'), s.get('workspace'),
-                                     classify_tool_error(result))
+        api_outcome = self._apply_api_tool_result(s, result, command, state.phase_task)
+        if api_outcome == 'continue':
+            s['stage'] = 'api_fetch'
+            return execute
+        if api_outcome == 'ask':
+            s['stage'] = 'ask'
+            return execute
+        if api_outcome == 'done':
+            stats = s.get('_apiStats') or result
         elif result.get('error') or (result.get('exitCode') not in (None, 0) and result.get('event') == 'execute_tool'):
             self._record_failure(
                 s, 'execute', command, s.get('workspace'), classify_tool_error(result) or 'nonzero_exit')
@@ -1267,11 +1441,17 @@ class PioneerTaskSolver:
             if result.get('precheckOnly') and not (result.get('checkExitCode') == 0 and extract_token(result.get('checkTail') or '')):
                 self._fact(s, '部署预检完成，尚未最终验收')
             if self._finish_from_tool(s, result, state.phase_task, stats):
+                s.setdefault('metrics', {})['answerReadyRound'] = state.round_no
+                s.setdefault('metrics', {})['checkPassed'] = True
                 return execute
             s['deployPhase'] = 'fix'
             s['stage'] = 'ask'
             return execute
+        if result.get('convertedCrlf'):
+            self._fact(s, '执行前已转换CRLF: %s' % ','.join(result['convertedCrlf']))
         if self._finish_from_tool(s, result, state.phase_task, stats):
+            s.setdefault('metrics', {})['answerReadyRound'] = state.round_no
+            s.setdefault('metrics', {})['checkPassed'] = True
             return execute
         s['stage'] = 'ask'
         return execute
@@ -1294,6 +1474,12 @@ class PioneerTaskSolver:
             s['history'].append({'llm': answer})
             s['retries'] = 0
             if answer['action'] == 'submit':
+                if s.get('taskKind') == 'api' and not (s.get('metrics') or {}).get('dataComplete'):
+                    s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0)
+                    s['history'].append({'blocked': 'records incomplete, refuse submit'})
+                    self._fact(s, '未查全禁止提交')
+                    s['stage'] = 'ask'
+                    return
                 s['answer'] = answer['taskAnswer']
                 s['stage'] = 'submit'
                 s['metrics']['answerReadyRound'] = state.round_no
@@ -1399,10 +1585,18 @@ class PioneerTaskSolver:
             return 'tight', remaining
         return 'normal', remaining
 
+    def _feedback_fingerprint(self, state):
+        payload = json.dumps([
+            state.last_cmd_result, state.llm_resp,
+            getattr(state, 'last_round_role_action_results', None),
+        ], ensure_ascii=False, default=str)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
     def ingest_feedback(self, state):
         """只消费 lastCmd/llm/submit 并绑定当前 phaseTask，不发出解题动作。"""
         if getattr(self, '_ingested_round', None) == state.round_no:
             state.task_session = dict(self.session) if self.session else {}
+            state.task_experience = dict(self.experience)
             return
         key = [state.team_our.team_id, state.team_our.type, state.phase_task] if state.team_our else None
         self._bind_match(state)
@@ -1422,6 +1616,7 @@ class PioneerTaskSolver:
                 self.session = {}
                 self.save()
             state.task_session = {}
+            state.task_experience = dict(self.experience)
             self._ingested_round = state.round_no
             return
         rewound = (state.round_no or 0) < s.get('round', -1)
@@ -1455,7 +1650,10 @@ class PioneerTaskSolver:
         s.setdefault('metrics', empty_metrics(state.round_no))
         s.setdefault('promptVersion', PROMPT_VERSION)
         s.setdefault('promptHash', PROMPT_HASH)
-        if s.get('feedbackRound') != state.round_no:
+        fingerprint = self._feedback_fingerprint(state)
+        already = (s.get('feedbackRound') == state.round_no
+                   and s.get('consumedFeedback') == fingerprint)
+        if not already:
             if s['stage'] in ('wait_read', 'wait_tool', 'wait_probe'):
                 self._consume_waiting(state, s)
             elif s['stage'] == 'wait_llm':
@@ -1466,8 +1664,11 @@ class PioneerTaskSolver:
                     s.get('apiReplay') or {}, state.phase_task, 'preview'):
                 s['stage'] = 'ask'
             s['feedbackRound'] = state.round_no
+            s['consumedFeedback'] = fingerprint
         self.session = s
+        self.save()
         state.task_session = dict(s)
+        state.task_experience = dict(self.experience)
         self._ingested_round = state.round_no
 
     def step(self, state, commands):
@@ -1504,8 +1705,13 @@ class PioneerTaskSolver:
             if s['stage'] == 'read' and s['index'] >= len(s['paths']):
                 if not self._switch_to_api_experience(s, state.phase_task, '文档读完或失败后改用已验证API经验'):
                     s['stage'] = 'ask'
+            if s['stage'] == 'ask' and not s.get('apiFetchAttempted'):
+                if self._switch_to_api_experience(s, state.phase_task, '进入提问前改用已验证API经验'):
+                    pass
             budget, _remaining = self._budget(s, state)
             if s['stage'] in ('read', 'tool', 'probe', 'api_fetch'):
+                if s['stage'] == 'api_fetch':
+                    s['apiFetchAttempted'] = True
                 rid = hashlib.sha256((str(key) + str(state.round_no) + s['stage']).encode()).hexdigest()[:16]
                 s['requestId'] = rid
                 s['metrics']['firstToolRound'] = s['metrics']['firstToolRound'] or state.round_no
@@ -1521,8 +1727,10 @@ class PioneerTaskSolver:
                         requestId=rid, workspace=s.get('workspace'), paths=s.get('paths') or []))
                     s['stage'] = 'wait_probe'
                 elif s['stage'] == 'api_fetch':
-                    query = api_fetch_query(s.get('apiReplay') or {}, state.phase_task, rid)
-                    execute = sandbox_command(FETCH_SCRIPT, query)
+                    query = api_fetch_query(
+                        s.get('apiReplay') or {}, state.phase_task, rid,
+                        offset=s.get('apiOffset'), limit=s.get('apiLimit'))
+                    execute = curl_api_command(query) if query else ''
                     s['lastTool'] = execute
                     s['stage'] = 'wait_tool'
                 else:
@@ -1559,9 +1767,34 @@ class PioneerTaskSolver:
         s['response'] = dict(prompt=prompt, executeCmd=execute, submission=submission)
         s['incomplete'] = s.get('stage') in INCOMPLETE_STAGES
         self.session = s
+        self._emit_round(state, s, execute, prompt, submission)
         self.save()
         state.task_session = dict(s)
         return prompt, execute
+
+    def _emit_round(self, state, s, execute, prompt, submission):
+        metrics = s.get('metrics') or {}
+        status = s.get('submitStatus')
+        emit_stderr(
+            MARKER, 'solver_round', state.round_no,
+            title='【自进化】回合 %s %s' % (s.get('instanceId') or '', s.get('stage')),
+            codeVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
+            taskInstance=s.get('instanceId'), stage=s.get('stage'),
+            memoryMatched=bool(s.get('apiReplay') or s.get('experienceHit')),
+            memoryInjected=bool(s.get('experienceHit') or metrics.get('memoryInjected')),
+            requestSent=bool(execute or prompt or submission),
+            responseConsumed=bool(s.get('consumedFeedback')),
+            recordsCollected=metrics.get('recordsCollected'),
+            expectedTotal=metrics.get('expectedTotal'),
+            dataComplete=bool(metrics.get('dataComplete')),
+            checkPassed=bool(metrics.get('checkPassed')),
+            answerReady=bool(s.get('answer')),
+            submitSent=status in ('sent', 'accepted', 'rejected', 'unknown') or bool(metrics.get('submitSentRound')),
+            submitAccepted=status == 'accepted',
+            submitRejected=status == 'rejected',
+            taskExpired=s.get('endReason') in ('phase_task_cleared', 'phase_task_changed', 'budget_insufficient'),
+            duplicateBlocked=metrics.get('duplicateBlocked') or 0,
+        )
 
     def make_prompt(self, state):
         kind = self.session.get('taskKind', 'unknown')

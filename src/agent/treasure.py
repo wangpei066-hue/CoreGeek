@@ -26,13 +26,17 @@ def treasure_buys_allowed(state: MatchState) -> bool:
 
 
 def shop_buy_allowed(name: str, state: MatchState, emergency: bool = False) -> bool:
-    """第四天前只买升炮/升墙/药/修复包；高压才买炸弹眩晕。召唤令、基地券、任务用品一律等到第四天。"""
+    """第四天前只买升炮/升墙/药/修复包；三炮二级后允许买一次基地券。高压才买炸弹眩晕。"""
     if not name:
         return False
     if game_day(state.round_no) >= TREASURE_BUY_FROM_DAY:
         return True
     if emergency and name in EMERGENCY_BUY_ALLOW:
         return True
+    if name == "StationUpgradeVoucher1":
+        from .brain import station_first_upgrade_pending, structure_priority_day
+        if station_first_upgrade_pending(state) or structure_priority_day(state):
+            return True
     return name in EARLY_GAME_BUY_ALLOW
 
 

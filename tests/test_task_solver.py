@@ -8,11 +8,15 @@ import tempfile
 import unittest
 
 from src.agent import GameServer
+from src.agent.economy import solver_ready_to_submit
 from src.agent.task_solver import (
-    extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT, PROBE_SCRIPT, task_context,
+    extract_md_paths, parse_llm, sandbox_command, READ_SCRIPT, PROBE_SCRIPT,
     harvest_api_call, matching_api_experience, build_api_answer, is_plain_int,
     PROMPT_HASH, PROMPT_VERSION, PioneerTaskSolver, BASE_PROMPT, DEPLOYMENT_SOP, API_SOP,
+    MARKER, task_fingerprint, relevant_md_paths, task_context,
+    curl_api_command, ingest_api_page, parse_curl_output,
 )
+from test_opening import opening_state
 
 
 class TaskSolverTests(unittest.TestCase):
@@ -374,6 +378,8 @@ class TaskSolverTests(unittest.TestCase):
         )
         first = self.post()
         self.assertIn('/api/v1/heritage/search', first['executeCmd'])
+        self.assertTrue(first['executeCmd'].lstrip().startswith('curl '))
+        self.assertNotIn('python3', first['executeCmd'])
         self.assertIn('location', first['executeCmd'])
         self.assertTrue(self.server.task_solver.session.get('experienceHit'))
         rid = self.server.task_solver.session['requestId']
@@ -419,9 +425,8 @@ class TaskSolverTests(unittest.TestCase):
         self.assertEqual(item['path'], '/api/v1/heritage/search')
         self.assertEqual(item['cityParam'], 'location')
         self.assertEqual(item['authStyle'], 'Authorization: Bearer')
-        self.assertEqual(item['extraParams']['limit'], '1000')
-        self.assertIsNone(item['pagination'])
         self.assertNotIn('SECRET', json.dumps(item))
+        self.assertNotIn('limit', item.get('extraParams') or {})
         self.assertEqual(
             matching_api_experience({'api': [item]}, '调用API查询南京遗产')['path'],
             '/api/v1/heritage/search')
@@ -583,6 +588,288 @@ class TaskSolverTests(unittest.TestCase):
         self.assertEqual(answer['types'], ['陵墓'])
         self.assertEqual(answer['oldest_era'], '明孝陵')
         self.assertIsInstance(answer['world_heritage_count'], int)
+
+    def test_same_round_retry_consumes_empty_feedback_once(self):
+        doc = self.root / 'guide.md'
+        doc.write_text('运行 python3 -c "print(1)"')
+        self.payload['phaseTask'] = f'阅读 `{doc}`，按说明获取答案'
+        first = self.post()
+        self.assertTrue(first['executeCmd'])
+        waiting = self.next_round(lastCmdResult='')
+        self.assertEqual(waiting.get('prompt'), '')
+        waits = self.server.task_solver.session.get('emptyWaits')
+        self.assertEqual(waits, 1)
+        retry = self.post()
+        self.assertEqual(self.server.task_solver.session.get('emptyWaits'), 1)
+        self.assertEqual(retry.get('executeCmd') or '', waiting.get('executeCmd') or '')
+
+    def test_restart_after_submit_ack_does_not_resubmit(self):
+        doc = self.root / 'guide.md'
+        doc.write_text('答案是42')
+        self.payload['phaseTask'] = f'阅读 `{doc}`，提交答案'
+        first = self.post()
+        read_back = self.sandbox(first['executeCmd'])
+        asked = self.next_round(lastCmdResult=read_back)
+        self.assertTrue(asked['prompt'])
+        submitted = self.next_round(llmResp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
+        self.assertEqual(submitted['roleCommandMap']['10011'],
+                         {'action': 'submitAnswer', 'taskAnswer': '42'})
+        acked = self.next_round(lastRoundRoleActionResults={'10011': True})
+        self.assertNotIn('10011', acked['roleCommandMap'])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'accepted')
+        self.server = GameServer(self.root)
+        self.client = self.server.app.test_client()
+        restored = self.post()
+        self.assertNotIn('10011', restored['roleCommandMap'])
+        self.assertEqual(self.server.task_solver.session.get('submitStatus'), 'accepted')
+
+    def test_other_city_md_is_not_read_for_current_city(self):
+        paths = relevant_md_paths('查询南京遗产。阅读 `task_1_beijing.md` 和 `API_DOCS.md`。')
+        self.assertIn('API_DOCS.md', paths)
+        self.assertFalse(any('beijing' in path.lower() for path in paths))
+
+    def test_chengdu_first_query_reuses_verified_beijing_api(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage', 'callVerified': True,
+            'recordsComplete': False,
+        }]
+        self.payload['phaseTask'] = (
+            '查询成都文化遗产。密钥：tok-cd。'
+            '提交{"city":"成都","total_count":0,"world_heritage_count":0,"types":[],"oldest_era":"名称"}'
+        )
+        first = self.post()
+        self.assertIn('/api/v1/heritage/search', first['executeCmd'])
+        self.assertTrue(first['executeCmd'].lstrip().startswith('curl '))
+        self.assertIn('成都', first['executeCmd'])
+        self.assertNotIn('python3', first['executeCmd'])
+        self.assertNotIn('cultural-heritage', first['executeCmd'])
+        self.assertTrue(self.server.task_solver.session.get('experienceHit'))
+
+    def test_duplicate_failed_read_blocks_same_basename(self):
+        self.payload['phaseTask'] = '阅读 `/tmp/old/task_1_beijing.md` 并完成任务'
+        first = self.post()
+        rid = self.server.task_solver.session['requestId']
+        feedback = '[exitCode:0]\n' + json.dumps(dict(
+            marker='PIONEER_TASK', requestId=rid, event='read_document', error='not_found',
+            path='/tmp/old/task_1_beijing.md'))
+        self.next_round(lastCmdResult=feedback)
+        blocked = self.next_round(llmResp=json.dumps(dict(action='read', path='task_1_beijing.md')))
+        self.assertFalse(blocked.get('executeCmd'))
+        self.assertGreaterEqual(self.server.task_solver.session['metrics']['duplicateBlocked'], 1)
+
+    def test_incomplete_api_fetch_does_not_submit(self):
+        self.server.task_solver.experience['api'] = [{
+            'baseUrl': 'http://127.0.0.1:8080', 'path': '/api/v1/heritage/search',
+            'method': 'GET', 'authStyle': 'Authorization: Bearer', 'cityParam': 'location',
+            'recordsPath': 'data.records', 'serviceHint': 'heritage', 'callVerified': True,
+        }]
+        self.payload['phaseTask'] = (
+            '调用API查询北京遗产。密钥：tok-1。'
+            '提交{"city":"北京","total_count":0,"world_heritage_count":0,"types":[],"oldest_era":"名称"}'
+        )
+        self.post()
+        rid = self.server.task_solver.session['requestId']
+        result = dict(
+            marker='PIONEER_TASK', requestId=rid, event='api_fetch', ok=False,
+            callVerified=True, recordsComplete=False, error='total_mismatch',
+            completenessEvidence='pagination.total=15 records=10',
+            recordsCollected=10, expectedTotal=15, totalCount=10,
+            typeCount=1, types=['坛庙'], worldHeritageCount=1,
+            oldestEraName='天坛', oldestEraEvidence='year=1420', city='北京',
+            businessCode=200, httpStatus=200, path='/api/v1/heritage/search',
+        )
+        response = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(result, ensure_ascii=False))
+        self.assertNotIn('10011', response.get('roleCommandMap') or {})
+        self.assertFalse(self.server.task_solver.session.get('metrics', {}).get('dataComplete'))
+        self.assertIn('offset', response.get('executeCmd') or '')
+        guessed = self.next_round(llmResp=json.dumps({
+            'action': 'submit',
+            'taskAnswer': json.dumps({'city': '北京', 'total_count': 10}, ensure_ascii=False),
+        }))
+        self.assertNotIn('10011', guessed.get('roleCommandMap') or {})
+        self.assertTrue(any('未查全' in item for item in self.server.task_solver.session.get('facts') or []))
+
+    def test_curl_command_urlencodes_city_without_python(self):
+        cmd = curl_api_command(dict(
+            baseUrl='http://127.0.0.1:8080', path='/api/v1/heritage/search',
+            method='GET', authStyle='Authorization: Bearer', token='tok-1',
+            cityParam='location', city='北京', extraParams={'size': '100'},
+        ))
+        self.assertTrue(cmd.startswith('curl '))
+        self.assertIn('--data-urlencode', cmd)
+        self.assertIn('北京', cmd)
+        self.assertIn('Bearer tok-1', cmd)
+        self.assertNotIn('python3', cmd)
+        self.assertNotIn('size=100', cmd)
+        self.assertNotIn('urllib', cmd)
+
+    def test_host_pagination_completes_offset_total_count_pages(self):
+        records = [
+            {'id': i, 'name': 'n%s' % i, 'type': '陵墓' if i == 14 else '坛庙',
+             'protected_level': '世界遗产' if i == 0 else '市级', 'era': 1000 + i}
+            for i in range(15)
+        ]
+        collected = []
+        first = ingest_api_page(collected, {
+            'code': 200,
+            'data': {
+                'records': records[:10],
+                'pagination': {'total_count': 15, 'offset': 0, 'limit': 10},
+            },
+        }, 200)
+        self.assertFalse(first.get('recordsComplete'))
+        self.assertEqual(first.get('recordsCollected'), 10)
+        self.assertEqual(first.get('expectedTotal'), 15)
+        self.assertEqual(first.get('nextOffset'), 10)
+        self.assertEqual(first.get('nextLimit'), 10)
+        self.assertFalse(first.get('ok'))
+        second = ingest_api_page(collected, {
+            'code': 200,
+            'data': {
+                'records': records[10:],
+                'pagination': {'total_count': 15, 'offset': 10, 'limit': 10},
+            },
+        }, 200)
+        self.assertTrue(second.get('recordsComplete'))
+        self.assertEqual(second.get('recordsCollected'), 15)
+        self.assertEqual(second.get('expectedTotal'), 15)
+        self.assertEqual(second.get('totalCount'), 15)
+        self.assertEqual(second.get('worldHeritageCount'), 1)
+        self.assertTrue(second.get('ok'))
+        status, payload, _ = parse_curl_output(
+            '[exitCode:0]\n{"code":200,"data":{"records":[]}}\nHTTPSTATUS:200')
+        self.assertEqual(status, 200)
+        self.assertEqual(payload['code'], 200)
+
+    def test_probe_token_submits_without_llm(self):
+        self.payload['phaseTask'] = '工作区路径：`/tmp/alpha/`，修复部署环境'
+        first = self.post()
+        self.assertIn('deploy_probe', first['executeCmd'])
+        rid = self.server.task_solver.session['requestId']
+        probe = dict(
+            marker='PIONEER_TASK', requestId=rid, event='deploy_probe', precheckOnly=True,
+            workspace='/tmp/alpha', convertedCrlf=['start.sh'],
+            checkExitCode=0, checkTail='6/6 passed\nTOKEN: alpha-ok\n',
+            files=[{'path': 'start.sh', 'exists': True, 'crlf': False, 'convertedCrlf': True}],
+        )
+        response = self.next_round(lastCmdResult='[exitCode:0]\n' + json.dumps(probe, ensure_ascii=False))
+        self.assertEqual(response.get('prompt') or '', '')
+        self.assertEqual(response['roleCommandMap']['10011']['action'], 'submitAnswer')
+        self.assertIn('alpha-ok', response['roleCommandMap']['10011']['taskAnswer'])
+
+
+class IngestFeedbackTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.solver = PioneerTaskSolver(Path(self.temp.name))
+        self.state = opening_state()
+        self.state.round_no = 20
+        self.state.phase_task = '工作区路径：`/tmp/ws`，修复部署环境'
+        self.pioneer = next(r for r in self.state.team_our.roles if r.role_type == 'pioneer')
+
+    def waiting(self, stage, request_id='rid-1', **extra):
+        from src.agent.task_solver import empty_metrics, task_context
+        ctx = task_context(self.state.phase_task)
+        session = dict(
+            key=[self.state.team_our.team_id, self.state.team_our.type, self.state.phase_task],
+            stage=stage, paths=[], documents=[], history=[], facts=[], failedActions=[],
+            index=0, offset=0, calls=0, retries=0, emptyWaits=0, emptyLlmWaits=0,
+            fingerprint=task_fingerprint(self.state.phase_task), requestId=request_id,
+            metrics=empty_metrics(self.state.round_no), round=self.state.round_no - 1,
+            llmPending=stage == 'wait_llm', submitStatus=None, pioneer=self.pioneer.id,
+        )
+        session.update(ctx)
+        session.update(extra)
+        return session
+
+    def test_duplicate_ingest_same_round_consumes_once(self):
+        self.solver.session = self.waiting('wait_tool')
+        self.state.last_cmd_result = ''
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(self.solver.session['emptyWaits'], 1)
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(self.solver.session['emptyWaits'], 1)
+
+    def test_step_does_not_reprocess_ingested_feedback(self):
+        self.solver.session = self.waiting('wait_llm', llmPending=True)
+        self.state.llm_resp = json.dumps({'action': 'submit', 'taskAnswer': 'TOKEN: ready'})
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(self.solver.session['stage'], 'submit')
+        self.assertEqual(self.solver.session.get('answer'), 'TOKEN: ready')
+        history_len = len(self.solver.session.get('history') or [])
+        commands = {}
+        prompt, execute = self.solver.step(self.state, commands)
+        self.assertEqual(len(self.solver.session.get('history') or []), history_len)
+        self.assertEqual(self.solver.session.get('answer'), 'TOKEN: ready')
+        self.assertEqual(commands.get(self.pioneer.id, {}).get('action'), 'submitAnswer')
+        self.assertEqual(prompt, '')
+        self.assertEqual(execute, '')
+
+    def test_token_this_round_is_visible_to_scheduler(self):
+        rid = 'probe-1'
+        self.solver.session = self.waiting('wait_probe', request_id=rid, taskKind='workspace')
+        payload = dict(
+            marker=MARKER, requestId=rid, event='deploy_probe',
+            exitCode=0, checkExitCode=0, output='TOKEN: abcdef', checkTail='TOKEN: abcdef',
+        )
+        self.state.last_cmd_result = json.dumps(payload, ensure_ascii=False)
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(self.state.task_session.get('stage'), 'submit')
+        self.assertIn('abcdef', self.state.task_session.get('answer') or '')
+        self.assertTrue(solver_ready_to_submit(self.state))
+
+    def test_task_switch_does_not_apply_old_sandbox_result(self):
+        old_task = '旧任务正文请计算1+1'
+        self.state.phase_task = old_task
+        self.solver.session = self.waiting(
+            'wait_tool', request_id='old-rid', history=[],
+            key=[self.state.team_our.team_id, self.state.team_our.type, old_task],
+            fingerprint=task_fingerprint(old_task),
+            taskKind='unknown',
+        )
+        self.state.last_cmd_result = json.dumps(dict(
+            marker=MARKER, requestId='old-rid', event='execute_tool',
+            exitCode=0, output='OLD_SANDBOX_SECRET',
+        ), ensure_ascii=False)
+        self.state.phase_task = '新任务正文请阅读说明.md'
+        self.solver.ingest_feedback(self.state)
+        dumped = json.dumps(self.solver.session, ensure_ascii=False)
+        self.assertNotIn('OLD_SANDBOX_SECRET', dumped)
+        self.assertNotEqual(self.solver.session.get('requestId'), 'old-rid')
+        self.assertEqual(self.solver.session.get('fingerprint'),
+                         task_fingerprint('新任务正文请阅读说明.md'))
+        self.assertFalse(solver_ready_to_submit(self.state))
+
+    def test_ingest_does_not_emit_tool_llm_or_role_action(self):
+        self.solver.session = self.waiting('ask', calls=0)
+        commands = {self.pioneer.id: {'action': 'move', 'targetPos': [{'x': 9, 'y': 9}]}}
+        snapshot = json.dumps(commands, sort_keys=True)
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(json.dumps(commands, sort_keys=True), snapshot)
+        self.assertNotIn('response', self.solver.session)
+        self.assertEqual(self.solver.session.get('stage'), 'ask')
+        self.assertFalse(self.solver.session.get('llmPending'))
+        self.assertEqual(self.solver.session.get('calls'), 0)
+
+    def test_restart_same_ack_does_not_submit_twice(self):
+        self.solver.session = self.waiting(
+            'wait_submit', answer='42', submitStatus='sent',
+            pioneer=self.pioneer.id)
+        self.state.last_round_role_action_results = {self.pioneer.id: True}
+        self.solver.ingest_feedback(self.state)
+        self.assertEqual(self.solver.session.get('submitStatus'), 'accepted')
+        commands = {}
+        self.solver.step(self.state, commands)
+        self.assertNotIn(self.pioneer.id, commands)
+        restored = PioneerTaskSolver(Path(self.temp.name))
+        again = {}
+        restored.ingest_feedback(self.state)
+        restored.step(self.state, again)
+        self.assertNotIn(self.pioneer.id, again)
+        self.assertEqual(restored.session.get('submitStatus'), 'accepted')
 
 
 if __name__ == '__main__':

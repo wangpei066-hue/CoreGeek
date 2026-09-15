@@ -3,11 +3,18 @@ from .decision_log import trace
 from .grid import chebyshev, move_towards
 from .log_format import emit_stderr
 from .protocol import Pos
-from .task_solver import MIN_TASK_TIMEOUT_ROUNDS, MARKER, task_fingerprint
+from .task_solver import MIN_TASK_TIMEOUT_ROUNDS, MARKER, task_context, task_fingerprint
 
 
-SCHEDULER_VERSION = '20260915-sched1'
-ESTIMATED_SOLVE_ROUNDS = 6
+SCHEDULER_VERSION = '20260915-sched2'
+# 领取到提交的观测回退：Alpha/Beta 部署约 9 轮（探查+修复+验收+提交），不是优化目标。
+DEPLOY_SOLVE_ROUNDS = 9
+DEPLOY_SOLVE_NOTE = '观测部署领取到提交约9轮：probe/fix/check/submit，含失败余量'
+API_SOLVE_ROUNDS = 9
+API_SOLVE_NOTE = 'API尚无稳定实测，保守回退9轮，与部署分开配置'
+UNKNOWN_SOLVE_ROUNDS = 9
+UNKNOWN_SOLVE_NOTE = '领取前不知题型，取各类回退与经验的保守上界'
+ESTIMATED_SOLVE_ROUNDS = DEPLOY_SOLVE_ROUNDS
 ACCEPT_RANGE = 1
 SHOP_STALL_ROUNDS = 4
 RESERVATION_KEY = 'pioneer_task_reservation'
@@ -15,6 +22,11 @@ SHOP_PROGRESS_KEY = 'pioneer_shop_progress'
 TASK_STREAK_KEY = 'pioneer_task_streaks'
 INTERRUPT_RESERVATION_COST = 24
 TASK_TYPES = ('自进化类1', '自进化类2')
+KIND_FALLBACKS = {
+    'workspace': (DEPLOY_SOLVE_ROUNDS, 'config.DEPLOY_SOLVE_ROUNDS ' + DEPLOY_SOLVE_NOTE),
+    'api': (API_SOLVE_ROUNDS, 'config.API_SOLVE_ROUNDS ' + API_SOLVE_NOTE),
+    'unknown': (UNKNOWN_SOLVE_ROUNDS, 'config.UNKNOWN_SOLVE_ROUNDS ' + UNKNOWN_SOLVE_NOTE),
+}
 
 
 def scheduler_task_session(state):
@@ -33,11 +45,37 @@ def scheduler_task_session(state):
     return session
 
 
+def _duration_from_experience(experience, kind, fallback):
+    samples = ((experience or {}).get('durations') or {}).get(kind) or []
+    values = [int(item['duration']) for item in samples if item.get('duration')]
+    if not values:
+        return fallback, KIND_FALLBACKS[kind][1]
+    values.sort()
+    idx = min(len(values) - 1, max(0, (len(values) * 3) // 4))
+    estimate = max(fallback, values[idx])
+    return estimate, 'experience.p75_including_failures kind=%s n=%d fallback=%d' % (
+        kind, len(values), fallback)
+
+
 def estimated_solve_rounds(state):
     session = scheduler_task_session(state)
     if session.get('metrics', {}).get('answerReadyRound') or session.get('answer'):
         return 1, 'session.answer_ready'
-    return ESTIMATED_SOLVE_ROUNDS, 'config.ESTIMATED_SOLVE_ROUNDS'
+    experience = getattr(state, 'task_experience', None) or {}
+    kind = None
+    if session.get('taskKind'):
+        kind = session.get('taskKind')
+    elif state.phase_task:
+        kind = task_context(state.phase_task).get('taskKind')
+    if kind in KIND_FALLBACKS:
+        fallback, _source = KIND_FALLBACKS[kind]
+        return _duration_from_experience(experience, kind, fallback)
+    estimates = []
+    for item_kind, (fallback, _source) in KIND_FALLBACKS.items():
+        estimate, source = _duration_from_experience(experience, item_kind, fallback)
+        estimates.append((estimate, source, item_kind))
+    estimate, source, item_kind = max(estimates, key=lambda row: row[0])
+    return estimate, 'pre_accept.max(%s) %s' % (item_kind, source)
 
 
 def reservation_of(state):
@@ -47,12 +85,15 @@ def reservation_of(state):
 
 
 def has_task_reservation(state, role=None):
+    """进行中的 phaseTask、前往中或领取待确认才算占用。phaseTask 已清空后的 active 是过期占用。"""
+    if state.phase_task:
+        return True
     item = reservation_of(state)
     if not item:
         return False
     if role is not None and item.get('pioneerId') not in (None, role.id):
         return False
-    return True
+    return item.get('stage') in (None, 'approaching', 'accept_pending')
 
 
 def clear_reservation(state, reason):
@@ -100,15 +141,18 @@ def voucher_is_defense_critical(state):
 
 
 def defense_snapshot(role, state, blocked):
-    from .opening import MUSTER_BUFFER, station_return_steps
+    from .opening import MUSTER_BUFFER, station_return_detail
     from .tactics import imminent_contact, night_wave_cleared, pressure, threat_eta_to_base
     from .brain import is_day_round
-    travel = station_return_steps(role, state, blocked)
-    eta = threat_eta_to_base(state)
+    detail = station_return_detail(role, state, blocked)
+    travel = detail['steps']
+    eta = threat_eta_to_base(state, role)
     wave = night_wave_cleared(state)
     press = pressure(state)
     contact = imminent_contact(state)
     day = is_day_round(state.round_no)
+    from .opening import defense_rounds_remaining
+    slack = defense_rounds_remaining(state, role)
     reasons = []
     due = False
     if press:
@@ -118,13 +162,13 @@ def defense_snapshot(role, state, blocked):
         reasons.append('imminent_contact')
         due = True
     if travel is None:
-        reasons.append('no_return_path')
+        reasons.append(detail.get('reason') or 'no_return_path')
         due = True
     elif due:
         pass
     elif wave:
         due = False
-    elif not day:
+    elif not day and slack <= 0:
         reasons.append('night_not_cleared')
         due = True
     elif eta is None:
@@ -135,19 +179,22 @@ def defense_snapshot(role, state, blocked):
         due = True
     return dict(
         pressure=press, imminentContact=contact, travel=travel,
-        travelSource='station_return_steps', threatEta=eta,
-        threatEtaSource='threat_eta_to_base=min(入夜剩余,可见敌人切比雪夫下界)',
+        travelSource='station_return_detail/same as defense_due',
+        travelReason=detail.get('reason'), alreadyAtPost=detail.get('alreadyAtPost'),
+        weaponId=detail.get('weaponId'), stand=detail.get('stand'),
+        threatEta=eta,
+        threatEtaSource='threat_eta_to_base=min(夜防到位剩余,可见敌人切比雪夫下界)',
         musterBuffer=MUSTER_BUFFER, nightWaveCleared=wave,
-        defenseDue=due, defenseDueReasons=reasons,
+        defenseDue=due, defenseDueReasons=reasons, defenseSlack=slack,
     )
 
 
 def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
-    from .opening import MUSTER_BUFFER, adjacent_path, station_return_steps
+    from .opening import MUSTER_BUFFER, adjacent_path, station_return_detail
     from .brain import is_day_round
     from .tactics import night_wave_cleared, threat_eta_to_base
     solve, solve_source = estimated_solve_rounds(state)
-    eta = threat_eta_to_base(state)
+    eta = threat_eta_to_base(state, pioneer)
     wave = night_wave_cleared(state)
     obstacles = blocked if reserved is None else (blocked | reserved)
     rows = []
@@ -155,16 +202,18 @@ def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
     if state.team_our:
         tasks = [t for t in state.team_our.player_tasks if t.task_type in TASK_TYPES]
     for task in tasks:
+        in_range = chebyshev(pioneer.pos, task.task_position) <= ACCEPT_RANGE
         row = dict(
             taskType=task.task_type, x=task.task_position.x, y=task.task_position.y,
             isValid=task.is_valid, coldDownRounds=task.cold_down_rounds,
             timeoutRounds=task.timeout_rounds, rejected=None,
-            outbound=None, outboundSource='adjacent_path(任务点邻格)',
+            outbound=None, outboundSource='adjacent_path(领取邻格)',
             solveEstimate=solve, solveSource=solve_source,
-            returnSteps=None, returnSource='station_return_steps(from task point)',
+            returnSteps=None, returnSource='station_return_detail(from accept stand)',
+            returnReason=None, alreadyAtPost=None, acceptStand=None,
             available=eta, availableSource='threat_eta_to_base',
-            needed=None, neededSource=None, inAcceptRange=chebyshev(
-                pioneer.pos, task.task_position) <= ACCEPT_RANGE,
+            needed=None, neededSource=None, inAcceptRange=in_range,
+            taskConstraint=None, defenseConstraint=None,
         )
         if not task.is_valid:
             row['rejected'] = 'invalid'
@@ -174,17 +223,23 @@ def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
             row['rejected'] = 'cooldown'
             rows.append(row)
             continue
-        if not is_day_round(state.round_no) and not wave:
+        from .opening import defense_rounds_remaining
+        if not is_day_round(state.round_no) and not wave and defense_rounds_remaining(state, pioneer) <= 0:
             row['rejected'] = 'night_defense'
             rows.append(row)
             continue
         timeout = task.timeout_rounds
+        row['taskConstraint'] = dict(
+            timeoutRounds=timeout, solveEstimate=solve,
+            ok=timeout is None or solve <= timeout,
+            note='领取后预计完成耗时须≤平台时限；timeoutRounds≥4不代表可完成',
+        )
         if timeout is not None and timeout < MIN_TASK_TIMEOUT_ROUNDS:
             row['rejected'] = 'platform_timeout_too_short'
             rows.append(row)
             continue
-        if timeout is not None and timeout < solve:
-            row['rejected'] = 'timeout_below_solve_estimate'
+        if timeout is not None and solve > timeout:
+            row['rejected'] = 'solve_exceeds_platform_timeout'
             rows.append(row)
             continue
         route = adjacent_path(pioneer, task.task_position, obstacles, state)
@@ -194,16 +249,33 @@ def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
             continue
         outbound = len(route)
         row['outbound'] = outbound
-        back = station_return_steps(pioneer, state, blocked, from_pos=task.task_position)
+        stand = pioneer.pos if not route else route[-1]
+        row['acceptStand'] = {'x': stand.x, 'y': stand.y}
+        detail = station_return_detail(pioneer, state, blocked, from_pos=stand)
+        back = detail['steps']
         row['returnSteps'] = back
+        row['returnReason'] = detail.get('reason')
+        row['alreadyAtPost'] = detail.get('alreadyAtPost')
         if back is None:
-            row['rejected'] = 'no_return_from_task'
+            row['rejected'] = detail.get('reason') or 'no_return_from_stand'
+            rows.append(row)
+            continue
+        if back == 0 and not detail.get('alreadyAtPost'):
+            row['rejected'] = 'return_zero_unexplained'
             rows.append(row)
             continue
         needed = outbound + solve + back + MUSTER_BUFFER
         row['needed'] = needed
-        row['neededSource'] = 'outbound+solveEstimate+return+MUSTER_BUFFER(非timeoutRounds)'
-        if not wave and eta is not None and needed >= eta:
+        row['neededSource'] = 'outbound+solveEstimate+return+MUSTER_BUFFER'
+        row['defenseConstraint'] = dict(
+            outbound=outbound, solve=solve, returnSteps=back, buffer=MUSTER_BUFFER,
+            eta=eta, ok=wave or (eta is not None and needed < eta),
+        )
+        if not wave and eta is None:
+            row['rejected'] = 'no_threat_eta'
+            rows.append(row)
+            continue
+        if not wave and needed >= eta:
             row['rejected'] = 'defense_time'
             rows.append(row)
             continue
@@ -230,8 +302,19 @@ def select_feasible_row(rows, reservation):
 
 def sync_reservation(state, rows):
     reservation = reservation_of(state)
+    if state.phase_task:
+        if reservation:
+            reservation['stage'] = 'active'
+            state.policy_memory[RESERVATION_KEY] = reservation
+        return reservation_of(state)
     if not reservation:
         return None
+    stage = reservation.get('stage') or 'approaching'
+    if stage == 'active':
+        clear_reservation(state, 'phase_task_cleared')
+        return None
+    if stage == 'accept_pending':
+        return reservation
     if not matching_task(state, reservation):
         clear_reservation(state, 'task_gone')
         return None
@@ -245,10 +328,12 @@ def sync_reservation(state, rows):
     return reservation
 
 
-def save_reservation(state, pioneer, row):
+def save_reservation(state, pioneer, row, stage='approaching'):
+    previous = reservation_of(state) or {}
     state.policy_memory[RESERVATION_KEY] = dict(
         pioneerId=pioneer.id, taskType=row['taskType'], x=row['x'], y=row['y'],
-        sinceRound=state.round_no, timeoutRounds=row.get('timeoutRounds'),
+        sinceRound=previous.get('sinceRound', state.round_no), timeoutRounds=row.get('timeoutRounds'),
+        stage=stage, acceptStand=row.get('acceptStand'),
     )
 
 
@@ -279,9 +364,15 @@ def begin_schedule(state, pioneer, blocked, reserved=None):
         intended=None, inAcceptRange=False, acceptReady=False,
         reservation=reservation_of(state),
         defense=defense_snapshot(pioneer, state, blocked) if pioneer else None,
-        codeVersion=SCHEDULER_VERSION, timeFilter=None,
+        occupancy=None, codeVersion=SCHEDULER_VERSION, timeFilter=None,
     )
     if pioneer:
+        from .economy import defense_occupancy
+        occupancy, snap = defense_occupancy(pioneer, state, blocked)
+        ctx['occupancy'] = occupancy
+        if isinstance(ctx.get('defense'), dict):
+            ctx['defense']['occupancy'] = occupancy
+            ctx['defense']['atGun'] = snap.get('atGun')
         ctx['candidates'] = evaluate_task_candidates(pioneer, state, blocked, reserved)
         ctx['reservation'] = sync_reservation(state, ctx['candidates'])
         selected = select_feasible_row(ctx['candidates'], ctx['reservation'])
@@ -292,9 +383,13 @@ def begin_schedule(state, pioneer, blocked, reserved=None):
                 outbound=selected.get('outbound'), outboundSource=selected.get('outboundSource'),
                 solveEstimate=selected.get('solveEstimate'), solveSource=selected.get('solveSource'),
                 returnSteps=selected.get('returnSteps'), returnSource=selected.get('returnSource'),
+                returnReason=selected.get('returnReason'), alreadyAtPost=selected.get('alreadyAtPost'),
+                acceptStand=selected.get('acceptStand'),
                 available=selected.get('available'), availableSource=selected.get('availableSource'),
                 needed=selected.get('needed'), neededSource=selected.get('neededSource'),
                 timeoutRounds=selected.get('timeoutRounds'),
+                taskConstraint=selected.get('taskConstraint'),
+                defenseConstraint=selected.get('defenseConstraint'),
                 timeoutNote='timeoutRounds是平台从领取起算的最长时限，不是预计解题耗时',
             )
     return ctx
@@ -369,17 +464,34 @@ def pioneer_task_commitment(pioneer, state, blocked, reserved=None):
     )
 
 
+def classify_shop_stall(pioneer, state):
+    from .brain import item_cost
+    gold = state.team_our.gold_num if state.team_our else 0
+    cost = item_cost('WeaponUpgradeVoucher1', state)
+    holding = any(isinstance(item, str) and 'WeaponUpgradeVoucher' in item for item in pioneer.backpack)
+    if gold < cost and not holding:
+        return 'gold_insufficient'
+    results = state.last_round_role_action_results or {}
+    if results.get(pioneer.id) is False:
+        return 'action_rejected'
+    last = (state.last_sent_command or {}).get(pioneer.id) or {}
+    if last.get('action') == 'move' and results.get(pioneer.id) is True:
+        return 'route_blocked'
+    return 'no_progress'
+
+
 def apply_task_choice(pioneer, state, blocked, reserved, row):
     from .decision_log import selected as selected_cmd
-    save_reservation(state, pioneer, row)
     add_branch(state, 'task_committed')
     target = Pos(row['x'], row['y'])
     if row.get('inAcceptRange'):
+        save_reservation(state, pioneer, row, stage='accept_pending')
         cmd = {'action': 'acceptTask'}
         mark_outcome(state, 'acceptTask', cmd, 'accept_ready')
         bump_streak(state, 'task')
         reset_shop_progress(state)
         return True, selected_cmd(state, pioneer.id, cmd, '已在领取范围且无更高优先阻塞，当轮接取')
+    save_reservation(state, pioneer, row, stage='approaching')
     step = move_towards(pioneer.pos, target, blocked | reserved,
                         state.map_info.width, state.map_info.height)
     if step:
@@ -417,6 +529,7 @@ def emit_scheduler_log(state, commands):
     if pioneer and state.worker_item_jobs:
         job = state.worker_item_jobs.get(pioneer.id)
     reservation = reservation_of(state)
+    occupancy = ctx.get('occupancy')
     title = '【调度】开拓者 %s %s' % (
         (final or {}).get('action') or ctx.get('outcome') or 'idle',
         ctx.get('source') or '',
@@ -430,6 +543,7 @@ def emit_scheduler_log(state, commands):
         health=None if pioneer is None else pioneer.health,
         phaseTaskPresent=bool(state.phase_task),
         reservation=reservation,
+        occupancy=occupancy,
         shopJob=None if not job else {'kind': job.get('kind'), 'item': job.get('item')},
         branches=ctx.get('branches') or [],
         returnedBranch=ctx.get('source'),

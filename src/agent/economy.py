@@ -59,15 +59,21 @@ def metal_inventory_value(role, state):
 
 def worker_should_shop_weapon_voucher(role, state, blocked=None):
     """工人买券：本人已持券，或完整代价比较后轮到这名工人。"""
-    from .brain import weapon_upgrade_due
+    from .brain import should_upgrade_weapon, weapon_upgrade_due
     if role.role_type != 'worker':
         return False
     if any(isinstance(item, str) and 'WeaponUpgradeVoucher' in item for item in role.backpack):
         return True
+    job = state.worker_item_jobs.get(role.id)
+    if job and job.get('kind') == 'weapon':
+        return True
     if not weapon_upgrade_due(state) and not any(
-            job.get('kind') == 'weapon' for job in state.worker_item_jobs.values()):
+            item.get('kind') == 'weapon' for item in state.worker_item_jobs.values()):
         return False
-    buyer = pick_weapon_voucher_buyer(state, blocked)
+    extra = should_upgrade_weapon(state) and any(
+        rid != role.id and item.get('kind') == 'weapon'
+        for rid, item in state.worker_item_jobs.items())
+    buyer = pick_weapon_voucher_buyer(state, blocked, extra=extra)
     return bool(buyer and buyer.id == role.id)
 
 
@@ -184,12 +190,7 @@ def _skip_pioneer_voucher_buyer(role, state, blocked):
         return False
     if state.phase_task:
         return True
-    from .pioneer_schedule import (
-        SHOP_PROGRESS_KEY, SHOP_STALL_ROUNDS, pioneer_task_commitment, voucher_is_defense_critical,
-    )
-    stalled = int((state.policy_memory.get(SHOP_PROGRESS_KEY) or {}).get('stallRounds') or 0)
-    if stalled >= SHOP_STALL_ROUNDS:
-        return True
+    from .pioneer_schedule import pioneer_task_commitment, voucher_is_defense_critical
     critical, _reason = voucher_is_defense_critical(state)
     if critical:
         return False
@@ -199,21 +200,35 @@ def _skip_pioneer_voucher_buyer(role, state, blocked):
     return False
 
 
-def pick_weapon_voucher_buyer(state, blocked=None):
-    """在能按时完成的人里选综合代价最低的；已持券优先。执行中任务保持稳定，除非阵亡、不可达或赶不上截止。"""
+def pick_weapon_voucher_buyer(state, blocked=None, extra=False):
+    """在能按时完成的人里选综合代价最低的；已持券优先。执行中任务保持稳定，除非阵亡、不可达或赶不上截止。
+    extra=True：为首日第二门另找买家，跳过已有武器券任务的人。"""
     if not state.team_our or not state.map_info:
         return None
-    from .brain import item_cost, voucher_for, weapon_upgrade_due
+    from .brain import (
+        WEAPON_TYPES, _pending_item_job_targets, _pick_upgradeable, find_zone, item_cost,
+        voucher_for, weapon_upgrade_due,
+    )
     from .grid import build_blocked_set
     from .opening import MUSTER_BUFFER, mobile_walkable, movement_avoid, station_return_steps
     from .tactics import night_wave_cleared, threat_eta_to_base
     if blocked is None:
         blocked = build_blocked_set(state) | movement_avoid(state)
     blocked = mobile_walkable(state, blocked, set())
-    weapon = _upgrade_target_weapon(state)
+    occupied = {rid for rid, job in state.worker_item_jobs.items() if job.get('kind') == 'weapon'}
+    if extra:
+        weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=1)
+        if weapon is None:
+            weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=2)
+    else:
+        weapon = _upgrade_target_weapon(state)
     name, _ = voucher_for('weapon', (weapon.level or 1) if weapon else 1)
     cost = item_cost(name, state)
-    arrival = None if night_wave_cleared(state) else threat_eta_to_base(state)
+
+    def role_arrival(item):
+        if night_wave_cleared(state):
+            return None
+        return threat_eta_to_base(state, item)
 
     def still_ok(role):
         if role is None or role.health <= 0:
@@ -226,25 +241,31 @@ def pick_weapon_voucher_buyer(state, blocked=None):
         if gun_back is None:
             return False
         total = time_needed + gun_back
-        if arrival is not None and total + MUSTER_BUFFER >= arrival:
+        eta = role_arrival(role)
+        if eta is not None and total + MUSTER_BUFFER >= eta:
             return False
         return True
 
     existing = next((j for j in state.worker_item_jobs.values() if j.get('kind') == 'weapon'), None)
-    if existing:
+    if existing and not extra:
         owner = next((r for r in state.team_our.roles
                       if r.id in state.worker_item_jobs
                       and state.worker_item_jobs[r.id].get('kind') == 'weapon'
                       and r.health > 0), None)
         if still_ok(owner) and not _skip_pioneer_voucher_buyer(owner, state, blocked):
             return owner
+    if extra and not weapon_upgrade_due(state):
+        return None
     if not weapon_upgrade_due(state) and not existing:
         return None
     if weapon is None:
         return None
+    shop = find_zone(state, 'weaponShop')
     best = None
     for role in state.team_our.roles:
         if role.role_type not in ('worker', 'pioneer') or role.health <= 0:
+            continue
+        if extra and role.id in occupied:
             continue
         if _skip_pioneer_voucher_buyer(role, state, blocked):
             continue
@@ -256,39 +277,61 @@ def pick_weapon_voucher_buyer(state, blocked=None):
         if gun_back is None:
             continue
         total = time_needed + gun_back
-        if arrival is not None and total + MUSTER_BUFFER >= arrival:
+        eta = role_arrival(role)
+        if eta is not None and total + MUSTER_BUFFER >= eta:
             continue
         holder = 0 if _voucher_holder(role) else 1
+        shop_dist = chebyshev(role.pos, shop.pos) if shop else 99
+        on_shop = 0 if shop_dist == 0 else 1
         role_rank = 0 if role.role_type == 'pioneer' else 1
-        key = (holder, score + gun_back, total, role_rank, role.id)
+        key = (holder, on_shop, score + gun_back, total, role_rank, role.id)
         if best is None or key < best[0]:
             best = (key, role, total, score)
     if best is None:
+        trace(state, None, 'voucher_no_buyer', '没有人能在截止前完成买券用券并回炮',
+              required_gold=cost, available_gold=state.team_our.gold_num if state.team_our else 0,
+              threat_eta=threat_eta_to_base(state), weapon_id=None if weapon is None else weapon.id)
         return None
     _, role, time_needed, score = best
     trace(state, role.id, 'voucher_buyer_pick', '按卖矿绕路、到店、使用和回炮的完整代价派人买券',
-          time_needed=time_needed, score=score, weapon_id=weapon.id, required_gold=cost)
+          time_needed=time_needed, score=score, weapon_id=weapon.id, required_gold=cost, extra=extra)
     return role
 
 
+def defense_occupancy(role, state, blocked):
+    """把回防占用分成三类：returning / must_hold / free。
+    只有正在回防移动或必须留守/操炮能挡住普通经济任务；已到家且无强制留守不算永久驻守。"""
+    from .brain import WEAPON_TYPES, is_day_round
+    from .pioneer_schedule import defense_snapshot
+    snap = defense_snapshot(role, state, blocked)
+    at_assigned = bool(snap.get('alreadyAtPost'))
+    at_gun = at_assigned or any(
+        r.health > 0 and r.role_type in WEAPON_TYPES and chebyshev(role.pos, r.pos) <= 1
+        for r in (state.team_our.roles if state.team_our else [])
+    )
+    reasons = list(snap.get('defenseDueReasons') or [])
+    if snap.get('pressure') or snap.get('imminentContact'):
+        kind = 'must_hold' if at_gun else 'returning'
+    elif not is_day_round(state.round_no) and snap.get('defenseSlack', 0) <= 0 and not snap.get('nightWaveCleared'):
+        kind = 'must_hold' if at_gun else 'returning'
+    elif not snap.get('defenseDue'):
+        kind = 'free'
+    elif at_gun:
+        travel = snap.get('travel')
+        eta_lock = 'travel_plus_buffer_vs_eta' in reasons and travel == 0
+        kind = 'must_hold' if eta_lock else 'free'
+    else:
+        kind = 'returning'
+    snap = dict(snap)
+    snap['occupancy'] = kind
+    snap['atGun'] = at_gun
+    return kind, snap
+
+
 def defense_due(role, state, blocked):
-    """安全余量不足则回防。高压和正在受攻击优先于历史空窗；找不到回路则停止新外出。"""
-    from .opening import MUSTER_BUFFER, station_return_steps
-    from .brain import is_day_round
-    from .tactics import imminent_contact, night_wave_cleared, pressure, threat_eta_to_base
-    if pressure(state) or imminent_contact(state):
-        return True
-    travel = station_return_steps(role, state, blocked)
-    if travel is None:
-        return True
-    if night_wave_cleared(state):
-        return False
-    if not is_day_round(state.round_no):
-        return True
-    arrival = threat_eta_to_base(state)
-    if arrival is None:
-        return True
-    return travel + MUSTER_BUFFER >= arrival
+    """安全余量不足则回防。与任务候选共用 station_return_detail 路径和到位规则。"""
+    from .pioneer_schedule import defense_snapshot
+    return defense_snapshot(role, state, blocked)['defenseDue']
 
 
 def task_defense_override(state) -> bool:
@@ -324,7 +367,7 @@ def pioneer_should_hold_task(pioneer, state) -> bool:
     from .tactics import pressure, threat_eta_to_base, two_guns_can_hold
     if pressure(state):
         return False
-    eta = threat_eta_to_base(state)
+    eta = threat_eta_to_base(state, pioneer)
     from .grid import build_blocked_set
     from .opening import MUSTER_BUFFER, movement_avoid, station_return_steps
     blocked = build_blocked_set(state) | movement_avoid(state)
@@ -342,34 +385,48 @@ def pioneer_should_hold_task(pioneer, state) -> bool:
 
 
 def muster_for_night(role, state, blocked, reserved):
-    """所有白天都按实际返程距离提前回防，而非仅首日集合。"""
+    """正在回防或必须留守时才接管；已到岗且无强制留守返回 False，让上层继续评估买券等事务。"""
     from .opening import assign_weapons, station_path, move_on_path
     from .tactics import night_wave_cleared, pressure
+    from .opening import first_night_economy_open
     if night_wave_cleared(state):
         return False, None
-    cycle = (state.round_no or 0) % 130
-    if (state.round_no or 0) < 70 and role.role_type == 'worker' and not pressure(state):
+    if ((state.round_no or 0) < 70 or first_night_economy_open(state)) and role.role_type == 'worker' and not pressure(state):
         return False, None  # 首日由施工计划按实际武器返程时间集合。
-    if not defense_due(role, state, blocked):
+    occupancy, snap = defense_occupancy(role, state, blocked)
+    if occupancy == 'free':
+        if snap.get('alreadyAtPost') or snap.get('atGun'):
+            trace(state, role.id, 'at_post_no_mandatory_hold',
+                  '已到炮位/家里，但当前没有强制留守需求，继续评估经济动作',
+                  occupancy=occupancy, defenseDue=snap.get('defenseDue'),
+                  defenseDueReasons=snap.get('defenseDueReasons'),
+                  travel=snap.get('travel'), threatEta=snap.get('threatEta'),
+                  travelReason=snap.get('travelReason'))
         return False, None
     if role.role_type == 'pioneer' and pioneer_should_hold_task(role, state):
         return False, None
     weapon = assign_weapons(state).get(role.id)
+    from .opening import defense_rounds_remaining
+    remaining = defense_rounds_remaining(state, role)
     if weapon is None:
         from .brain import own_station
         from .opening import adjacent_path
         base = own_station(state)
         path = adjacent_path(role, base.pos, blocked | reserved, state) if base else None
-        trace(state, role.id, 'no_free_weapon', '进入回防时段但缺少独立武器，先返回基地')
+        trace(state, role.id, 'no_free_weapon', '进入回防时段但缺少独立武器，先返回基地',
+              occupancy=occupancy, threat_eta=snap.get('threatEta'))
         return True, move_on_path(state, role, path, reserved, '没有武器也不留在外面，返回基地')
     path = station_path(role, weapon, blocked | reserved, state)
-    remaining = 70 - cycle if cycle < 70 else 0
-    from .tactics import threat_eta_to_base
-    arrival = threat_eta_to_base(state)
-    trace(state, role.id, 'income_muster', '安全余量不足，提前回到分配武器', weapon_id=weapon.id,
-          remaining_day_rounds=remaining, threat_eta=arrival,
+    trace(state, role.id, 'income_muster',
+          '强制留守操炮' if occupancy == 'must_hold' else '安全余量不足，提前回到分配武器',
+          occupancy=occupancy, weapon_id=weapon.id,
+          remaining_day_rounds=remaining, threat_eta=snap.get('threatEta'),
+          defenseDueReasons=snap.get('defenseDueReasons'),
           return_steps=None if path is None else len(path))
-    return True, move_on_path(state, role, path, reserved, '停止采矿和购物，提前回防')
+    if occupancy == 'must_hold' and snap.get('atGun') and not path:
+        return True, None
+    return True, move_on_path(state, role, path, reserved,
+                              '原地守炮' if occupancy == 'must_hold' and snap.get('atGun') else '停止采矿和购物，提前回防')
 
 
 def ore_prices(state):
@@ -609,11 +666,13 @@ def trip_collect_limit(role, state, path_len=0, return_len=0, purpose='income'):
     if cap <= 0:
         return 0
     from .brain import is_day_round
-    from .opening import MUSTER_BUFFER
+    from .opening import MUSTER_BUFFER, first_night_economy_open
     from .tactics import night_wave_cleared, threat_eta_to_base
-    if night_wave_cleared(state) or not is_day_round(state.round_no):
+    if night_wave_cleared(state):
         return cap
-    arrival = threat_eta_to_base(state)
+    if not is_day_round(state.round_no) and not first_night_economy_open(state):
+        return cap
+    arrival = threat_eta_to_base(state, role)
     if arrival is None:
         return cap
     lead = dusk_cashout_lead(state) if purpose == 'income' else 0

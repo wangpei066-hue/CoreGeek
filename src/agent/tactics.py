@@ -136,14 +136,15 @@ def _note_respawns(state):
         state.policy_memory.pop('opening_wall_targets', None)
 
 
-def threat_eta_to_base(state):
-    """安全截止时间：min(入夜剩余, 可见敌人首次贴近关键目标的切比雪夫下界)。
-    切比雪夫不是官方移动耗时，也未计入射程；找不到可见威胁时白天用入夜剩余，夜间为未知。"""
-    from .brain import WEAPON_TYPES, own_station, is_day_round
-    cycle = (state.round_no or 0) % 130
+def threat_eta_to_base(state, role=None):
+    """安全截止剩余回合：min(该角色夜防到位点剩余, 可见敌人切比雪夫下界)。
+    切比雪夫不是官方移动耗时，也未计入射程。找不到可见威胁且已过到位点时为未知。"""
+    from .brain import WEAPON_TYPES, own_station
+    from .opening import defense_rounds_remaining
     etas = []
-    if is_day_round(state.round_no):
-        etas.append(max(0, 70 - cycle))
+    remaining = defense_rounds_remaining(state, role)
+    if remaining > 0:
+        etas.append(remaining)
     robots = threat_robots(state)
     if robots:
         spots = []
@@ -151,19 +152,18 @@ def threat_eta_to_base(state):
         if base:
             spots.append(base.pos)
         weapons = []
-        for role in (state.team_our.roles if state.team_our else []):
-            if role.health <= 0:
+        for item in (state.team_our.roles if state.team_our else []):
+            if item.health <= 0:
                 continue
-            if role.role_type in (*WEAPON_TYPES, 'wall'):
-                spots.append(role.pos)
-                if role.role_type in WEAPON_TYPES:
-                    weapons.append(role)
-        # 只把已经在院内/炮旁的人当成关键目标，远处采矿的人不会把全局截止时间压成贴身威胁。
+            if item.role_type in (*WEAPON_TYPES, 'wall'):
+                spots.append(item.pos)
+                if item.role_type in WEAPON_TYPES:
+                    weapons.append(item)
         if base:
-            for role in (state.team_our.roles if state.team_our else []):
-                if role.health > 0 and role.role_type in ('worker', 'pioneer'):
-                    if chebyshev(role.pos, base.pos) <= 3 or any(chebyshev(role.pos, w.pos) <= 1 for w in weapons):
-                        spots.append(role.pos)
+            for item in (state.team_our.roles if state.team_our else []):
+                if item.health > 0 and item.role_type in ('worker', 'pioneer'):
+                    if chebyshev(item.pos, base.pos) <= 3 or any(chebyshev(item.pos, w.pos) <= 1 for w in weapons):
+                        spots.append(item.pos)
         if spots:
             etas.append(min(chebyshev(spot, robot.pos) for robot in robots for spot in spots))
     if not etas:
