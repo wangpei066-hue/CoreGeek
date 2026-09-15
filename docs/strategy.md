@@ -159,9 +159,13 @@ BUILD_SURVIVAL_WALL → MUSTER
 
 资源目标按每名工人到所有可达候选矿的真实最短路径选择：`score = path_length`；服务器已给出单位售价时才用 `path_length / known_unit_value`。`switch_penalty = 4`，且必须落在合法换目标白名单里。每个工人的 `opening_worker_goals` 跨回合保持；连续三回合路径不缩短才宣布原目标失效。检测到 `A→B→A` 时保持原目标、走当前 BFS 下一步。
 
+**修墙先囤够一批再动身（`opening_wall_work`）**：背包里有石头不代表立刻去建墙——只有满足「背包已满」「攒够 `min(STONE_BATCH, 当前缺口数)` 块」「石矿已经不可达」三者之一才会转去 `claim_opening_wall`。否则继续囤，避免变成「采一块、跑回去建一道、再跑回矿点」的单趟搬运。修墙阶段第一天不做第二门升级，背包里只要还有铜铁（不等背包塞满）就立刻去卖，卖不出去才 `drop` 腾位置。
+
 `go_mine` / `liquidate` / `replenish_walls` / `muster_for_night` 只提供原子动作，不能自行改战略阶段。最终命令之后只有紧急治疗、近敌战斗、正式回防可以覆盖。
 
 最低生存墙（`survival_wall_plan`）先封正面通向基地/武器/操炮位的缺口，再补两侧端点。死亡墙、死亡武器不计入完成。
+
+**个人回防截止点，不是全队统一 `MUSTER`**：`opening_stage` 到 `MUSTER` 只是最终兜底（剩余白天 ≤ `MUSTER_BUFFER` 或贴身威胁）；在那之前，每名角色按自己到已分配武器的真实路程单独判断——`remaining ≤ own_travel + MUSTER_BUFFER` 就先于全队进入个人回炮，基地附近的人不会被最远的队友拖累提前停工。背包还有铜铁、且回防前最后一次绕去小贩卖掉还来得及（`remaining ≤ role_deadline + 2×小贩往返 + 1`）时，会先卖再回炮，不会把资源原样带进夜里浪费；真到了硬截止点就不再绕路，直接回炮。
 
 ### 开拓者首日
 
@@ -217,9 +221,7 @@ BUILD_SURVIVAL_WALL → MUSTER
 
 每回合无论 `phaseTask` 是否为空，stderr 打一条 `PIONEER_TASK`/`scheduler`（不占 `executeCmd`），记录分支、最终动作来源、候选排除原因、连续采购/回防占用、领取条件、防守与时间筛选来源。`acceptTask` 若在指令合并后消失会记 `accept_overwritten`。
 
-`strategy.decide` 前 `PioneerTaskSolver.ingest_feedback` 只消费本回合反馈并绑定当前 `phaseTask`；动作仍由 `step` 发出。调度读取的 `task_session` 必须属于当前任务，旧 fingerprint/key 不能让 `solver_ready_to_submit` 误判。
-
-解题在 `PioneerTaskSolver`（第 16 节）：会话与角色移动分开保存；开拓者回炮或操炮时仍消费本回合 LLM/沙盒回传，但不提交、不新开解题输出。官方清空 `phaseTask` 会归档会话，**不把清空当成判题通过**。每天 LLM 限 3 次；自进化进行中豁免且不计入新闻额度。
+解题在 `PioneerTaskSolver.step`（第 16 节，`strategy.decide` 之后调用一次）：单一入口，既消费上一回合反馈也生成本回合动作，不再拆分成两步。`server.py` 调用后把 `solver.session` 写回 `state.task_session`；`pioneer_schedule.py` 的 `scheduler_task_session` 读它时会自己核对 `key`/`fingerprint` 是否还对应当前 `phaseTask`，过期就当空会话处理，不会让 `solver_ready_to_submit` 把上一个任务的"已可提交"状态带到新任务里。官方清空 `phaseTask` 时直接清空会话，不归档，**不把清空当成判题通过**。每天 LLM 限 3 次（新闻/宝藏），自进化解题不计入这个额度。
 
 ---
 
@@ -373,23 +375,23 @@ $$
 | `API_SOLVE_ROUNDS` | 9 | API 无稳定实测时的保守回退，与部署分列 |
 | `SHOP_STALL_ROUNDS` | 4 | 采购无进展时重新评估买家，不默认取消必要购买 |
 | `INTERRUPT_RESERVATION_COST` | 24 | 买券评估里打断任务预约的机会成本 |
-| `EMPTY_WAIT_LIMIT` | 2 | 空沙盒/空 LLM 连续等待超过此时才改问模型 |
-| 沙盒命令 / HTTP | 10s / 8s | 工具包装超时；API 单次网络超时 |
+| `task_solver` 沙盒调用上限 | 12 | LLM 调用次数到此转 `exhausted`，不再发 prompt |
+| 沙盒命令超时 | 10s | `READ_SCRIPT`/`EXEC_SCRIPT` 里 `timeout 10` |
 | 新闻 LLM 日限 | 3 | 不含自进化 |
 
 ---
 
 ## 14. 持久化与日志
 
-`state/build_memory.json`：失败建造点、工人建造目标、商店任务、上一回合指令、`policy_memory`（武器分配、卖矿承诺、开局「只修墙」、召唤日限额、新闻/宝藏记忆、正面墙是否被拆过、角色存活标记、工人占矿目标等）。队伍/地图/基地变化或回合回退时清空策略记忆，并重置新闻记忆与解题会话/经验。角色从阵亡变为存活时清掉该人的建造目标、商店任务、旧炮位和占矿。协议没有比赛 ID，无法区分「同一队伍连续两局都从 round 0 开始」。`worker_item_jobs` 会随记忆落盘。
+`state/build_memory.json`：失败建造点、工人建造目标、商店任务、上一回合指令、`policy_memory`（武器分配、卖矿承诺、开局「只修墙」、召唤日限额、新闻/宝藏记忆、正面墙是否被拆过、角色存活标记、工人占矿目标等）。队伍/地图/基地变化或回合回退时清空策略记忆，并重置新闻记忆与解题会话。协议没有比赛 ID，无法区分「同一队伍连续两局都从 round 0 开始」。`worker_item_jobs` 会随记忆落盘。
 
-自进化另有三份文件，换任务不清经验：
+**阵亡与复活都要清理，不止复活这一侧**（`tactics._note_respawns`）：工人/开拓者从存活变阵亡、或从阵亡变存活时，都会清掉该角色名下的 `worker_build_targets`、`worker_item_jobs`、`weapon_assignment`、`opening_wall_targets`、占矿目标、`selling_roles` 预约。这不是为了好看——`_pending_item_job_targets`（道具任务目标去重）和 `claimed_mines`（占矿降权）都不检查角色死活，如果死者名下的任务/占矿条目一直留着，队友永远没人会替它释放，等于永久卡住一个武器升级目标或一座矿。
+
+自进化只有一份状态文件，换任务不清经验：
 
 | 文件 | 内容 | 清理 |
 | --- | --- | --- |
-| `state/task_session.json` | 当前任务：文档、动作、请求状态、答案、facts、失败指纹、回合预算 | 当前任务结束时归档后清空 |
-| `state/task_experience.json` | 已验证 API 调用方式、部署 CRLF/验收经验；不含密钥和城市统计答案 | 按对局保留；换对局或回合回退才清空 |
-| `state/task_archives.json` | 未完成任务快照与结束原因 | 最多 8 条；换对局或回退清空 |
+| `state/task_session.json` | 当前任务：识别到的路径、已读文档、历史动作与结果、答案、调用次数、重试次数 | `phaseTask` 清空时直接清掉，不归档 |
 
 决策原因写在 `logs/` 的 decision 报告里。自进化每个任务还会在 stderr 打 `PIONEER_TASK` / `task_summary`（实例、prompt 哈希、领取/提交回合、拦截次数、结束原因）。动作合法不等于答案判对。
 
@@ -407,72 +409,45 @@ $$
 - README 里部分条目已过时（例如「升级优先补墙」「眩晕未实现」），以本文和代码为准。
 - 自进化平台是否另有任务实例 ID（当前只有 type/position/`timeoutRounds`）。
 - `timeoutRounds` 从领取还是任务开放起算；本地截止回合标为估计值。
-- `phaseTask` 清空是否等于判题通过（当前只归档为未确认）。
-- 部署从领到提交的 Round 差降到约 6：优化目标，不是平台保证。
+- `phaseTask` 清空是否等于判题通过（当前不记录，直接清空会话）。
+- 求解器（`task_solver.py`）是刻意回退过的简化版：不做 API 分页/去重、不拦截重复失败命令、不做部署 CRLF 自动修复、不跨任务保存已验证经验。这些能力在更早的历史版本里出现过，代价是复杂度和对 `python3` 沙盒环境的依赖（比赛沙盒是否保证 `python3` 未经确认），权衡后退回纯 `sh` 脚本。
+- 提交确认（`errorCode` 2/4）判断没有按角色/动作过滤：协议本身 `ErrorInfo` 只有 `errorCode`+`description`，不带角色归属，理论上同一回合其它角色的非法动作触发的 `errorCode 4` 可能被误判成这次提交被拒绝。
 
 ---
 
 ## 16. 自进化解题（PioneerTaskSolver）
 
-入口：`PioneerTaskSolver.step`（`src/agent/task_solver.py`）。HTTP 协议和角色指令格式不变。不要用历史答案或旧 TOKEN 代替真实执行。
+入口：`PioneerTaskSolver.step(state, commands)`（`src/agent/task_solver.py`），`strategy.decide` 之后调用一次，既消费上一回合反馈又生成本回合动作。HTTP 协议和角色指令格式不变。
 
-### 流水线
+这是**刻意回退过的简化版**：本轮删掉了 API 分页/去重、重复失败指纹拦截、部署 CRLF 自动修复、跨任务经验持久化与归档（`task_experience.json`/`task_archives.json`）这些更早期加过的能力，换回一套只依赖 `sh`（不依赖 `python3`）的最小状态机——比赛沙盒是否保证 `python3` 可用未经确认，这台开发机上就踩过 `python3` 被系统占位程序劫持、真实解释器缺失的坑，纯 `sh` 脚本更保险。旧版本的这些能力仍在 git 历史里（`git log -- src/agent/task_solver.py`），需要时可以参考，但当前代码没有。
 
-识别当前任务实例 → 恢复会话、加载适用经验 → 已知类1/类2走固定路径，其余按通用 LLM 环（读说明 → execute → 再判断）。LLM 给出的 `curl`/`wget` 直接进沙盒，查出分页后改由程序续发。成功条件满足则提交。
+### 会话与阶段
 
-任务标识：协议没有实例 ID。本地用 `teamId:领取序号:fingerprint前8位`。换任务时归档当前会话并记录结束原因；没有成功证据不标通过。
+`self.session`（落盘到 `state/task_session.json`）跨回合持久，字段：`key`（`[teamId, type, phaseTask]`，判断是否换了新任务）、`stage`、`paths`/`index`/`offset`（待读文档列表与进度）、`documents`/`history`（已读内容与动作历史）、`calls`/`retries`、`taskKind`/`workspace`（`task_context` 解析结果）、`answer`。协议没有任务实例 ID，`key` 换了或 `round_no` 回退就直接开新会话，不归档旧的。
 
-### 等待与通道
+阶段流转：`read → wait_read → (read，还有下一页/下一份文档 | ask，文档读完)`；`ask → wait_llm`（发 prompt，`calls` 满 12 次后进 `exhausted`，不再问）；`wait_llm` 解析 LLM 返回的 `read`/`execute`/`submit` 动作，分别转回 `read`、转 `tool → wait_tool → ask`、或转 `submit → wait_submit`。运维任务点了相对路径的文档但还不知道 `workspace` 时，直接跳过 `wait_read` 进 `ask`，先问清楚工作区在哪。同一回合重复调用返回缓存的 `response`，不重复推进状态机。
 
-`lastCmdResult` 为空表示本回合没发命令，不是失败。区分：未返回、诊断/新闻残留、`[TIMEOUT]` / `[JUDGER_ERROR]`、对得上的工具 JSON。空响应或无关 `task_active` 不会立刻再发请求；连续空等超过 `EMPTY_WAIT_LIMIT`(2) 才改问 LLM。
+`_holding_for_output`：开拓者本回合命令是 `move`/`attack`/`buy`/`sell`/`drop`，或正操控某门炮（`controllerId` 匹配），则不「持有」解题权——仍会消费已经收到的沙盒/LLM 回传更新会话，但不会新发探查/LLM/提交指令，避免和回防/操炮的移动指令打架。
 
-工具结果优先匹配 `marker=PIONEER_TASK`、`requestId` 和 `event`（`read_document` / `execute_tool` / `deploy_probe` / `api_fetch`）。类1查询走裸 `curl`，回传是接口 JSON 加 `HTTPSTATUS:`，不要求 marker。`llmResp` 没有原生请求 ID，同时只允许一个待处理 LLM。开拓者移动/操炮时仍消费已返回结果，但不发新的工具或 prompt。
+### 沙盒脚本
 
-等待 `wait_read` / `wait_tool` / `wait_probe` / `wait_llm` / `wait_submit` 时，诊断只写 stderr，不占用 `executeCmd`。
+`READ_SCRIPT` / `EXEC_SCRIPT` 都是纯 `sh` 脚本，通过 `sandbox_command` 包成 `sh -c '<script>' -- <参数...>` 执行，参数逐个 `shlex.quote`。
+
+- **读文档**：`workspace` 给了就先 `cd`；文件存在就 `readlink -f` 取绝对路径，否则在当前目录和根目录下 `find`（排除 `proc/sys/dev/.git/__pycache__`）按 basename 找，最多留 10 条候选。**必须恰好 1 个匹配**，0 个是 `not_found`，多个是 `ambiguous_path`。命中后用 `dd`+`awk` 从 `offset` 读最多 6000 字节，转义反斜杠和引号，回报 `nextOffset`/`more` 供分页续读。
+- **执行命令**：`workspace` 给了就先 `cd`；`timeout 10 sh -c "$command"`，输出截到 6000 字节，超时（退出码 124）标 `tool_timeout`。
+
+沙盒结果靠 `marker=PIONEER_TASK` + 本次的 `requestId` 匹配；找不到匹配结果时 `wait_read` 最多重试 2 次（重发同一条 `pendingCommand`），`wait_tool` 找不到就直接记 `sandboxError` 并转 `ask`——没有更细的「未返回/超时/无关内容」区分。
 
 ### 提交确认
 
-| 状态 | 含义 |
-| --- | --- |
-| `sent` | 已发出 `submitAnswer` |
-| `accepted` | 开拓者本回合动作合法，且没有 `errorCode 2` |
-| `rejected` | 官方 `errorCode 2`（答案错误），或开拓者提交动作为非法且伴随 `errorCode 4` |
-| `unknown` | 尚未收到开拓者结果；不盲目重复提交 |
-| `cleared_unconfirmed` | `phaseTask` 已空，只说明任务结束，**不是判题通过** |
+`wait_submit` 阶段：本回合出现 `error_code` 属于 `(2, 4)` 的错误，**或**开拓者这一回合的 `lastRoundRoleActionResults` 为 `False`，就判定提交被拒（记 `submissionRejected` 到 `history`），转回 `ask` 重新求解。没有第三种「未知，继续等」状态——不满足拒绝条件就默认还在等，下一回合再看。
 
-`lastRoundRoleActionResults=true` 只表示动作合法。其他角色的 `errorCode 4` 不触发当前答案重算。
+`errorCode` 判断**没有按角色/动作过滤**（协议里 `ErrorInfo` 只有 `errorCode`+`description`，不带角色归属）：如果同一回合恰好有别的角色因为别的原因触发了 `errorCode 4`，理论上会被误判成这次提交被拒绝。这是简化版的已知限制，不是遗漏。
 
-### 重复失败
+### Prompt（`make_prompt`）
 
-记录 `动作类型 + 目标路径/命令 + 工作目录 + 错误类别`。南京式读文件：首次失败写入 facts；同路径同环境不再原样执行；若有已验证 API 经验则改走 `api_fetch`，否则改读尚未失败的文档或带着明确原因问 LLM。通用 `execute` 只拦截**完全相同**的命令串，不用脆弱字符串判断 shell 是否等价。
+固定的一段中文说明（任务类型不限、taskKind 只是启发式线索、API 任务要求先读任务点名的 `API_DOCS.md`、部署类要把修复和验证合并成一条 `execute`、只返回一个 JSON 对象等）+ **始终原样拼接**的 `DEPLOYMENT_SOP`（来自 `task_sop.py`，不管 `taskKind` 是不是 `workspace` 都会带上，不像更早版本那样按分类只注入对应 SOP）+ 当前任务的 JSON 证据块（`task`/`taskKind`/`workspace`/`documentPaths`/`documents`/`history[-16:]`）。
 
-### 路径
+没有失败去重、没有调用经验复用——每次问 LLM 都带着最近 16 条历史，重复犯错与否完全靠 LLM 自己从历史里看出来，代码不拦。
 
-`documentDir`：任务说明所在目录，读引用资料优先相对它解析。`workspace`：修复/执行目录。工作区不存在则清除并改问，不因反复 `chdir` 失败锁死。
-
-### 部署任务
-
-有工作区时先 `deploy_probe`：列出规范与脚本、检查 CRLF/解释器/权限；确认 shebang/`.sh` 存在 CRLF 时用 Python 把 `\r\n` 换成 `\n`（不改 `check`、不依赖 `dos2unix`、不创建空启动脚本）。预检通过只记 facts，不是任务成功。探查阶段若 `./check` 退出码 0 且输出含真实 `TOKEN:`，程序直接构造 `{"token":...}` 提交，不再问 LLM。否则一次 execute 完成修复、回读和验收。已知部署从领到提交的 Round 差，以本轮 9 为基线，目标约 6，不是保证。
-
-### API 任务
-
-同一对局已有遗产/API 调用经验时，南京直接复用路径、认证方式和城市参数（当前任务的密钥和城市），不读北京旧文件、不重新猜接口。`limit` 不是全量证据。
-
-执行顺序：加载经验或读文档 → 沙盒只发 `curl -G --data-urlencode` → 求解器按 pagination 续发下一页 curl → 程序统计 → 答案校验 → 提交。不要在沙盒里再启 python/urllib。
-
-- 只把业务 `code=200` 当成调用成功；不假定存在 `status=success` 或 `items`。
-- 已知接口用 `data.records` 和 `data.pagination`。
-- HTTP/shell 退出码 0 不等于业务成功。
-- `401` 停止分页和统计；参数错误先改参数。
-- 查询成功立即写入调用经验；完整性未确认时不标「全量已验证」。
-- 世界遗产用 `protected_level` 精确匹配任务要求。
-- `oldest_era` 是遗产**名称**，必须有可比较年代；模糊年代不用第一条记录占位。
-- 答案字段按当前题目示例填充；整数排除布尔。`total_count` 等于已获取条数。数据完整且字段合法才自动提交。
-
-不能复用旧 TOKEN、城市统计答案或跨对局完成状态。密钥按当前任务文本提取，日志脱敏。
-
-### Prompt
-
-结构：通用动作协议（含根目录求解器里的 API/部署兜底句） + 当前任务分类规则 + 已验证经验 + 当前目标和剩余预算 + 已确认 facts/失败动作 + 最近 16 条结果。部署 SOP 只注入 `taskKind=workspace`；API 注入 API SOP；未知任务注入通用 SOP，不注入完整部署 SOP。完整文档按需提供；facts 不随 `history[-16:]` 丢失。
-
-回合预算：领取回合 + 平台 `timeoutRounds` 得到估计截止；`timeoutRounds` 日志里不变，不能当剩余回合。预算不足时不编造答案抢提交。调用次数上限 12 只是辅助限制。
+回合预算：只有一个硬上限——`calls`（LLM 调用次数）到 12 次就 `exhausted`，之后不再发 prompt。没有基于 `timeoutRounds` 的截止回合估算，那部分完全由 `pioneer_schedule.py` 自己算（`estimated_solve_rounds`/`KIND_FALLBACKS`），彼此独立。
