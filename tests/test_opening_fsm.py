@@ -131,7 +131,7 @@ def illegal_switches(trail):
         None, 'sticky', 'nearest', 'stalled', 'sticky_gone', 'sticky_stalled',
         'backpack_full', 'gold_ready', 'have_voucher', 'muster', 'survival_wall',
         'build_weapons', 'wait_in_yard', 'blocked_by_nonstone_inventory', 'at_post',
-        'stage_change',
+        'stage_change', 'batch_not_ready', 'batch_ready', 'mine_exhausted',
     }
     return [row for row in trail if row.get('switch_reason') not in allowed]
 
@@ -261,6 +261,55 @@ class OpeningFsmTrailTests(unittest.TestCase):
         no_command = [e for e in state.decision_events
                       if e.get('code') == 'worker_no_command' and e.get('worker_state') == 'BUILD_WEAPONS']
         self.assertEqual(no_command, [])
+
+    def test_stone_batches_before_building_walls(self):
+        """回归：不能采一块石头就跑回去建一道墙，要先攒够一批再成片建造。"""
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'), Zone(Pos(1, 9), 'weaponShop'), Zone(Pos(1, 11), 'vendor'),
+        ]
+        trail = run_opening(state, 40)
+        wall_rows = [r for r in trail if r['worker_id'] == 1 and r['stage'] == STAGE_WALL]
+        collect_streak = 0
+        single_stone_builds = 0
+        for row in wall_rows:
+            if row['action'] == 'collect':
+                collect_streak += 1
+            elif row['action'] == 'build' and row['goal_type'] == 'wall':
+                if collect_streak == 1:
+                    single_stone_builds += 1
+                collect_streak = 0
+        builds = [r for r in wall_rows if r['action'] == 'build' and r['goal_type'] == 'wall']
+        self.assertGreater(len(builds), 0)
+        self.assertEqual(single_stone_builds, 0)
+
+    def test_opening_wall_work_keeps_mining_until_batch_ready(self):
+        """opening_wall_work 单测：手上只有 1 块石头、缺口还很多时应继续囤石，不直接去建墙。"""
+        from src.agent.opening_schedule import opening_wall_work
+        from src.agent.opening import movement_avoid
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone')]
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        blocked = build_blocked_set(state) | movement_avoid(state)
+
+        worker.backpack = ['stone']
+        state.decision_events = []
+        opening_wall_work(worker, state, blocked, set(), set(), {})
+        tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(tick.get('goal_type'), 'stone')
+
+        worker.backpack = ['stone'] * 6
+        state.decision_events = []
+        opening_wall_work(worker, state, blocked, set(), set(), {})
+        tick2 = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(tick2.get('goal_type'), 'wall')
+        self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
 
     def test_no_second_upgrade_on_day1(self):
         state = opening_state()

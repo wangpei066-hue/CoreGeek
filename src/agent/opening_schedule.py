@@ -430,21 +430,40 @@ def opening_muster(role, state, blocked, reserved, assignments, stage):
 
 
 def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
-    from .opening import claim_opening_wall, survival_wall_missing
+    """先攒够一批石头再回去成片建墙，不要采一块就往返建一道。"""
+    from .opening import STONE_BATCH, claim_opening_wall, survival_wall_missing
     missing = survival_wall_missing(state)
     stones = (role.backpack or []).count('stone')
-    if stones > 0 and missing:
+    cap = role.back_pack_capability or 0
+    pack_full = bool(cap and len(role.backpack or []) >= cap)
+    # 只备够这名工人这趟真正用得上的量：不超过 STONE_BATCH，也不超过缺口数。
+    batch_target = min(STONE_BATCH, len(missing)) if missing else 0
+    batch_ready = stones >= batch_target if batch_target else stones > 0
+    mine_exhausted = False
+    if missing and stones > 0 and not pack_full and not batch_ready:
+        mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
+        if mine is not None:
+            target = (mine.pos.x, mine.pos.y)
+            if path:
+                return opening_move(state, role, path, reserved, target, '前往最近可达石矿继续囤石',
+                                    'mine', 'stone', reason, STAGE_WALL)
+            cmd = selected(state, role.id, {
+                'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
+            }, '继续采集石头，攒够一批再建墙')
+            return _tick(state, role, STAGE_WALL, 'mine', 'stone', target, 0, 'collect',
+                         'batch_not_ready', cmd)
+        mine_exhausted = True
+        trace(state, role.id, 'stone_mine_unreachable', '石矿不可达，带着手上的石头去建墙')
+    if stones > 0 and missing and (pack_full or batch_ready or mine_exhausted):
         cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, assignments)
         if cmd:
             target = None
-            if cmd.get('action') == 'build':
+            if cmd.get('action') in ('build', 'move'):
                 tp = cmd.get('targetPos') or [{}]
                 target = (tp[0].get('x'), tp[0].get('y'))
-            elif cmd.get('action') == 'move':
-                tp = cmd.get('targetPos') or [{}]
-                target = (tp[0].get('x'), tp[0].get('y'))
+            switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
             return _tick(state, role, STAGE_WALL, 'wall', 'wall', target, 0 if cmd.get('action') == 'build' else 1,
-                         cmd.get('action'), 'survival_wall', cmd)
+                         cmd.get('action'), switch, cmd)
     if _metal_count(role) and (_backpack_full(role) or stones == 0 and _backpack_full(role)):
         cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_WALL, 'blocked_by_nonstone_inventory')
         if cmd:
@@ -454,8 +473,7 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                 cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '丢弃铜铁以便采石')
                 return _tick(state, role, STAGE_WALL, 'wall', 'drop', None, 0, 'drop',
                              'blocked_by_nonstone_inventory', cmd)
-    cap = role.back_pack_capability or 0
-    if missing and (not cap or len(role.backpack or []) < cap):
+    if missing and not pack_full and (not batch_ready or stones == 0):
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
         if mine is not None:
             target = (mine.pos.x, mine.pos.y)
