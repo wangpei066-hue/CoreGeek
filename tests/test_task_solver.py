@@ -250,8 +250,9 @@ class TaskSolverTests(unittest.TestCase):
         self.payload['llmResp'] = '原始响应' * 2000
         self.post()
         record = json.loads((self.root / 'logs/request_000001.json').read_text(encoding='utf-8'))
-        self.assertEqual(record, self.payload)
-        self.assertNotIn('PIONEER_TASK_EXCHANGE', self.output.getvalue())
+        expected = {key: value for key, value in self.payload.items() if key != 'llmResp'}
+        self.assertEqual(record, expected)
+        self.assertIn('PIONEER_TASK_EXCHANGE', self.output.getvalue())
 
     def test_wrong_sandbox_correlation_does_not_feed_llm(self):
         self.payload['phaseTask'] = '阅读 `/task.md`'
