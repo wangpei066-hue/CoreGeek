@@ -4,11 +4,9 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
-import sys
 
 
 from .log_format import command_text, emit_stderr
-from .news_logging import log_folk_plan, log_official_plan
 
 CONSOLE_MARKER = "STRATEGY_DECISION"
 WEAPON_BUILD_NAMES = ("gatling", "railgun", "rocket")
@@ -90,13 +88,15 @@ def emit_console_report(report):
             for role in roles
         ],
     )
-    news_plans = report.get("newsPlans") or {}
-    official = news_plans.get("official") or {}
-    folk = news_plans.get("folk") or {}
-    if official.get("oreEffects"):
-        log_official_plan(round_no, official)
-    if folk:
-        log_folk_plan(round_no, folk)
+    # official_plan / folk_plan 只在 ingest（官方原文变化）和 LLM 落地时打，
+    # 不在每回合结束重复打印。
+    # news_plans = report.get("newsPlans") or {}
+    # official = news_plans.get("official") or {}
+    # folk = news_plans.get("folk") or {}
+    # if official.get("oreEffects"):
+    #     log_official_plan(round_no, official)
+    # if folk:
+    #     log_folk_plan(round_no, folk)
 
     weapon_actions, wall_actions, pioneer_actions, economy_actions = [], [], [], []
     for role in roles:
@@ -381,35 +381,36 @@ def write_report(log_dir, report):
             stream.write(text)
 
 
-def emit_console_report(report):
-    """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
-
-    本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
-    任务原文、背包明细或重复路径事件刷满平台输出。
-    """
-    role_reports = []
-    for role in report["roles"]:
-        reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
-                   for event in role["events"]]
-        role_reports.append({
-            "id": role["role_id"], "type": role["role_type"],
-            "pos": role["position"], "status": role["status"],
-            "health": role["health"], "backpackCounts": role["backpack"],
-            "commandKey": role["command_key"], "command": role["command"],
-            "reasons": reasons, "pendingBuild": role["pending_build"],
-            "itemJob": role["item_job"],
-        })
-    record = {
-        "marker": CONSOLE_MARKER, "sequence": report["sequence"],
-        "roundNo": report["round"], "phase": report["phase"],
-        "summary": report["summary"], "roles": role_reports,
-        "globalEvents": [event for event in report["events"] if event["role_id"] is None],
-        "previousFeedback": report["previous_feedback"],
-        "systemErrors": report["system_errors"],
-        "observedChanges": report["observed_changes"],
-        "decisionMs": report["decision_ms"],
-        "schemaVersion": report['schema_version'],
-        "timestampUtc": report['timestamp_utc'],
-        "diagnostics": report.get('diagnostics', {}),
-    }
-    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
+# 旧版：整包 STRATEGY_DECISION JSON。与上方按类分行版本同名，会盖掉前者。
+# def emit_console_report(report):
+#     """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
+#
+#     本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
+#     任务原文、背包明细或重复路径事件刷满平台输出。
+#     """
+#     role_reports = []
+#     for role in report["roles"]:
+#         reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
+#                    for event in role["events"]]
+#         role_reports.append({
+#             "id": role["role_id"], "type": role["role_type"],
+#             "pos": role["position"], "status": role["status"],
+#             "health": role["health"], "backpackCounts": role["backpack"],
+#             "commandKey": role["command_key"], "command": role["command"],
+#             "reasons": reasons, "pendingBuild": role["pending_build"],
+#             "itemJob": role["item_job"],
+#         })
+#     record = {
+#         "marker": CONSOLE_MARKER, "sequence": report["sequence"],
+#         "roundNo": report["round"], "phase": report["phase"],
+#         "summary": report["summary"], "roles": role_reports,
+#         "globalEvents": [event for event in report["events"] if event["role_id"] is None],
+#         "previousFeedback": report["previous_feedback"],
+#         "systemErrors": report["system_errors"],
+#         "observedChanges": report["observed_changes"],
+#         "decisionMs": report["decision_ms"],
+#         "schemaVersion": report['schema_version'],
+#         "timestampUtc": report['timestamp_utc'],
+#         "diagnostics": report.get('diagnostics', {}),
+#     }
+#     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)

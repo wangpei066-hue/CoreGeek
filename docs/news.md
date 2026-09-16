@@ -10,18 +10,26 @@
 平台下载的是 stderr 一行 JSON：`marker` → `event` → `roundNo` → `title` → 其余。  
 搜 `"marker":"NEWS_INFER"`，再筛：
 
-| `event` | 看什么 |
-| --- | --- |
-| `official_ingested` | 新官方消息原文 |
-| **`official_plan`** | 官方矿价 **`plan`**（工人） |
-| `folk_ingested` | 新传闻原文、累计 `legends` |
-| **`folk_plan`** | 传闻宝藏 **`plan`**（开拓者） |
-| `prompt_sent` | `consumer` 为 `ore` 或 `treasure`，完整 `promptText` |
-| `llm_output` | `parsedJson` 与落地后的 `plan` |
 
-真正给策略用的是 **`plan`**。`title` 只是中文摘要。
+| `event`             | 看什么                                             |
+| ------------------- | ----------------------------------------------- |
+| `official_ingested` | 新官方消息原文                                         |
+| `**official_plan`** | 官方矿价 `**plan**`（工人）                             |
+| `folk_ingested`     | 新传闻原文、累计 `legends`                              |
+| `**folk_plan**`     | 传闻宝藏 `**plan**`（开拓者）                            |
+| `prompt_sent`       | `consumer` 为 `ore` 或 `treasure`，完整 `promptText` |
+| `llm_output`        | `parsedJson` 与落地后的 `plan`                       |
 
-有矿价效应或已有传闻 JSON 时，每回合结束还会再打一行当前 `official_plan` / `folk_plan`。
+
+真正给策略用的是 `**plan**`。`title` 只是中文摘要。
+
+`official_plan` / `folk_plan` 只在事件发生时打，**不**每回合重打：
+
+- 官方原文变了（且不是「无重大新闻」）→ ingest 立刻打 `official_plan`
+- 矿价 LLM 落地 → 再打 `official_plan`
+- 宝藏 LLM 落地 → 打 `folk_plan`
+
+传闻 ingest 只打 `folk_ingested`。当前 `plan` 仍每回合写入本地 `decision_*.json` 的 `newsPlans`。
 
 ## 处理顺序（送推）
 
@@ -51,13 +59,15 @@
 }
 ```
 
-| 字段 | 含义 |
-| --- | --- |
-| `today` | 当前游戏日（`roundNo // 130 + 1`） |
-| `oreEffects` | 各矿种完整日程（启发式或 LLM） |
-| `bannedOres` | **今天**不能采：`iron` / `copper` / `stone` |
-| `stockpileOres` | **今天**该抢收（明天开始禁采） |
-| `priceUpOres` | **今天**回收价上涨的矿 |
+
+| 字段              | 含义                                    |
+| --------------- | ------------------------------------- |
+| `today`         | 当前游戏日（`roundNo // 130 + 1`）           |
+| `oreEffects`    | 各矿种完整日程（启发式或 LLM）                     |
+| `bannedOres`    | **今天**不能采：`iron` / `copper` / `stone` |
+| `stockpileOres` | **今天**该抢收（明天开始禁采）                     |
+| `priceUpOres`   | **今天**回收价上涨的矿                         |
+
 
 `oreEffects[]`：`affectedOre`、`mineBannedDays`、`priceUpDays`、`source`（`heuristic` / `llm`）、`publishedDay`、`notes`。
 
@@ -65,9 +75,9 @@
 
 - 第 1 天：`stockpileOres: ["iron"]`，禁采/涨价为空  
 - 第 2、3 天：`bannedOres` 与 `priceUpOres` 为 `["iron"]`  
-- 第 4 天起：三个都空  
+- 第 4 天起：三个都空
 
-启发式未命中且尚无 LLM 时 `oreEffects` 为空，回合末可能不打 `official_plan`。
+启发式未命中且尚无 LLM 时 ingest 仍会打一行 `official_plan`（`oreEffects` 为空，`source=pending_llm`）；矿价 LLM 落地后再打一行带效应的。
 
 ## 传闻 `plan`（开拓者）
 
@@ -86,42 +96,98 @@
 }
 ```
 
-| 字段 | 含义 |
-| --- | --- |
-| `ready` | 是否可执行。无祭坛、无物品或 `confidence < 0.7` 会被打成 `false` |
-| `confidence` | 0–1 |
-| `altarPos` | 祭坛 `{x,y}`，没有则 `null` |
-| `items` | 献祭用品英文名（已滤掉药/券/召唤令） |
-| `openFromRound` / `openToRound` | 开启窗口（回合号），未知为 `null` |
-| `notes` | 依据或缺什么 |
-| `source` | 目前只有 `llm` |
+
+| 字段                              | 含义                                             |
+| ------------------------------- | ---------------------------------------------- |
+| `ready`                         | 是否可执行。无祭坛、无物品或 `confidence < 0.7` 会被打成 `false` |
+| `confidence`                    | 0–1                                            |
+| `altarPos`                      | 祭坛 `{x,y}`，没有则 `null`                          |
+| `items`                         | 献祭用品英文名（已滤掉药/券/召唤令）                            |
+| `openFromRound` / `openToRound` | 开启窗口（回合号），未知为 `null`                           |
+| `notes`                         | 依据或缺什么                                         |
+| `source`                        | 目前只有 `llm`                                     |
+
 
 ## 代码里怎么拿
 
-每回合 `server.py` 已挂上 `state.news_memory`。工人请用 `worker_json(round_no)`（按当天重算）；开拓者用 `pioneer_json()`。不要只读跨天前写入的缓存。
+### 对象从哪来
+
+每回合 `src/agent/server.py` 在调用 `strategy.decide(state)` **之前**已经执行：
+
+```python
+self.match_state.news_memory = self.news_memory
+self.news_memory.ingest(self.match_state)           # 写入官方/传闻 plan
+self.prompt_router.consume_llm_resp(self.match_state)  # 若有上回合 llmResp，覆盖 plan
+```
+
+因此工人/开拓者决策函数里拿到的 `state` 一定带 `state.news_memory`（类型 `NewsMemory`）。  
+类定义：`src/agent/news_memory.py`。落盘文件：`state/news_memory.json`。
+
+**不要**去读 stderr 日志当输入。日志只是同一份 `plan` 的打印。
+
+### 工人：拿官方 plan
+
+接到采矿/卖矿的地方，例如 `src/agent/economy.py` 的 `profitable_mine` / `sellable_ores` / `liquidate`。
 
 ```python
 memory = getattr(state, "news_memory", None)
-if memory is None:
-    official, folk = {}, {}
-else:
-    official = memory.worker_json(state.round_no)  # bannedOres / stockpileOres / priceUpOres
-    folk = memory.pioneer_json()                   # ready / altarPos / items / ...
+official = memory.worker_json(state.round_no) if memory else {}
+# official 就是日志里 official_plan 的 plan
+banned = set(official.get("bannedOres") or [])       # 今天不挖
+stockpile = set(official.get("stockpileOres") or []) # 今天优先挖、先别卖
+price_up = set(official.get("priceUpOres") or [])    # 今天优先卖掉
 ```
 
-工人只关心今天也可以：
+必须用 `worker_json(state.round_no)`，它按**本回合**重算 `bannedOres` 等三个当天数组。  
+不要用 `memory.data["officialPlan"]` 当工人输入：那是上次写入的缓存，跨天后会过期。
+
+只想要集合、不要整份 dict 时：
 
 ```python
-from src.agent.news_memory import game_day
-
+from .news_memory import game_day
 day = game_day(state.round_no)
-banned = memory.banned_ores(day)          # set，如 {"iron"}
+banned = memory.banned_ores(day)            # set() 或 {"iron"}
 stockpile = memory.ores_to_stockpile(day)
 price_up = memory.price_boosted_ores(day)
 ```
 
-开拓者现成判断在 `src/agent/treasure.py`：`hypothesis_actionable(memory)`、`altar_pos(memory)`、`hypothesis_items(memory)`。阈值 `TREASURE_ACT_CONFIDENCE = 0.7`。
+空 plan（没新闻或启发式未命中）时三个集合都是空的，按原经济逻辑即可。
 
-等价落盘缓存：`memory.data["officialPlan"]`、`memory.data["folkPlan"]`。
+### 开拓者：拿传闻 plan
 
-相关实现：`src/agent/news_memory.py`、`src/agent/prompt_router.py`、`src/agent/news_logging.py`。平台分类日志总表见 [`logging.md`](logging.md)。
+接到 `src/agent/brain.py` 的 `decide_pioneer_day` / `decide_pioneer_task`。
+
+```python
+memory = getattr(state, "news_memory", None)
+folk = memory.pioneer_json() if memory else {}
+# folk 就是日志里 folk_plan 的 plan；LLM 还没回来时是 {}
+ready = bool(folk.get("ready"))
+items = list(folk.get("items") or [])
+altar = folk.get("altarPos")          # {"x": 12, "y": 12} 或 None
+window = (folk.get("openFromRound"), folk.get("openToRound"))
+```
+
+或直接用已有封装（读的是同一份 `treasureHypothesis`）：
+
+```python
+from .treasure import (
+    hypothesis_actionable, altar_pos, hypothesis_items, decide_treasure_action,
+)
+if memory and hypothesis_actionable(memory):
+    cmd = decide_treasure_action(pioneer, state, memory, blocked, reserved)
+```
+
+`folk` 为空或 `ready` 为 false 时不要买祭坛用品、不要 `summonTreasure`。置信度阈值是 `TREASURE_ACT_CONFIDENCE = 0.7`（写在 `news_memory.py`）。
+
+`memory.data["folkPlan"]` 与 `pioneer_json()` 内容相同，开拓者可以用；没有「按当天切片」的问题。
+
+### 和日志的对应关系
+
+
+| 日志                                      | 代码取出的变量                                         | 生成函数                      |
+| --------------------------------------- | ----------------------------------------------- | ------------------------- |
+| `NEWS_INFER` / `official_plan` / `plan` | `official = memory.worker_json(state.round_no)` | `NewsMemory.worker_json`  |
+| `NEWS_INFER` / `folk_plan` / `plan`     | `folk = memory.pioneer_json()`                  | `NewsMemory.pioneer_json` |
+
+
+相关实现：`src/agent/news_memory.py`、`src/agent/prompt_router.py`、`src/agent/news_logging.py`、`src/agent/treasure.py`。平台分类日志总表见 `[logging.md](logging.md)`。

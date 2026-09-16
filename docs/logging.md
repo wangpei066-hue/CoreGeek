@@ -17,7 +17,7 @@
 | `BUILD_WALL` | 每回合 | 一层/二层进度、缺口、本回合砌墙或采石 |
 | `PIONEER_TASK` | 每回合总览；接取/解题时另有 solver 行 | `event=round` 看本回合接取/提交；`accept_requested` / `task_active` 看解题细节 |
 | `ECONOMY` | **仅采矿/卖矿有动作或相关事件时** | 本回合采集/出售 |
-| `NEWS_INFER` | **有新闻事件或当前计划 JSON 时** | `official_plan` / `folk_plan`；字段与取用见 [`news.md`](news.md) |
+| `NEWS_INFER` | **官方原文变化、LLM 落地、或其它新闻事件时** | `official_plan` / `folk_plan`；字段与取用见 [`news.md`](news.md) |
 
 完整分支原因、背包明细、路径事件仍在本地 `logs/decision_NNNNNN.json`。
 
@@ -83,7 +83,7 @@
 
 处理顺序：官方启发式命中则不送矿价 LLM；未命中当天最多送 1 次且优先于传闻。传闻只走宝藏 LLM，每天至少预留 1 次送推。两份 JSON 只落盘并打日志，默认不改工人/开拓者动作。详情见 [`news.md`](news.md)。
 
-每回合有日程时，`emit_console_report` 会再打一行当前 `official_plan` / `folk_plan`，平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"` 即可。
+`official_plan` / `folk_plan` 只在官方原文变化（ingest）或对应 LLM 落地时打，不每回合重打。平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"`。
 
 不要再搜 `consumer=intel`：混合情报 prompt 已去掉。
 
