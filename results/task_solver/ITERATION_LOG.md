@@ -42,3 +42,21 @@
 
 - 验证：南京单任务仍未在14轮内提交；第2轮自动 API 请求出现 `HTTPSTATUS:000`，第6轮 LLM 已产生完整正确统计，但状态机未完成摘要转提交。
 - 结论：下一轮优先修复 API 服务启动竞态重试及摘要完成状态传递，再进行完整6任务回归。
+
+## 迭代 7（2026-09-16）
+
+- 版本：`20260916-solver6`（本轮提交前的工作树）
+- 修改：API 传输 `HTTPSTATUS:000` 最多确定性重试2次；提交前从带分页证据的历史执行结果恢复完整摘要状态。
+- 完整6任务回归：`6/6` 成功，全部不超过14轮：alpha 9、北京 13、南京 8、beta 9、成都 14、gamma 13。
+- 回归报告保存在本机临时路径 `/tmp/task-suite-final.json`；仓库仅提交摘要，避免推送原始提示和轨迹。
+
+## 真实网络日志诊断与修复（2026-09-16）
+
+- `true_network/nanjing&beta.log` 显示 beta 已通过 `./check` 并拿到 TOKEN，但任务切换后停在 `wait_submit`，没有再次发出 `submitAnswer`。
+- 修复：`submit` 与 `wait_submit` 均进入幂等重发分支，直到收到平台确认；已确认任务不再重发。
+
+## 真实环境无限调度修复（2026-09-16）
+
+- 按真实平台约束移除 solver 内部 LLM 调用次数上限和 `budget_insufficient -> exhausted` 终止路径。
+- 旧会话若已落入 `exhausted`，恢复时自动转为 `submit`（已有答案）或 `ask`（未有答案）。
+- 本地模拟仍由 `LocalTaskDriver --max-rounds 14` 控制测试边界。

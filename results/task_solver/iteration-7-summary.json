@@ -1,0 +1,14 @@
+{
+  "max_rounds": 14,
+  "success_count": 6,
+  "total": 6,
+  "complete": true,
+  "results": {
+    "task_1_alpha.md": {"success": true, "rounds": 9},
+    "task_1_beijing.md": {"success": true, "rounds": 13},
+    "task_2_nanjing.md": {"success": true, "rounds": 8},
+    "task_2_beta.md": {"success": true, "rounds": 9},
+    "task_3_chengdu.md": {"success": true, "rounds": 14},
+    "task_3_gamma.md": {"success": true, "rounds": 13}
+  }
+}

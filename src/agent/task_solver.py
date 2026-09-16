@@ -18,7 +18,15 @@ PROMPT_VERSION = '20260916-solver5'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
 TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
-URL_RE = re.compile(r'https?://[^\s\'"\\]+')
+# URLs in task documents are commonly enclosed in Markdown backticks and
+# followed by Chinese punctuation.  Keep extraction permissive, then normalize
+# each match before passing it to urlparse/curl.
+URL_RE = re.compile(r'https?://[^\s\'"\\`<>，。；：、（）()\[\]{}]+')
+URL_TRAILING_CHARS = '`\u2019\u201d\u3001\u3002\uff0c\uff1b\uff1a\uff09\uff3d\uff5d\u3011.,;:)]}>'
+
+
+def clean_url(url):
+    return (url or '').strip().rstrip(URL_TRAILING_CHARS)
 CITY_RE = re.compile(r'(北京|南京|成都|上海|广州|深圳|杭州|武汉|西安|重庆|天津|苏州|长沙|郑州|青岛|合肥|福州|厦门|昆明|哈尔滨|沈阳|济南|南昌|南宁|太原|石家庄)')
 CITY_LATIN = {
     '北京': 'beijing', '南京': 'nanjing', '成都': 'chengdu', '上海': 'shanghai',
@@ -389,7 +397,7 @@ def service_hint(path, url, task):
 def matching_api_experience(experience, task):
     items = [item for item in ((experience or {}).get('api') or [])
              if item.get('path') and not item.get('invalidReason')]
-    urls = URL_RE.findall(task or '')
+    urls = [clean_url(url) for url in URL_RE.findall(task or '')]
     task_hint = service_hint('', urls[0] if urls else '', task)
     city = extract_city(task)
     for item in reversed(items):
@@ -420,7 +428,7 @@ def matching_api_experience(experience, task):
 
 def harvest_api_call(command, output, task):
     """仅在业务 code=200 时保存调用经验；不含密钥；不把查询成功标成全量已验证。"""
-    urls = URL_RE.findall(command or '')
+    urls = [clean_url(url) for url in URL_RE.findall(command or '')]
     if not urls:
         return None
     payload = None
@@ -1001,7 +1009,7 @@ def default_heritage_experience(task, documents):
     task's host/path when one is provided.
     """
     blob = '\n'.join(str(item.get('content') or '') for item in documents or [])
-    urls = URL_RE.findall(blob + '\n' + (task or ''))
+    urls = [clean_url(url) for url in URL_RE.findall(blob + '\n' + (task or ''))]
     parsed = urlparse(urls[0]) if urls else urlparse('http://localhost:8899/api/v1/heritage/search')
     path = parsed.path or '/api/v1/heritage/search'
     if 'heritage' not in path.lower() and '遗产' not in blob:
@@ -1169,6 +1177,18 @@ class PioneerTaskSolver:
                     and item.get('requestId') == request_id
                     and item.get('event') in ('read_document', 'execute_tool', 'deploy_probe', 'api_fetch')):
                 return item
+        # Some real task runners return the raw stdout of a command instead
+        # of the PIONEER_TASK wrapper.  In particular, ./check may return
+        # ``[ OK ] ... TOKEN: ...`` directly.  Do not discard that result while
+        # waiting for an execute_tool response: it is the authoritative
+        # completion evidence for deployment tasks.
+        if self.session.get('stage') == 'wait_tool':
+            match = re.match(r'^\[exitCode:(-?\d+)\]\n?(.*)$',
+                             state.last_cmd_result or '', flags=re.DOTALL)
+            if match:
+                return dict(marker=MARKER, requestId=request_id,
+                            event='execute_tool', exitCode=int(match.group(1)),
+                            output=match.group(2), outputTail=match.group(2))
         status, payload, raw = parse_curl_output(state.last_cmd_result)
         if payload is not None and ('code' in payload or 'data' in payload):
             return dict(
@@ -1421,6 +1441,15 @@ class PioneerTaskSolver:
                 s['_apiStats'] = stats
                 return 'done'
         if result.get('event') == 'api_curl':
+            # A freshly started local/remote service can briefly return curl's
+            # HTTP 000. Retry the deterministic query in the solver stage;
+            # asking the LLM to diagnose a transport race spends the deadline.
+            if result.get('httpStatus') in (0, None) and not result.get('payload'):
+                retries = int(s.get('apiTransportRetries') or 0)
+                if retries < 2:
+                    s['apiTransportRetries'] = retries + 1
+                    self._fact(s, 'API transport未就绪，确定性重试 %s/2' % (retries + 1))
+                    return 'continue'
             collected = s.setdefault('apiRecords', [])
             stats = ingest_api_page(collected, result.get('payload'), result.get('httpStatus'))
             replay = s.get('apiReplay') or {}
@@ -1598,6 +1627,9 @@ class PioneerTaskSolver:
             for key in ('output', 'outputTail', 'checkTail'):
                 if redacted.get(key):
                     redacted[key] = redact_secrets(redacted[key], [secret])
+        redacted['commandHasPagination'] = bool(
+            re.search(r'\boffset\b', command, re.IGNORECASE)
+            and re.search(r'\blimit\b', command, re.IGNORECASE))
         s['history'].append(redacted)
         stats = self._harvest(result, command, state.phase_task, s.get('workspace'))
         api_outcome = self._apply_api_tool_result(s, result, command, state.phase_task)
@@ -1652,6 +1684,37 @@ class PioneerTaskSolver:
             s['history'].append({'llm': answer})
             s['retries'] = 0
             if answer['action'] == 'submit':
+                if s.get('taskKind') == 'api' and not (s.get('metrics') or {}).get('dataComplete'):
+                    # The execute result can arrive through the generic
+                    # history path (for example after a transport retry),
+                    # while the structured API event is absent.  Re-validate
+                    # the last paginated final-summary evidence here before
+                    # rejecting an otherwise ready answer.
+                    answer_obj = None
+                    try:
+                        answer_obj = json.loads(answer.get('taskAnswer') or '')
+                    except (TypeError, ValueError):
+                        pass
+                    summary_evidence = False
+                    for item in reversed(s.get('history') or []):
+                        output = item.get('output') if isinstance(item, dict) else None
+                        paginated = item.get('commandHasPagination') if isinstance(item, dict) else False
+                        if not output or not paginated:
+                            continue
+                        for candidate in extract_json_objects(output):
+                            if (isinstance(candidate.get('total_count'), int)
+                                    and isinstance(candidate.get('world_heritage_count'), int)
+                                    and isinstance(candidate.get('types'), list)
+                                    and isinstance(candidate.get('oldest_era'), str)
+                                    and paginated):
+                                summary_evidence = True
+                                break
+                        if summary_evidence:
+                            break
+                    if summary_evidence and isinstance(answer_obj, dict):
+                        s.setdefault('metrics', {})['dataComplete'] = True
+                        s['metrics']['recordsComplete'] = True
+                        self._fact(s, '历史中存在已校验分页统计，允许提交')
                 if s.get('taskKind') == 'api' and not (s.get('metrics') or {}).get('dataComplete'):
                     s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0)
                     s['history'].append({'blocked': 'records incomplete, refuse submit'})
@@ -1825,6 +1888,12 @@ class PioneerTaskSolver:
             s['stage'] = 'ask'
         for field, value in task_context(state.phase_task).items():
             s.setdefault(field, value)
+        # `exhausted` is not a server-side task state.  Recover sessions from
+        # older local versions so a real match never becomes permanently
+        # stuck because of a client-side budget guard.
+        if s.get('stage') == 'exhausted':
+            s['stage'] = 'submit' if s.get('answer') else 'ask'
+            s.pop('endReason', None)
         s.setdefault('metrics', empty_metrics(state.round_no))
         s.setdefault('promptVersion', PROMPT_VERSION)
         s.setdefault('promptHash', PROMPT_HASH)
@@ -1928,21 +1997,22 @@ class PioneerTaskSolver:
                 if execute:
                     s['pendingCommand'] = execute
             elif s['stage'] == 'ask':
-                if budget == 'insufficient' and not s.get('answer'):
-                    self._fact(s, '回合预算不足，不编造答案')
-                    s['endReason'] = 'budget_insufficient'
-                    s['stage'] = 'exhausted'
-                elif s['calls'] < 12:
-                    prompt = self.make_prompt(state)
-                    s['calls'] += 1
-                    s['metrics']['llmCalls'] = s['calls']
-                    s['metrics']['firstActiveRound'] = s['metrics'].get('firstActiveRound') or state.round_no
-                    s['llmPending'] = True
-                    s['stage'] = 'wait_llm'
-                else:
-                    s['stage'] = 'exhausted'
-            elif s['stage'] == 'submit':
-                if pioneer and pioneer.id not in commands:
+                # The real platform does not impose a solver-side LLM-call
+                # ceiling.  The local driver enforces its own max_rounds for
+                # simulation, so never turn a real session into `exhausted`.
+                prompt = self.make_prompt(state)
+                s['calls'] += 1
+                s['metrics']['llmCalls'] = s['calls']
+                s['metrics']['firstActiveRound'] = s['metrics'].get('firstActiveRound') or state.round_no
+                s['llmPending'] = True
+                s['stage'] = 'wait_llm'
+            elif s['stage'] in ('submit', 'wait_submit'):
+                # phaseTask can rotate away immediately after the first
+                # submitAnswer.  When this session is restored, wait_submit
+                # must remain an active resend state until the platform sends
+                # a definitive result; otherwise the answer is silently lost.
+                if (pioneer and s.get('answer') and s.get('submitStatus') != 'accepted'
+                        and pioneer.id not in commands):
                     submission[pioneer.id] = {'action': 'submitAnswer', 'taskAnswer': s['answer']}
                     commands.update(submission)
                     s['pioneer'] = pioneer.id
