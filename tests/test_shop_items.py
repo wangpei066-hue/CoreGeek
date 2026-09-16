@@ -58,6 +58,38 @@ class VoucherCostTests(unittest.TestCase):
 
 
 class MaybeStartJobPriorityTests(unittest.TestCase):
+    def test_buys_all_level_one_weapon_vouchers_when_gold_and_space_allow(self):
+        state = minimal_state(gold_num=300)
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=1),
+            make_role(22, 12, 8, "rocket", level=1),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 20, 20, "worker", back_pack_capability=10)
+        state.team_our.roles.append(worker)
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher1", "num": 3})
+
+    def test_after_three_level_two_weapons_buys_station_before_level_three_batch(self):
+        state = minimal_state(gold_num=450)
+        station = state.team_our.roles[0]
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=2),
+        ]
+        worker = make_role(1, 20, 20, "worker", back_pack_capability=10)
+        state.team_our.roles.append(worker)
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "StationUpgradeVoucher1", "num": 1})
+        state.worker_item_jobs.clear()
+        station.level = 2
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher2", "num": 3})
+
     def test_weapon_then_wall_then_station(self):
         state = minimal_state(gold_num=1000)
         weapon = make_role(20, 12, 10, "gatling", health=1000, level=1)
@@ -73,9 +105,6 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         state.worker_item_jobs.clear()
         wall.level = 3
         wall.health = 2000
-        maybe_start_shop_item_job(worker, state)
-        self.assertNotIn(1, state.worker_item_jobs)
-        state.round_no = 400
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["kind"], "station")
 

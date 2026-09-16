@@ -1107,9 +1107,56 @@ def station_path(role, weapon, blocked, state):
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
 
 
+def dual_rocket_stands(state, first, second, blocked):
+    """两门火箭的共同操控邻格。"""
+    if not first or not second or first.role_type != 'rocket' or second.role_type != 'rocket':
+        return set()
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    ring = set(wall_ring(state, base)) if base else set()
+    obstacles = set(blocked) - {
+        (r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')
+    }
+    first_goals = {
+        (p.x, p.y) for p in neighbors8(first.pos, state.map_info.width, state.map_info.height)
+        if (p.x, p.y) not in ring and (p.x, p.y) not in obstacles
+    }
+    second_goals = {
+        (p.x, p.y) for p in neighbors8(second.pos, state.map_info.width, state.map_info.height)
+        if (p.x, p.y) not in ring and (p.x, p.y) not in obstacles
+    }
+    return first_goals & second_goals
+
+
+def dual_rocket_partner(state, weapon, blocked):
+    if not weapon or weapon.role_type != 'rocket':
+        return None, set()
+    partners = []
+    for other in state.team_our.roles:
+        if other.id == weapon.id or other.role_type != 'rocket' or other.health <= 0:
+            continue
+        stands = dual_rocket_stands(state, weapon, other, blocked)
+        if stands:
+            partners.append((chebyshev(weapon.pos, other.pos), other.id, other, stands))
+    if not partners:
+        return None, set()
+    _dist, _id, partner, stands = min(partners)
+    return partner, stands
+
+
+def dual_rocket_path(role, weapon, blocked, state):
+    partner, stands = dual_rocket_partner(state, weapon, blocked)
+    if not partner or not stands:
+        return None
+    return path_to_any(role.pos, stands, blocked, state.map_info.width, state.map_info.height)
+
+
 def weapon_approach_path(role, weapon, blocked, reserved, state):
     """去开炮：先绕开队友，走不通再让路穿过占位，避免空转。"""
     own = {(role.pos.x, role.pos.y)}
+    if weapon and weapon.role_type == 'rocket':
+        dual = dual_rocket_path(role, weapon, (blocked | reserved) - own, state)
+        if dual is not None:
+            return dual
     strict = adjacent_path(role, weapon.pos, (blocked | reserved) - own, state)
     if strict is not None:
         return strict

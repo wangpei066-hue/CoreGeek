@@ -420,13 +420,36 @@ def station_l2_upgrade_pending(state: "MatchState") -> bool:
     return station_first_upgrade_pending(state)
 
 
+def self_evolution_work_open(state: "MatchState") -> bool:
+    """开拓者自进化完成前，不拿普通结构购物占用开拓者。"""
+    if state.phase_task:
+        return True
+    if not state.team_our:
+        return False
+    from .pioneer_schedule import has_task_reservation
+    if any(r.role_type == "pioneer" and r.health > 0 and has_task_reservation(state, r)
+           for r in state.team_our.roles):
+        return True
+    return any(
+        getattr(t, "is_valid", False)
+        and getattr(t, "task_type", None) in ("自进化类1", "自进化类2")
+        and getattr(t, "cooldown", 0) == 0
+        for t in (state.team_our.player_tasks or [])
+    )
+
+
 def station_first_buyer(state: "MatchState"):
     """三炮二级后的首次升基地：站在商店的工人优先，避免开拓者跑去抢单。"""
     if not state.team_our:
         return None
     shop = find_zone(state, "weaponShop")
+    protect_pioneer = self_evolution_work_open(state)
     mobiles = [r for r in state.team_our.roles
-               if r.role_type in ("worker", "pioneer") and r.health > 0]
+               if r.role_type in ("worker", "pioneer") and r.health > 0
+               and not (protect_pioneer and r.role_type == "pioneer")]
+    if not mobiles and protect_pioneer:
+        mobiles = [r for r in state.team_our.roles
+                   if r.role_type in ("worker", "pioneer") and r.health > 0]
     if not mobiles:
         return None
 
@@ -493,6 +516,14 @@ def should_upgrade_weapon(state: "MatchState") -> bool:
             return False
         return jobs == 0
     return jobs == 0
+
+
+def should_spend_surplus_on_upgrades(state: "MatchState") -> bool:
+    """防线没有正面缺口时，别让金币躺着，尽快转成升级券。"""
+    if not state.team_our or (state.team_our.gold_num or 0) < _WALL_VOUCHER_COST[1]:
+        return False
+    from .opening import critical_wall_missing
+    return not critical_wall_missing(state)
 
 
 def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: bool = True,
@@ -628,8 +659,8 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             and (station.pos.x, station.pos.y) not in pending_targets):
         name, cost = voucher_for("station", station.level or 1)
         from .treasure import shop_buy_allowed
-        if name not in role.backpack and not shop_buy_allowed(name, state):
-            trace(state, role.id, "early_buy_blocked", "第四天前不买基地券，金币留给武器升级", item=name)
+        if name not in role.backpack and not shop_buy_allowed(name, state) and weapon_upgrade_due(state):
+            trace(state, role.id, "early_buy_blocked", "武器升级仍有缺口，暂不买基地券", item=name)
         elif name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
             state.worker_item_jobs[role.id] = {"item": name, "target": (station.pos.x, station.pos.y), "kind": "station"}
             return
@@ -657,6 +688,59 @@ def _droppable_for_purchase(role: Role):
             return name
     return next((item for item in role.backpack
                  if isinstance(item, str) and "Voucher" not in item and item != "Medicine"), None)
+
+
+def _team_item_count(state: "MatchState", item: str) -> int:
+    return sum(
+        (r.backpack or []).count(item)
+        for r in (state.team_our.roles if state.team_our else [])
+        if r.health > 0
+    )
+
+
+def _batch_buy_quantity(role: Role, state: "MatchState", job: dict) -> int:
+    item = job.get("item")
+    cost = item_cost(item, state)
+    if not item or cost <= 0:
+        return 1
+    cap = role.back_pack_capability or 0
+    free = max(0, cap - len(role.backpack or [])) if cap else 1
+    affordable = max(0, (state.team_our.gold_num or 0) // cost)
+    if free <= 0 or affordable <= 0:
+        return 0
+    pending = _pending_item_job_targets(state)
+    held = _team_item_count(state, item)
+    desired = 1
+    if item == "WeaponUpgradeVoucher1":
+        desired = sum(
+            1 for w in state.team_our.roles
+            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) <= 1
+        )
+    elif item == "WeaponUpgradeVoucher2":
+        desired = sum(
+            1 for w in state.team_our.roles
+            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) == 2
+        )
+    elif item == "StationUpgradeVoucher1":
+        station = own_station(state)
+        desired = 1 if station and (station.level or 1) <= 1 else 0
+    elif item == "StationUpgradeVoucher2":
+        station = own_station(state)
+        desired = 1 if station and (station.level or 1) == 2 else 0
+    elif item == "WallUpgradeVoucher1":
+        desired = sum(
+            1 for w in state.team_our.roles
+            if w.role_type == "wall" and w.health > 0 and (w.level or 1) <= 1
+            and (w.pos.x, w.pos.y) not in pending
+        ) + 1
+    elif item == "WallUpgradeVoucher2":
+        desired = sum(
+            1 for w in state.team_our.roles
+            if w.role_type == "wall" and w.health > 0 and (w.level or 1) == 2
+            and (w.pos.x, w.pos.y) not in pending
+        ) + 1
+    desired = max(1, desired - held)
+    return max(1, min(desired, affordable, free))
 
 
 def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved: set):
@@ -733,7 +817,10 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
                 return selected(state, role.id, {"action": "drop", "name": drop}, '腾出背包空位购买升级道具')
             trace(state, role.id, "backpack_full", "背包已满且没有可丢弃矿石，无法购买道具")
             return None
-        return selected(state, role.id, {"action": "buy", "name": item, "num": 1}, '执行维修/升级道具任务')
+        num = _batch_buy_quantity(role, state, job)
+        if num <= 0:
+            return None
+        return selected(state, role.id, {"action": "buy", "name": item, "num": num}, '批量购买升级券并按队列逐个使用')
     return move_on_path(state, role, adjacent_path(role, shop.pos, walkable, state), reserved, '执行维修/升级道具任务')
 
 
@@ -1073,6 +1160,14 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         handled, cmd = liquidate(worker, state, blocked, reserved)
         if cmd:
             return cmd
+    if should_spend_surplus_on_upgrades(state):
+        maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=True)
+        cmd = decide_shop_item_job(worker, state, blocked, reserved)
+        if cmd:
+            trace(state, worker.id, 'surplus_upgrade_spend',
+                  '正面无紧急缺口，优先把闲置金币转成武器/基地/围墙升级',
+                  gold=state.team_our.gold_num)
+            return cmd
     if station_first_upgrade_pending(state):
         maybe_start_shop_item_job(worker, state, allow_weapon=allow_weapon)
         cmd = decide_shop_item_job(worker, state, blocked, reserved)
@@ -1314,13 +1409,13 @@ def decide_pioneer_day(pioneer: Role, state: "MatchState", blocked: set, reserve
         mark_outcome(state, 'tactical', cmd, 'tactical')
         return cmd
 
-    item_job_cmd = decide_shop_item_job(pioneer, state, blocked, reserved)
+    item_job_cmd = None if self_evolution_work_open(state) else decide_shop_item_job(pioneer, state, blocked, reserved)
     if item_job_cmd and not has_task_reservation(state, pioneer):
         mark_outcome(state, 'item_job', item_job_cmd, 'shop')
         bump_streak(state, 'shop')
         return item_job_cmd
 
-    if not has_task_reservation(state, pioneer):
+    if not has_task_reservation(state, pioneer) and not self_evolution_work_open(state):
         shop = find_zone(state, 'weaponShop')
         worker_at_shop = bool(shop and any(
             r.role_type == 'worker' and r.health > 0 and chebyshev(r.pos, shop.pos) <= 1
@@ -1479,6 +1574,41 @@ def plan_pioneer_tasks(state, blocked, reserved):
     return commands, handled_ids
 
 
+def _night_economy_worker_to_release(state, blocked, task_pioneers):
+    if self_evolution_work_open(state) or task_pioneers:
+        return None
+    from .tactics import pressure, front_breached
+    if pressure(state) or front_breached(state):
+        return None
+    workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
+    pioneers = [r for r in state.team_our.roles if r.role_type == "pioneer" and r.health > 0]
+    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
+    rockets = [w for w in weapons if w.role_type == "rocket"]
+    non_rockets = [w for w in weapons if w.role_type != "rocket"]
+    if len(workers) < 2 or not pioneers or len(rockets) < 2 or not non_rockets:
+        return None
+    from .opening import dual_rocket_partner, weapon_approach_path
+    dual_workers = []
+    for worker in workers:
+        for rocket in rockets:
+            partner, stands = dual_rocket_partner(state, rocket, blocked)
+            if not partner:
+                continue
+            path = weapon_approach_path(worker, rocket, blocked, set(), state)
+            if path is not None:
+                dual_workers.append((len(path), worker.id, rocket.id, worker, rocket))
+    if not dual_workers:
+        return None
+    _, _id, _rid, dual_worker, _rocket = min(dual_workers)
+    if not any(weapon_approach_path(pioneer, weapon, blocked, set(), state) is not None
+               for pioneer in pioneers for weapon in non_rockets):
+        return None
+    candidates = [w for w in workers if w.id != dual_worker.id]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda w: (len(w.backpack or []), w.id))
+
+
 def plan_night(state: "MatchState") -> dict:
     from .opening import assign_weapons, move_on_path, movement_avoid, weapon_approach_path, _fighter_layer
     from .tactics import (
@@ -1515,10 +1645,21 @@ def plan_night(state: "MatchState") -> dict:
                 commands[role.id] = cmd
         return commands
     commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
-    assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
     urgent = pressure(state) or front_breached(state)
+    released_worker = _night_economy_worker_to_release(state, blocked, task_pioneers)
+    excluded = set(task_pioneers)
+    if released_worker is not None:
+        excluded.add(released_worker.id)
+    assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
+    if released_worker is not None:
+        cmd = decide_worker_day(released_worker, state, blocked, reserved)
+        if cmd:
+            trace(state, released_worker.id, "night_worker_released_to_economy",
+                  "自进化完成且双火箭+开拓者可覆盖三炮，释放一个工人夜间采矿/经济",
+                  command=cmd)
+            commands[released_worker.id] = cmd
     fighters = [r for r in state.team_our.roles
-                if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in task_pioneers]
+                if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]
     fighters.sort(key=lambda r: (
         0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
         _fighter_layer(state, r),
@@ -1535,7 +1676,7 @@ def plan_night(state: "MatchState") -> dict:
                     from .treasure import shop_buy_allowed
                     if not shop_buy_allowed(cmd['name'], state, emergency=True):
                         continue
-                    state.team_our.gold_num -= item_cost(cmd['name'], state)
+                    state.team_our.gold_num -= item_cost(cmd['name'], state) * cmd.get('num', 1)
                 commands[fighter.id] = cmd
                 continue
         weapon = assignments.get(fighter.id)
@@ -1579,7 +1720,7 @@ def plan_night(state: "MatchState") -> dict:
                         from .treasure import shop_buy_allowed
                         if not shop_buy_allowed(cmd['name'], state, emergency=urgent):
                             continue
-                        state.team_our.gold_num -= item_cost(cmd['name'], state)
+                        state.team_our.gold_num -= item_cost(cmd['name'], state) * cmd.get('num', 1)
                     commands[fighter.id] = cmd
                     continue
             trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",

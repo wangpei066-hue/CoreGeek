@@ -212,7 +212,7 @@ class DefensePriorityTests(unittest.TestCase):
         state.team_our.roles[1].backpack = ['stone'] * 4
         commands = self.decide(state)
         self.assertFalse(outer_wall_ready(state))
-        self.assertEqual(commands[1], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 1})
+        self.assertEqual(commands[1], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 3})
         self.assertEqual(active_wall_plan(state, state.team_our.roles[0]), primary_wall_plan(state, state.team_our.roles[0]))
 
     def test_level_two_weapons_upgrade_before_walls(self):

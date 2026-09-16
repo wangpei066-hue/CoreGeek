@@ -2,7 +2,7 @@
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.protocol import PlayerTask, Pos, RobotRole
+from src.agent.protocol import PlayerTask, Pos, RobotRole, Zone
 from test_opening import opening_state
 from test_shop_items import make_role
 
@@ -66,6 +66,54 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 self.assertEqual(commands[20]['controllerId'], '3')
                 self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
 
+    def test_pioneer_keeps_task_when_worker_can_cover_two_adjacent_rockets(self):
+        state = opening_state()
+        state.round_no = 80
+        state.phase_task = '任务进行中'
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        worker.pos = Pos(9, 10)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(11, 13)
+        state.team_our.roles = [
+            r for r in state.team_our.roles
+            if r.role_type not in ('rocket', 'gatling', 'railgun')
+        ]
+        state.team_our.roles += [
+            make_role(20, 9, 9, 'rocket', level=2, attack_range=20, cooldown=0, health=1000),
+            make_role(21, 9, 11, 'rocket', level=2, attack_range=20, cooldown=2, health=1000),
+        ]
+        state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
+        commands = self.decide(state)
+        self.assertNotIn(pioneer.id, commands)
+        self.assertTrue(any(c.get('controllerId') == str(worker.id) for c in commands.values()))
+
+    def test_after_tasks_done_worker_is_released_to_night_economy(self):
+        state = opening_state()
+        state.round_no = 80
+        state.team_our.gold_num = 0
+        state.team_our.player_tasks = []
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(9, 10)
+        freed = next(r for r in state.team_our.roles if r.id == 2)
+        freed.pos = Pos(7, 9)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(10, 12)
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        state.team_our.roles = [
+            r for r in state.team_our.roles
+            if r.role_type not in ('rocket', 'gatling', 'railgun')
+        ]
+        state.team_our.roles += [
+            make_role(20, 9, 9, 'rocket', level=2, attack_range=20, cooldown=0, health=1000),
+            make_role(21, 9, 11, 'rocket', level=2, attack_range=20, cooldown=2, health=1000),
+            make_role(22, 11, 12, 'railgun', level=2, attack_range=20, cooldown=0, health=1000),
+        ]
+        state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
+        commands = self.decide(state)
+        self.assertIn(freed.id, commands)
+        self.assertIn(commands[freed.id]['action'], ('move', 'collect', 'sell', 'buy'))
+        self.assertFalse(any(c.get('controllerId') == str(freed.id) for c in commands.values()))
+
     def test_ordinary_voucher_does_not_preempt_feasible_task(self):
         state = opening_state()
         state.round_no = 140
@@ -83,8 +131,21 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         commands = self.decide(state)
         self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
         self.assertNotEqual(commands[pioneer.id]['action'], 'buy')
-        self.assertTrue(any(c.get('action') == 'buy' and c.get('name') == 'WeaponUpgradeVoucher1'
-                            for rid, c in commands.items() if rid != pioneer.id))
+
+    def test_pioneer_task_beats_ordinary_wall_upgrade_purchase(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 300
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        from src.agent.protocol import Zone
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(8, 9)
+        state.team_our.roles.append(make_role(30, 12, 10, 'wall', level=1, health=1000))
+        state.worker_item_jobs[pioneer.id] = {'item': 'WallUpgradeVoucher1', 'target': (12, 10), 'kind': 'wall'}
+        commands = self.decide(state)
+        self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
+        self.assertNotEqual(commands[pioneer.id].get('name'), 'WallUpgradeVoucher1')
 
     def test_worker_buys_voucher_when_pioneer_is_next_to_task(self):
         state = opening_state()
