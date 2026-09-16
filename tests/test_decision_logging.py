@@ -91,7 +91,7 @@ class DecisionLoggingTests(unittest.TestCase):
         diag = report['diagnostics']
         self.assertEqual(diag['gold_delta'], 50)
         self.assertEqual(diag['primary']['planned'], 14)
-        self.assertEqual(diag['outer']['planned'], 5)
+        self.assertNotIn('outer', diag)
         self.assertEqual(len(diag['weapons']), 3)
         self.assertTrue(any(a['code'] == 'MOVE_NO_PROGRESS' for a in diag['alerts']))
         self.assertTrue(any(a['code'] == 'NIGHT_UNSTATIONED' for a in diag['alerts']))

@@ -205,14 +205,14 @@ def economist_should_help_wall(state, remaining, role):
     """经济工只在有限、可完成的条件下接管墙，完成后自动回到升级闭环，不会变成长期石工。"""
     if role.role_type != 'worker':
         return False
-    from .opening import MUSTER_BUFFER, movement_avoid, survival_wall_missing
+    from .opening import MUSTER_BUFFER, survival_wall_missing
     from . import work_orders as wo
     roles = opening_worker_roles(state)
     builder = next((r for r in (state.team_our.roles if state.team_our else [])
                     if r.id == roles.get('builder') and r.health > 0), None)
     if builder is None or builder.id == role.id:
         return True  # 建造工阵亡或不可用：工作单交接，墙任务不能消失。
-    blocked = build_blocked_set(state) | movement_avoid(state)
+    blocked = build_blocked_set(state)
     orders = wo.compute_work_orders(state, blocked)
     if orders['emergency_defense']['active']:
         return True
@@ -421,8 +421,9 @@ def _backpack_full(role):
     return bool(cap and len(role.backpack or []) >= cap)
 
 
-def _metal_count(role):
-    return sum(1 for n in (role.backpack or []) if n in ('copper', 'iron'))
+def _metal_count(role, state=None):
+    from .economy import worker_metal_count
+    return worker_metal_count(role, state)
 
 
 def _nearest_zone(role, state, blocked, reserved, neutral_type):
@@ -445,8 +446,13 @@ def _nearest_zone(role, state, blocked, reserved, neutral_type):
 
 
 def opening_sell_metal(role, state, blocked, reserved, stage, switch_reason='backpack_full'):
-    ores = [n for n in ('copper', 'iron') if n in (role.backpack or [])]
+    from .economy import ores_held_for_price_rise
+    held = ores_held_for_price_rise(state)
+    ores = [n for n in ('copper', 'iron') if n in (role.backpack or []) and n not in held]
     if not ores:
+        if held & set(role.backpack or []):
+            trace(state, role.id, 'ore_held_for_price_rise', '官方消息预告涨价，这些矿等涨价当天再卖',
+                  held=sorted(held & set(role.backpack or [])))
         return None
     zone, path = _nearest_zone(role, state, blocked, reserved, 'vendor')
     if zone is None:
@@ -517,6 +523,10 @@ def opening_apply_voucher(role, state, blocked, reserved, stage):
         }, '使用第一张武器升级券')
         return _tick(state, role, stage, 'weapon', 'rocket', target, 0, 'use', 'have_voucher', cmd)
     if path:
+        from .economy import en_route_collect
+        detour = en_route_collect(role, state, len(path), '带着第一张升级券回家，顺路采矿；入夜前仍来得及回去使用')
+        if detour:
+            return _tick(state, role, stage, 'weapon', 'rocket', target, len(path), 'collect', 'have_voucher', detour)
         return opening_move(state, role, path, reserved, target, '前往武器使用升级券',
                             'weapon', 'rocket', 'have_voucher', stage)
     return None
@@ -680,7 +690,7 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                          0 if cmd.get('action') == 'build' else 1,
                          cmd.get('action'), switch, cmd)
 
-    if _metal_count(role):
+    if _metal_count(role, state):
         # 修墙阶段用不上铜铁了（第一天不做第二门升级），背包里有多少都该卖掉换金币，
         # 不能等到背包塞满才想起来卖，不然会一直闲置到入夜白白浪费。
         cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_WALL, 'wall_stage_metal_unused')
@@ -754,7 +764,7 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
           worker_mode=opening_worker_mode(state, role), stage_label=stage_label)
     goal = _goal(state, role.id)
     if (goal and goal.get('kind') == 'vendor' and goal.get('stage') == stage_label
-            and _metal_count(role) and gold < cost):
+            and _metal_count(role, state) and gold < cost):
         cmd = opening_sell_metal(role, state, blocked, reserved, stage_label, 'sticky')
         if cmd:
             return cmd
@@ -775,7 +785,7 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
     prices = ore_prices(state)
     known = any(prices.get(n, 0) > 0 for n in ('copper', 'iron'))
     covers = known and gold + team_metal_inventory_value(state) >= cost
-    if _metal_count(role) and (_backpack_full(role) or covers):
+    if _metal_count(role, state) and (_backpack_full(role) or covers):
         cmd = opening_sell_metal(role, state, blocked, reserved, stage_label,
                                  'backpack_full' if _backpack_full(role) else 'gold_ready')
         if cmd:
@@ -915,7 +925,7 @@ def plan_opening_fsm(state):
         plan_pioneer_tasks, is_day_round,
     )
     from .opening import (
-        MUSTER_BUFFER, assign_weapons, day_rounds_remaining, movement_avoid, opening_has_voucher,
+        MUSTER_BUFFER, assign_weapons, day_rounds_remaining, opening_has_voucher,
         weapon_approach_path, live_l2_weapon_count, survival_wall_missing,
     )
     from .tactics import imminent_contact
@@ -923,7 +933,7 @@ def plan_opening_fsm(state):
     if base is None:
         return {}
     remaining = day_rounds_remaining(state.round_no)
-    blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
+    blocked, reserved = build_blocked_set(state), set()
     fighters = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0]
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     gold = state.team_our.gold_num if state.team_our else 0
@@ -1011,7 +1021,7 @@ def plan_opening_fsm(state):
         # 还没到硬截止点，但背包有铜铁、马上要进最后回防窗口了：这是最后能安全绕一趟小贩的时机，
         # 现在不卖，等 role_due 触发就只能直接回炮，铜铁只能烂在背包里过夜。
         if (not role_due and stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER)
-                and not imminent_contact(state) and _metal_count(role)):
+                and not imminent_contact(state) and _metal_count(role, state)):
             zone, vendor_path = _nearest_zone(role, state, blocked, reserved, 'vendor')
             if zone is not None:
                 detour = 2 * len(vendor_path) + 1

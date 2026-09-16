@@ -82,14 +82,16 @@ class OfficialNewsTests(unittest.TestCase):
         role.backpack = ["iron"] * 8
         self.assertNotIn("iron", sellable_ores(role, state))
 
-    def test_sells_stockpiled_iron_above_half_backpack_before_price_up(self):
+    def test_holds_iron_before_price_up_until_backpack_nearly_full(self):
         state, role = economy_state()
         state.round_no = 10
         state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
         ingest_news(state)
         role.back_pack_capability = 10
         role.backpack = ["iron"] * 8
-        self.assertEqual(sellable_ores(role, state)["iron"], 3)
+        self.assertNotIn("iron", sellable_ores(role, state))
+        role.backpack = ["iron"] * 9
+        self.assertEqual(sellable_ores(role, state)["iron"], 4)
 
     def test_liquidates_forecast_ore_during_price_up_window(self):
         state, role = economy_state()

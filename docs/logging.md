@@ -49,7 +49,6 @@
 | 字段 | 含义 |
 | --- | --- |
 | `primary` | 一层 planned/built/missing（最多 20 格）/missingCount |
-| `outer` | 二层进度与 `unlocked` |
 | `thisRound` | 砌墙或为墙采石 |
 | `events` | 墙相关分支 |
 

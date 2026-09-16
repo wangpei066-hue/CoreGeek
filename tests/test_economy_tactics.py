@@ -6,7 +6,7 @@ import unittest
 from src.agent.brain import BasicActionValidator, V1Strategy, item_cost
 from src.agent.economy import liquidate, pick_mine, profitable_mine, sellable_ores
 from src.agent.tactics import begin_round, tactical_action
-from src.agent.opening import funnel_gap, wall_ring, movement_avoid, safe_wall, assign_weapons
+from src.agent.opening import primary_wall_plan, wall_ring, safe_wall, assign_weapons
 from src.agent.grid import build_blocked_set
 from src.agent.protocol import MatchState, Pos, Zone, RobotRole, ShopItem
 from src.agent.server import load_build_memory, save_build_memory
@@ -575,25 +575,22 @@ class TacticalTests(unittest.TestCase):
         self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set(), allow_travel=False))
 
 
-class FunnelTests(unittest.TestCase):
-    def test_mirrored_outer_gap_is_open_and_not_a_movement_route(self):
+class WallLayoutTests(unittest.TestCase):
+    def test_single_layer_front_on_both_sides(self):
+        """规则不允许双层墙：迎敌方向只有一整列墙。"""
+        from src.agent.opening import attack_direction, defense_bounds
         for base_x in (10, 30):
             state = opening_state()
             base = state.team_our.roles[0]
             base.pos = Pos(base_x, 10)
-            gap = funnel_gap(state, base)
+            left, right, bottom, top = defense_bounds(state, base)
+            direction = attack_direction(state, base)
+            front = right if direction == 1 else left
             walls = set(wall_ring(state, base))
-            self.assertNotIn(gap, walls)
-            self.assertIn(gap, movement_avoid(state))
-            inner_x = base_x+3 if base_x == 10 else base_x-2
-            self.assertIn((inner_x, gap[1]), walls)
-            self.assertEqual(abs(gap[0]-inner_x), 2)
-
-    def test_map_edge_falls_back_to_one_layer(self):
-        state = opening_state()
-        state.map_info.width = 6
-        state.team_our.roles[0].pos = Pos(1, 10)
-        self.assertIsNone(funnel_gap(state, state.team_our.roles[0]))
+            self.assertTrue(all((front, y) in walls for y in range(bottom, top + 1)))
+            beyond = {p for p in walls if (p[0] - front) * direction > 0}
+            self.assertEqual(beyond, set())
+            self.assertEqual(primary_wall_plan(state, base), wall_ring(state, base))
 
     def test_wall_cannot_cut_off_only_vendor_route(self):
         state = opening_state()
@@ -692,12 +689,21 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIsNotNone(cmd)
 
-    def test_stockpile_released_when_weapon_voucher_is_short(self):
+    def test_ore_rising_soon_is_held_even_when_weapon_voucher_is_short(self):
         from unittest import mock
         state, role = defended_state(gold=0)
-        role.backpack = ['copper'] * 80
-        with mock.patch('src.agent.world_intel.ores_to_stockpile', return_value={'copper'}), \
-                mock.patch('src.agent.world_intel.ores_in_spike', return_value=set()):
-            self.assertEqual(sellable_ores(role, state)['copper'], 80)
-            state.team_our.gold_num = 1000
-            self.assertEqual(sellable_ores(role, state)['copper'], 30)
+        role.backpack = ['copper'] * 30 + ['iron'] * 10
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            ores = sellable_ores(role, state)
+        self.assertEqual(ores['copper'], 30)
+        self.assertNotIn('iron', ores)
+
+    def test_opening_does_not_sell_ore_rising_soon(self):
+        from unittest import mock
+        from src.agent.opening_schedule import opening_sell_metal
+        state, role = defended_state(gold=0)
+        state.round_no = 30
+        role.backpack = ['iron'] * 10
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            cmd = opening_sell_metal(role, state, build_blocked_set(state), set(), 'fund')
+        self.assertIsNone(cmd)

@@ -154,7 +154,6 @@ def emit_console_report(report):
     )
 
     primary = diag.get("primary") or {}
-    outer = diag.get("outer") or {}
     missing_n = len(primary.get("missing") or [])
     wall_round = "、".join(a["text"] for a in wall_actions) or "无砌墙/采石"
     planned = primary.get("planned")
@@ -166,11 +165,6 @@ def emit_console_report(report):
             "planned": primary.get("planned"), "built": primary.get("built"),
             "missing": (primary.get("missing") or [])[:20],
             "missingCount": missing_n,
-        },
-        outer={
-            "planned": outer.get("planned"), "built": outer.get("built"),
-            "missingCount": len(outer.get("missing") or []),
-            "unlocked": diag.get("outer_unlocked"),
         },
         thisRound=wall_actions,
         events=_events_with_codes(events, WALL_EVENT_CODES),
@@ -348,7 +342,7 @@ def render_text(report):
     diagnostic = report.get('diagnostics', {})
     for alert in diagnostic.get('alerts', []):
         lines.append('【重点】' + json.dumps(alert, ensure_ascii=False))
-    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons', 'newsPlans'):
+    for key in ('primary', 'gold_delta', 'actors', 'weapons', 'newsPlans'):
         if key in diagnostic or key in report:
             payload = diagnostic.get(key) if key in diagnostic else report.get(key)
             if payload:
