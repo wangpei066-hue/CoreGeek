@@ -416,9 +416,11 @@ def pioneer_should_hold_task(pioneer, state) -> bool:
         if eta is None or eta > need:
             return True
         return False
+    if two_guns_can_hold(state):
+        return True
     if not solver_can_progress(state):
         return False
-    return two_guns_can_hold(state)
+    return False
 
 
 def muster_for_night(role, state, blocked, reserved):
@@ -552,8 +554,12 @@ def sellable_ores(role, state, dump_extra_stone=False):
             price_up = set(ores_in_spike(state))
     except Exception:
         stockpile, price_up = set(), set()
+    stockpile_cap = (role.back_pack_capability or 0) // 2 if role.back_pack_capability else None
     for ore in stockpile - price_up:
-        ores[ore] = 0
+        if stockpile_cap is None:
+            ores[ore] = 0
+        else:
+            ores[ore] = max(0, ores[ore] - stockpile_cap)
     base = own_station(state)
     reserve = 0
     if base and role.role_type == 'worker':

@@ -199,13 +199,29 @@ def two_guns_can_hold(state):
         return False
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     gunners = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
-    if len(weapons) < 2 or len(gunners) < 2:
+    if len(weapons) < 2 or not gunners:
         return False
-    from .opening import assign_weapons
+    from .opening import assign_weapons, dual_rocket_partner
+    from .grid import build_blocked_set
+    from .opening import movement_avoid
+    blocked = build_blocked_set(state) | movement_avoid(state)
     assignments = assign_weapons(state)
     manning = sum(1 for g in gunners if assignments.get(g.id)
                   and chebyshev(g.pos, assignments[g.id].pos) <= 1
                   and (assignments[g.id].attack_range or 0) > 0)
+    dual_manning = 0
+    for g in gunners:
+        weapon = assignments.get(g.id)
+        rocket_options = [weapon] if weapon and weapon.role_type == 'rocket' else [
+            w for w in weapons if w.role_type == 'rocket' and chebyshev(g.pos, w.pos) <= 1
+        ]
+        for rocket in rocket_options:
+            if not rocket or chebyshev(g.pos, rocket.pos) > 1:
+                continue
+            partner, stands = dual_rocket_partner(state, rocket, blocked)
+            if partner and (g.pos.x, g.pos.y) in stands:
+                dual_manning = max(dual_manning, 2)
+    manning = max(manning, dual_manning)
     if manning < 2:
         return False
     robots = threat_robots(state)

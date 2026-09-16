@@ -476,8 +476,20 @@ def opening_shop_voucher(role, state, blocked, reserved, stage, switch_reason='g
                     cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '腾出背包买券')
                     return _tick(state, role, stage, 'shop', 'weaponShop', target, 0, 'drop', switch_reason, cmd)
             return None
-        cmd = selected(state, role.id, {'action': 'buy', 'name': 'WeaponUpgradeVoucher1', 'num': 1},
-                       '购买第一张武器升级券')
+        from .brain import WEAPON_TYPES, item_cost
+        cost = item_cost('WeaponUpgradeVoucher1', state)
+        free = max(0, (role.back_pack_capability or 1) - len(role.backpack or []))
+        needed = sum(
+            1 for w in state.team_our.roles
+            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) <= 1
+        )
+        held = sum(
+            (r.backpack or []).count('WeaponUpgradeVoucher1')
+            for r in state.team_our.roles if r.health > 0
+        )
+        num = max(1, min(max(1, needed - held), free or 1, (state.team_our.gold_num or 0) // cost))
+        cmd = selected(state, role.id, {'action': 'buy', 'name': 'WeaponUpgradeVoucher1', 'num': num},
+                       '批量购买武器升级券')
         if role.role_type == 'pioneer':
             trace(state, role.id, 'pioneer_buys_voucher', '开拓者购买第一张武器升级券')
         return _tick(state, role, stage, 'shop', 'weaponShop', target, 0, 'buy', switch_reason, cmd)
