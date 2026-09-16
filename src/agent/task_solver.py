@@ -1385,7 +1385,13 @@ class PioneerTaskSolver:
                     s['_apiStats'] = stats
                     return 'done'
                 if stats.get('error') == 'total_mismatch' and stats.get('nextOffset') is not None:
-                    self._fact(s, 'LLM命令结果未查全 offset=%s，等待后续分页' % stats['nextOffset'])
+                    # Pagination is transport-level bookkeeping: continue the
+                    # verified query automatically, but keep answer selection
+                    # and schema interpretation in the LLM.
+                    s['apiOffset'] = stats['nextOffset']
+                    s['apiLimit'] = stats.get('nextLimit') or s.get('apiLimit') or 10
+                    self._fact(s, 'API结果未查全，自动继续分页 offset=%s' % stats['nextOffset'])
+                    return 'continue'
                 return 'ask'
             # A compact one-shot script may intentionally emit only its final
             # statistics instead of every raw record.  Accept it when the
