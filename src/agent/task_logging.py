@@ -9,7 +9,11 @@ MARKER = "PIONEER_TASK"
 
 
 def log_task_exchange(event, sequence, payload, session, round_no):
+<<<<<<< HEAD
     """完整记录平台收发数据；request/response 通过 sequence 配对。"""
+=======
+    """记录平台请求/响应交换，供回放和诊断使用。"""
+>>>>>>> 53bda0691e98e3d0a2b82a23d82df1d09b0d7624
     print(json.dumps({
         "marker": "PIONEER_TASK_EXCHANGE",
         "event": event,

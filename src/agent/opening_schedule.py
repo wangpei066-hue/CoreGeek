@@ -462,10 +462,15 @@ def opening_muster(role, state, blocked, reserved, assignments, stage):
     from .opening import weapon_approach_path
     weapon = assignments.get(role.id)
     if weapon is None or weapon.health <= 0:
+        trace(state, role.id, 'opening_muster_no_weapon', '回防时没有分配到存活武器，本回合无命令',
+              stage=stage, assignment_found=weapon is not None,
+              weapon_health=None if weapon is None else weapon.health)
         return None
     path = weapon_approach_path(role, weapon, blocked, reserved, state)
     target = (weapon.pos.x, weapon.pos.y)
     if path is None:
+        trace(state, role.id, 'opening_muster_unreachable', '找不到到分配武器的路径，本回合无命令',
+              stage=stage, weapon_id=weapon.id, weapon_pos={'x': weapon.pos.x, 'y': weapon.pos.y})
         return None
     if path == []:
         return _tick(state, role, stage, 'muster', 'weapon', target, 0, 'hold', 'at_post', None)
@@ -553,6 +558,9 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
     if 'WeaponUpgradeVoucher1' in (role.backpack or []):
         return opening_apply_voucher(role, state, blocked, reserved, STAGE_FUND)
     buyer = _voucher_buyer_id(state, gold, cost, excluded_ids=excluded_buyer_ids)
+    trace(state, role.id, 'voucher_buyer_status', '筹资阶段查看本回合买家判定',
+          gold=gold, cost=cost, buyer_id=buyer, is_buyer=(role.id == buyer),
+          excluded_ids=sorted(excluded_buyer_ids))
     goal = _goal(state, role.id)
     if (goal and goal.get('kind') == 'vendor' and goal.get('stage') == STAGE_FUND
             and _metal_count(role) and gold < cost):
@@ -668,10 +676,18 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
                       '生存墙阶段金币不足，开拓者不抢工人采矿，只等待任务金币或墙后备用',
                       available_gold=gold, required_gold=cost)
             return opening_muster(role, state, blocked, reserved, assignments, STAGE_WALL)
-        if day1_wall_floor_met(state) and gold >= cost:
+        wall_floor_met = day1_wall_floor_met(state)
+        if wall_floor_met and gold >= cost:
+            trace(state, role.id, 'worker_wall_stage_voucher_attempt',
+                  '生存墙阶段墙数已达标且金币够，尝试并行买券（无买家协调，可能多人同时去买）',
+                  available_gold=gold, required_gold=cost)
             cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'wall_floor_met_backup_voucher')
             if cmd:
                 return cmd
+        else:
+            trace(state, role.id, 'worker_wall_stage_voucher_wait',
+                  '生存墙阶段暂不买券，继续修墙' if not wall_floor_met else '金币不够，继续修墙不买券',
+                  available_gold=gold, required_gold=cost, wall_floor_met=wall_floor_met)
         return opening_wall_work(role, state, blocked, reserved, claimed, assignments)
     return None
 

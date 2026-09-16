@@ -22,6 +22,9 @@ WEAPON_EVENT_CODES = {
     "upgrade_job_preempted", "no_free_weapon", "weapon_cooldown", "no_target_in_range",
     "pioneer_voucher_job", "pioneer_voucher_wait_gold", "pioneer_buys_voucher",
     "station_voucher_hold_for_attack", "station_upgrade_wait_cooldown",
+    "voucher_buyer_status", "voucher_buyer_pick",
+    "worker_wall_stage_voucher_attempt", "worker_wall_stage_voucher_wait",
+    "opening_muster_no_weapon", "opening_muster_unreachable",
 }
 PIONEER_EVENT_CODES = {
     "pioneer_task", "task_yields_to_defense", "task_yields_to_voucher",
@@ -30,10 +33,12 @@ PIONEER_EVENT_CODES = {
     "treasure_decoded", "legend_appended",
     "task_reservation_cleared", "task_reservation_interrupted",
     "accept_overwritten", "shop_stall_reassess",
+    "pioneer_stay_clear_no_station", "pioneer_stay_clear_no_weapon",
 }
 ECONOMY_EVENT_CODES = {
     "income_mine", "cashout_priority", "sale_unreachable", "sale_too_late",
     "backpack_full", "no_reachable_mine", "sell_threshold",
+    "worker_day_no_command",
 }
 
 
@@ -203,6 +208,28 @@ def emit_console_report(report):
             events=eco_ev,
         )
 
+
+
+def log_judge_feedback(state):
+    """把官方判题反馈（errorCode/description + 上一条指令是否合法）集中打一行 stderr，
+    debug 时不用再翻 decision_*.json 去对照。只读不改状态，不参与决策。"""
+    errors = [{"errorCode": e.error_code, "description": e.description} for e in (state.errors or [])]
+    previous = state.last_sent_command or {}
+    results = state.last_round_role_action_results or {}
+    per_actor = []
+    for key in sorted(set(previous) | set(results), key=lambda k: str(k)):
+        per_actor.append({
+            "actorId": key,
+            "command": previous.get(key),
+            "legal": results.get(key),
+        })
+    if not errors and not per_actor:
+        return
+    emit_stderr(
+        "JUDGE_FEEDBACK", "round", state.round_no,
+        title=f"【判决反馈】错误{len(errors)}条 | 角色回执{len(per_actor)}条",
+        errors=errors, perActor=per_actor,
+    )
 
 
 def trace(state, role_id, code, message, **details):

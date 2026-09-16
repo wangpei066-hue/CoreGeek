@@ -1190,6 +1190,7 @@ def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
         return None
     base = own_station(state)
     if base is None:
+        trace(state, role.id, 'pioneer_stay_clear_no_station', '找不到基地，开拓者本回合无命令')
         return None
     here = (role.pos.x, role.pos.y)
     construction = set(wall_ring(state, base)) | set(weapon_slots(state, base))
@@ -1211,6 +1212,8 @@ def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
             state, role, weapon_approach_path(role, weapon, blocked, reserved, state),
             reserved, '开拓者白天不采矿不建墙，先去分配炮位',
         )
+    trace(state, role.id, 'pioneer_stay_clear_no_weapon', '没有分配到武器，开拓者本回合无命令',
+          assignments_count=len(assignments))
     return None
 
 
