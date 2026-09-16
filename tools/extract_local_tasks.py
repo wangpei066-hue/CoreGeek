@@ -61,11 +61,39 @@ for city, prefix, target in (("北京", "BJ", 15), ("南京", "NJ", 12), ("成�
 
 def load_rows(log_path: Path) -> list[dict]:
     rows = []
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    raw = log_path.read_text(encoding="utf-8", errors="replace")
+    # Some exports contain literal newlines inside a record. Split on the
+    # stable outer-record marker instead of physical lines.
+    records = re.split(r'(?=\{"roundNo")', raw)
+    for line in records:
+        line = line.strip()
+        if not line:
+            continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            # Older exported logs embedded the PIONEER_TASK JSON directly in
+            # lastCmdResult without escaping its quotes. Recover the document
+            # events from those lines so extraction remains possible.
+            match = re.search(
+                r'"event":"read_document".*?"path"\s*:\s*"([^"]+)".*?'
+                r'"content":"(.*?)","nextOffset"',
+                line,
+            )
+            if not match:
+                continue
+            try:
+                content = json.loads('"' + match.group(2) + '"')
+            except json.JSONDecodeError:
+                continue
+            value = {
+                "lastCmdResult": json.dumps({
+                    "marker": "PIONEER_TASK",
+                    "event": "read_document",
+                    "path": match.group(1),
+                    "content": content,
+                }, ensure_ascii=False),
+            }
         if isinstance(value, dict):
             rows.append(value)
     return rows
@@ -106,12 +134,14 @@ def write_workspace(root: Path, app: str, number: int, spec: str) -> None:
     start.write_text("#!/bin/sh\necho started\n", encoding="utf-8")
     start.chmod(0o644)
     token = TOKENS[app]
-    port, service = re.search(r"第 3 行：`([^`]+)`", spec).group(1), re.search(r"第 6 行：`([^`]+)`", spec).group(1)
+    port = re.search(r"第 3 行：`?([^`\n]+)`?", spec).group(1).strip()
+    service = re.search(r"第 6 行：`?([^`\n]+)`?", spec).group(1).strip()
     check = template / "check"
     check.write_text(
         "#!/bin/sh\nset -eu\nfail=0\n"
         f"[ -d logs/{app} ] || fail=$((fail+1))\n"
-        f"[ \"$(stat -c %a logs/{app} 2>/dev/null || true)\" = 755 ] || fail=$((fail+1))\n"
+        f"mode=$(stat -c %a logs/{app} 2>/dev/null || stat -f %Lp logs/{app} 2>/dev/null || true)\n"
+        "[ \"$mode\" = 755 ] || fail=$((fail+1))\n"
         f"[ \"$(sed -n '3p' config/{app}.conf 2>/dev/null)\" = {json.dumps(port)} ] || fail=$((fail+1))\n"
         f"[ \"$(sed -n '6p' config/{app}.conf 2>/dev/null)\" = {json.dumps(service)} ] || fail=$((fail+1))\n"
         "[ -f bin/start.sh ] || fail=$((fail+1))\n"
