@@ -1154,7 +1154,10 @@ class PioneerTaskSolver:
         hit = matching_api_experience(self.experience, state.phase_task) if s.get('taskKind') != 'workspace' else None
         if hit and api_fetch_query(hit, state.phase_task, 'preview'):
             s['apiReplay'] = hit
-            s['stage'] = 'api_fetch'
+            # Experience is a candidate for the LLM, not authorization to
+            # execute.  Read the current brief first so changed fields and
+            # descriptions can override stale cross-task memory.
+            s['apiConfirmationRequired'] = True
             s['experienceHit'] = True
             s['metrics']['experienceHit'] = True
             s['metrics']['memoryMatched'] = True
@@ -1237,7 +1240,8 @@ class PioneerTaskSolver:
         if not hit or not api_fetch_query(hit, task, 'preview'):
             return False
         s['apiReplay'] = hit
-        s['stage'] = 'api_fetch'
+        s['apiConfirmationRequired'] = True
+        s['stage'] = 'ask'
         s['experienceHit'] = True
         s.setdefault('metrics', {})['experienceHit'] = True
         self._fact(s, reason)
@@ -1610,12 +1614,10 @@ class PioneerTaskSolver:
                 replay = default_heritage_experience(state.phase_task, s.get('documents'))
                 if replay:
                     s['apiReplay'] = replay
-                    s['stage'] = 'api_fetch'
-                    s['experienceHit'] = True
-                    s['metrics']['experienceHit'] = True
-                    s['metrics']['memoryInjected'] = True
-                    self._fact(s, '读取任务简报后采用已知遗产API契约，跳过过时文档探查')
-                    s['history'].append({'contractReuse': {'path': replay['path'], 'cityParam': 'location'}})
+                    s['apiConfirmationRequired'] = True
+                    self._fact(s, '读取任务简报后将遗产API契约作为候选，交由LLM确认')
+                    s['history'].append({'contractCandidate': {
+                        'path': replay['path'], 'cityParam': replay['cityParam']}})
             if result.get('more') and result['nextOffset'] < 60000:
                 s['offset'] = result['nextOffset']
                 s['paths'][s['index']] = result['path']
@@ -1629,9 +1631,12 @@ class PioneerTaskSolver:
             # still selects the right SOP and enables deterministic TOKEN/API handling.
             if s.get('taskKind') == 'workspace' and deployment_repair_command(s):
                 s['autoRepairPending'] = True
-            # The API contract is available from the task brief; do not let
-            # the normal document-read transition re-enter stale API docs.
-            s['stage'] = 'api_fetch' if s.get('taskKind') == 'api' and s.get('apiReplay') else 'read'
+            # Always let the LLM inspect the current brief (and any explicitly
+            # referenced API docs) before an API experience is used.
+            if s.get('taskKind') == 'api' and s.get('index', 0) >= len(s.get('paths') or []):
+                s['stage'] = 'ask'
+            else:
+                s['stage'] = 'read'
             return execute
         command = s.get('lastTool') or ''
         redacted = dict(result)
@@ -1766,6 +1771,9 @@ class PioneerTaskSolver:
                     s['stage'] = 'read'
                 else:
                     command = answer['command']
+                    if s.get('taskKind') == 'api':
+                        s['apiReplayConfirmed'] = True
+                        s['apiConfirmationRequired'] = False
                     if self._is_duplicate_failure(s, 'execute', command, s.get('workspace'), 'nonzero_exit'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
                         s['history'].append({'blocked': '相同命令已失败且无新证据', 'command': command})
@@ -1965,7 +1973,8 @@ class PioneerTaskSolver:
             if s['stage'] == 'read' and s['index'] >= len(s['paths']):
                 if not self._switch_to_api_experience(s, state.phase_task, '文档读完或失败后改用已验证API经验'):
                     s['stage'] = 'ask'
-            if s['stage'] == 'ask' and not s.get('apiFetchAttempted'):
+            if (s['stage'] == 'ask' and not s.get('apiFetchAttempted')
+                    and not s.get('apiConfirmationRequired')):
                 if self._switch_to_api_experience(s, state.phase_task, '进入提问前改用已验证API经验'):
                     pass
             budget, _remaining = self._budget(s, state)
