@@ -206,6 +206,8 @@ class NewsMemory:
             "buyTarget": None,
             "llmDay": None,
             "llmUsed": 0,
+            "orePromptSent": False,
+            "treasurePromptSent": False,
             "pendingConsumer": None,
             "pendingRound": None,
             "pendingPrompt": None,
@@ -245,6 +247,8 @@ class NewsMemory:
             "buyTarget": None,
             "llmDay": None,
             "llmUsed": 0,
+            "orePromptSent": False,
+            "treasurePromptSent": False,
             "pendingConsumer": None,
             "pendingRound": None,
             "pendingPrompt": None,
@@ -278,6 +282,8 @@ class NewsMemory:
         if self.data["llmDay"] != day:
             self.data["llmDay"] = day
             self.data["llmUsed"] = 0
+            self.data["orePromptSent"] = False
+            self.data["treasurePromptSent"] = False
 
         news = state.world_news
         official = (news.official_news if news else "") or ""
@@ -287,10 +293,11 @@ class NewsMemory:
             self.data["officialDay"] = day
             meaningful = official.strip() and "无重大新闻" not in official
             if meaningful:
-                self.data["needOreParse"] = True
                 effects = heuristic_ore_effects(official, day)
                 for weak in effects:
                     self._upsert_ore_effect(weak)
+                # 机制命中则不申请矿价 LLM；只有匹配失败才送一次。
+                self.data["needOreParse"] = not bool(effects)
                 if effects and getattr(state, "decision_events", None) is not None:
                     trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
                           effects=effects)
@@ -444,11 +451,22 @@ class NewsMemory:
     def can_spend(self) -> bool:
         return self.budget_remaining() > 0 and self.data.get("pendingConsumer") is None
 
+    def folk_needs_prompt(self) -> bool:
+        return bool(self.data.get("needTreasureDecode") and not self.data.get("treasureEmpty"))
+
+    def official_needs_prompt(self) -> bool:
+        """启发式未命中、且当天还没送过矿价 LLM。"""
+        return bool(self.data.get("needOreParse") and not self.data.get("orePromptSent"))
+
     def mark_pending(self, consumer: str, round_no: int, prompt: str) -> None:
         self.data["pendingConsumer"] = consumer
         self.data["pendingRound"] = round_no
         self.data["pendingPrompt"] = prompt
         self.data["llmUsed"] = int(self.data.get("llmUsed", 0)) + 1
+        if consumer == "ore":
+            self.data["orePromptSent"] = True
+        elif consumer == "treasure":
+            self.data["treasurePromptSent"] = True
         self.save()
 
     def clear_pending(self) -> None:

@@ -101,7 +101,7 @@ def make_treasure_prompt(state: MatchState, memory: NewsMemory) -> str:
 
 
 class PromptRouter:
-    """消费 llmResp，并在无自进化任务时申请日额度 prompt。"""
+    """消费 llmResp；无自进化时申请日额度 prompt（官方未命中优先且每天至多 1 次，传闻保底 1 次）。"""
 
     def __init__(self, memory: NewsMemory):
         self.memory = memory
@@ -174,7 +174,8 @@ class PromptRouter:
         self.memory.clear_pending()
 
     def request_prompt(self, state: MatchState) -> str:
-        """phaseTask 活跃时返回空；否则按 宝藏 > 矿价 申请至多 1 次。"""
+        """无自进化时每回合至多 1 条。启发式未命中的官方消息优先，但每天最多送 1 次；
+        民间传闻若仍待解码，至少预留 1 次成功送推。"""
         if state.phase_task:
             return ""
         if (self.memory.data.get("pendingConsumer")
@@ -184,18 +185,11 @@ class PromptRouter:
         if not self.memory.can_spend():
             return ""
 
-        if self.memory.data.get("needTreasureDecode") and not self.memory.data.get("treasureEmpty"):
-            prompt = make_treasure_prompt(state, self.memory)
-            self.memory.mark_pending("treasure", state.round_no, prompt)
-            trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])
-            log_news_event(
-                event="prompt_sent", consumer="treasure", roundNo=state.round_no,
-                title="【LLM】发送宝藏解码 prompt",
-                promptText=prompt, used=self.memory.data["llmUsed"],
-            )
-            return prompt
-
-        if self.memory.data.get("needOreParse"):
+        folk_needed = self.memory.folk_needs_prompt()
+        official_needed = self.memory.official_needs_prompt()
+        folk_unsent = folk_needed and not self.memory.data.get("treasurePromptSent")
+        # 最后 1 次额度留给尚未送出的传闻，避免官方占满后传闻当天一次都没有。
+        if official_needed and (self.memory.budget_remaining() > 1 or not folk_unsent):
             prompt = make_ore_prompt(state, self.memory)
             self.memory.mark_pending("ore", state.round_no, prompt)
             self.memory.data["needOreParse"] = False
@@ -205,6 +199,17 @@ class PromptRouter:
             log_news_event(
                 event="prompt_sent", consumer="ore", roundNo=state.round_no,
                 title="【LLM】发送矿价解析 prompt",
+                promptText=prompt, used=self.memory.data["llmUsed"],
+            )
+            return prompt
+
+        if folk_needed:
+            prompt = make_treasure_prompt(state, self.memory)
+            self.memory.mark_pending("treasure", state.round_no, prompt)
+            trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])
+            log_news_event(
+                event="prompt_sent", consumer="treasure", roundNo=state.round_no,
+                title="【LLM】发送宝藏解码 prompt",
                 promptText=prompt, used=self.memory.data["llmUsed"],
             )
             return prompt

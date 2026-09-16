@@ -79,7 +79,7 @@ class NewsMemoryTests(unittest.TestCase):
     def test_ingest_official_and_legend(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")
         self.memory.ingest(state)
-        self.assertTrue(self.memory.data["needOreParse"])
+        self.assertFalse(self.memory.data["needOreParse"])
         self.assertTrue(self.memory.data["needTreasureDecode"])
         self.assertEqual(self.memory.banned_ores(2), {"iron"})
         self.assertEqual(self.memory.data["legends"][-1]["text"], "西部有一石门")
@@ -116,6 +116,54 @@ class NewsMemoryTests(unittest.TestCase):
         self.memory.ingest(day2)
         self.assertEqual(self.memory.data["llmUsed"], 0)
         self.assertTrue(self.memory.can_spend())
+
+    def test_heuristic_hit_skips_official_llm_sends_folk(self):
+        state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")
+        self.memory.ingest(state)
+        router = PromptRouter(self.memory)
+        prompt = router.request_prompt(state)
+        self.assertIn("民间传闻", prompt)
+        self.assertNotIn("官方消息解析器", prompt)
+        self.assertTrue(self.memory.data["treasurePromptSent"])
+        self.assertFalse(self.memory.data["orePromptSent"])
+
+    def test_heuristic_miss_official_llm_before_folk(self):
+        state = self._state(0, official="安全委员会发布例行通报，请各队关注后续安排。", folk="西部有一石门")
+        self.memory.ingest(state)
+        self.assertTrue(self.memory.data["needOreParse"])
+        router = PromptRouter(self.memory)
+        first = router.request_prompt(state)
+        self.assertIn("官方消息", first)
+        self.assertTrue(self.memory.data["orePromptSent"])
+        self.memory.clear_pending()
+        state.round_no = 1
+        second = router.request_prompt(state)
+        self.assertIn("民间传闻", second)
+        self.assertTrue(self.memory.data["treasurePromptSent"])
+
+    def test_official_llm_at_most_once_and_last_slot_saved_for_folk(self):
+        state = self._state(0, official="安全委员会发布例行通报。", folk="西部有一石门")
+        self.memory.ingest(state)
+        router = PromptRouter(self.memory)
+        router.request_prompt(state)
+        self.assertEqual(self.memory.data["pendingConsumer"], "ore")
+        self.memory.clear_pending()
+        self.memory.data["needOreParse"] = True
+        state.round_no = 1
+        again = router.request_prompt(state)
+        self.assertIn("民间传闻", again)
+        self.assertEqual(self.memory.data["llmUsed"], 2)
+
+        self.memory.clear_pending()
+        self.memory.data["llmUsed"] = 2
+        self.memory.data["treasurePromptSent"] = False
+        self.memory.data["needTreasureDecode"] = True
+        self.memory.data["needOreParse"] = True
+        self.memory.data["orePromptSent"] = False
+        state.round_no = 2
+        last = router.request_prompt(state)
+        self.assertIn("民间传闻", last)
+        self.assertFalse(self.memory.data["orePromptSent"])
 
     def test_phase_task_blocks_news_prompt(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="情报")
