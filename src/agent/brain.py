@@ -546,8 +546,12 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     if role.id in state.worker_item_jobs:
         return
 
+    held_weapon_voucher = any(
+        isinstance(item, str) and item.startswith("WeaponUpgradeVoucher")
+        for item in (role.backpack or [])
+    )
     weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=1)
-    if weapon and allow_weapon and not defer_new_weapon_for_station(state):
+    if weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state)):
         name, cost = voucher_for("weapon", weapon.level or 1)
         if name in role.backpack:
             adjacent = [
@@ -597,7 +601,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             return
 
     weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=2)
-    if weapon and allow_weapon and (weapon.level or 1) >= 2:
+    if weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state)) and (weapon.level or 1) >= 2:
         name, cost = voucher_for("weapon", weapon.level or 1)
         if name in role.backpack:
             adjacent = [
@@ -1010,6 +1014,10 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     cashout = in_pre_night_cashout_window(worker, state, blocked, reserved)
     job = state.worker_item_jobs.get(worker.id)
     held_item = bool(job and job.get('item') in worker.backpack)
+    held_weapon_voucher = any(
+        isinstance(item, str) and item.startswith('WeaponUpgradeVoucher')
+        for item in (worker.backpack or [])
+    )
     if cashout:
         handled, cmd = liquidate(worker, state, blocked, reserved)
         if cmd:
@@ -1020,6 +1028,14 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             cmd = decide_shop_item_job(worker, state, blocked, reserved)
             if cmd:
                 return cmd
+    if allow_weapon and (held_weapon_voucher or (job and job.get('kind') == 'weapon')):
+        maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=False)
+        cmd = decide_shop_item_job(worker, state, blocked, reserved)
+        if cmd:
+            trace(state, worker.id, 'pre_muster_weapon_voucher',
+                  '白天回防前优先推进武器升级券，避免券带进夜里不用',
+                  heldVoucher=held_weapon_voucher, jobKind=(job or {}).get('kind'))
+            return cmd
     handled, cmd = muster_for_night(worker, state, blocked, reserved)
     if handled:
         return cmd

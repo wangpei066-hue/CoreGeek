@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import sys
 
 
 from .log_format import command_text, emit_stderr

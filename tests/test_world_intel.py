@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.economy import profitable_mine, sellable_ores
+from src.agent.economy import liquidate, profitable_mine, sellable_ores
 from src.agent.grid import build_blocked_set
 from src.agent.news_memory import NewsMemory
 from src.agent.prompt_router import PromptRouter
@@ -67,6 +67,21 @@ class OfficialNewsTests(unittest.TestCase):
         ingest_news(state)
         role.backpack = ["iron"] * 8
         self.assertIn("iron", sellable_ores(role, state))
+
+    def test_liquidates_forecast_ore_before_block_window(self):
+        state, role = economy_state()
+        state.round_no = 10
+        state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
+        ingest_news(state)
+        role.backpack = ["iron"]
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertTrue(handled)
+        self.assertIsNotNone(cmd)
+        self.assertTrue(any(
+            e["code"] == "cashout_priority"
+            and any("官方消息预告" in trigger for trigger in (e.get("triggers") or []))
+            for e in state.decision_events
+        ))
 
 
 class FolkLegendTests(unittest.TestCase):
