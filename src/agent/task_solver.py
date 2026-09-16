@@ -66,20 +66,19 @@ DEPLOYMENT_SOP = DEPLOYMENT_SOP_TEMPLATE + '''
 若探查已确认CRLF且允许修复启动格式，用Python将\\r\\n规范为\\n，不要依赖dos2unix，也不要改检查器逻辑。
 成功检查后直接依据真实TOKEN构造答案，不要再分轮验证。
 '''
-API_SOP = '''同一服务已有已验证调用经验时，优先复用路径、认证方式和城市参数，不重新猜测接口，也不要去读其他城市旧任务文件。
-缺少经验或经验失效时，再阅读当前任务的API文档并依据错误响应调整。
-本地任务环境的已验证兼容契约是：GET `/api/v1/heritage/search`，请求头 `Authorization: Bearer heritage-api-key-2024`，城市参数 `location`，分页参数 `offset`/`limit`；响应业务码在 `code`，记录为 `data.records`，分页为 `data.pagination`。文档中的 `X-API-Key`、`city`、`page` 仅作为过时内容处理。
-已知接口用 curl -G --data-urlencode 查询；必须显式传 `offset=0&limit=100`（或在一次 shell/Python 脚本中循环 offset），不能省略分页参数，也不能只取默认第一页。中文参数交给 curl 编码。
-已知接口使用实际响应的 code、data.records、data.pagination；不要假定存在 status=success 或 items。
-HTTP/shell 成功不等于业务成功。code 非 200 时停止分页和统计。401 时停止依赖步骤并修正认证；参数错误时先改参数。
-查询成功不等于全量读取已验证。按 pagination 分页，检测重复页面、重复ID、总量不一致及无进展。
-世界遗产用 protected_level 精确匹配任务要求。oldest_era 提交遗产名称且必须有年代比较依据，模糊年代不能用第一条记录占位。一次 execute 应完成全部分页、去重、统计和年代比较，只打印一个最终 JSON；不要先打印样本、keys、era_map 或逐页调试输出。
-'''
+API_SOP = '''API SOP：任务正文和任务明确引用的 API 文档是最高优先级；先确认任务要求的字段、答案格式、接口路径、认证、参数和分页方式，再决定是否使用历史经验。
+历史 API 经验只能作为候选线索，必须由你结合当前任务/文档确认；当前任务出现新字段、新描述、新 URL 或与经验冲突时，以当前资料为准，不要静默套用旧契约。
+不要因为任务看起来像遗产查询就假定是 heritage 接口，也不要默认跳过 API_DOCS.md。只有当前资料或已由你确认的响应证据支持时，才能使用某个接口契约。
+本地实验中曾验证过的候选契约是：GET `/api/v1/heritage/search`，请求头 `Authorization: Bearer heritage-api-key-2024`，城市参数 `location`，分页参数 `offset`/`limit`；响应业务码在 `code`，记录为 `data.records`，分页为 `data.pagination`。这只是候选，不是新任务的固定答案。
+确认契约后，查询必须覆盖任务要求的全部数据；若使用 offset/limit，显式传 `offset=0` 和合理 `limit`，按实际 pagination 继续分页，检测重复页面、重复 ID、总量不一致和无进展。中文参数使用 curl 编码。
+HTTP/shell 成功不等于业务成功。依据当前响应和任务文档判断业务码、记录路径、分页结构及统计字段；不要假定存在 status=success、items 或固定的 oldest_era 语义。
+查询完整后，按照当前任务文档解释字段和比较规则，生成符合当前任务要求的最终 JSON。不要让历史 schema、固定年代表或旧任务答案覆盖当前任务定义；信息不足时继续阅读或向 LLM 自己提出下一步，而不是猜测。
+只打印必要证据和最终结果，避免样本/keys/逐页调试输出导致截断。'''
 PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
 PROMPT_DEPLOY = '''部署SOP：read任务文档→read唯一spec.md→下一次execute一次完成修复、CRLF处理和check→从成功输出提取真实TOKEN并submit。配置按物理行用awk写临时文件再mv；CRLF用tr -d '\\r'。不要继续ls/cat探查，不要修改check，不要重复失败命令。'''
-PROMPT_API = '''API SOP：不要读取过时的API_DOCS.md；读完题目后直接一次execute完成全部查询和统计，随后立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination；文档中的X-API-Key、city、page过时。第一请求必须显式 `offset=0&limit=100`，若pagination.total_count仍大于返回数，必须在同一条命令中循环 offset=已有记录数直到收齐；不得只查询默认10条，不得打印样本/字段探查/逐页调试信息。按唯一id去重，code必须为200；protected_level精确统计世界遗产。oldest_era 必须按记录的 era_order；若模拟数据的 era_order 全为 null，按明确历史顺序比较（六朝早于明，明早于清），不要用第一条记录占位。数字保持数字，最后只输出一个答案JSON。'''
+PROMPT_API = '''API执行提示：当前任务正文和明确引用的 API 文档优先。历史经验（包括本地遗产 API 的路径、认证、参数和字段）仅供核对，必须先确认与当前任务一致；发现冲突或新字段时按当前资料调整。确认接口后一次 execute 完成必要查询、真实响应校验和全量分页，再依据当前任务要求提交；不要猜字段、不要把旧任务 schema 当作答案格式。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
