@@ -359,6 +359,50 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
     ))
 
 
+def _ordered_rockets(state: "MatchState", pending_targets: set = ()):
+    return sorted(
+        (
+            r for r in state.team_our.roles
+            if r.role_type == "rocket" and r.health > 0
+            and (r.pos.x, r.pos.y) not in pending_targets
+        ),
+        key=lambda r: (_weapon_front_key(state, r), r.id),
+    )
+
+
+def _pick_weapon_upgrade_chain_target(state: "MatchState", pending_targets: set):
+    """武器升级链：火箭A2 -> 火箭B2 -> 火箭A3 -> 基地 -> 火箭B3 -> 电磁炮2。"""
+    rockets = _ordered_rockets(state, pending_targets)
+    for rocket in rockets[:2]:
+        if (rocket.level or 1) < 2:
+            return rocket
+    if len(rockets) >= 2 and (rockets[0].level or 1) == 2:
+        return rockets[0]
+    station = own_station(state)
+    station_ready = bool(station and (station.level or 1) >= 2)
+    if len(rockets) >= 2 and station_ready and (rockets[1].level or 1) == 2:
+        return rockets[1]
+    railguns = sorted(
+        (
+            r for r in state.team_our.roles
+            if r.role_type == "railgun" and r.health > 0
+            and (r.pos.x, r.pos.y) not in pending_targets
+        ),
+        key=lambda r: (_weapon_front_key(state, r), r.id),
+    )
+    for railgun in railguns:
+        if (railgun.level or 1) < 2:
+            return railgun
+    return _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=2)
+
+
+def _level3_weapon_job_pending(state: "MatchState") -> bool:
+    return any(
+        job.get("kind") == "weapon" and job.get("item") == "WeaponUpgradeVoucher2"
+        for job in state.worker_item_jobs.values()
+    )
+
+
 def structure_priority_day(state: "MatchState") -> bool:
     """第三天起（day_index>=2）提高围墙和升基地优先级。"""
     return ((state.round_no or 0) // DAY_NIGHT_CYCLE) >= 2
@@ -423,16 +467,14 @@ def station_low_health_upgrade_pending(state: "MatchState") -> bool:
 
 
 def station_first_upgrade_pending(state: "MatchState") -> bool:
-    """三门炮都到 2 级且尚未开始三级时，先把基地升一次（1→2）。"""
+    """第一门火箭到 3 级后，先把基地升一次（1→2）。"""
     station = own_station(state)
     if not station or (station.level or 1) >= 2:
         return False
-    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
-    if len(weapons) < 3 or any((w.level or 1) < 2 for w in weapons):
+    rockets = _ordered_rockets(state)
+    if len(rockets) < 2:
         return False
-    if any((w.level or 1) >= 3 for w in weapons):
-        return False
-    return True
+    return (rockets[0].level or 1) >= 3
 
 
 def station_l2_upgrade_pending(state: "MatchState") -> bool:
@@ -631,8 +673,13 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
         isinstance(item, str) and item.startswith("WeaponUpgradeVoucher")
         for item in (role.backpack or [])
     )
-    weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=1)
-    if weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state)):
+    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
+    if (weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state))
+            and ((weapon.level or 1) <= 1 or (
+                weapon.role_type == "rocket"
+                and (weapon.level or 1) == 2
+                and not station_first_upgrade_pending(state)
+            ))):
         name, cost = voucher_for("weapon", weapon.level or 1)
         if name in role.backpack:
             adjacent = [
@@ -653,8 +700,23 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
                   next_level=(weapon.level or 1) + 1)
         return
 
+    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
+    if (weapon and allow_weapon and (weapon.level or 1) >= 2
+            and not _level3_weapon_job_pending(state)
+            and not station_first_upgrade_pending(state)):
+        name, cost = voucher_for("weapon", weapon.level or 1)
+        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
+        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
+            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定首门三级火箭，当前金币不足，禁止改做低优先级消费',
+                  weapon_id=weapon.id, current_level=weapon.level or 1,
+                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
+                  next_level=(weapon.level or 1) + 1)
+        return
+
     station = own_station(state)
     if station_l2_upgrade_pending(state):
+        if _level3_weapon_job_pending(state):
+            return
         if not station or (station.pos.x, station.pos.y) in pending_targets:
             return
         buyer = station_first_buyer(state)
@@ -682,8 +744,9 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             state.worker_item_jobs[role.id] = {"item": name, "target": (wall.pos.x, wall.pos.y), "kind": "wall"}
             return
 
-    weapon = _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=2)
-    if weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state)) and (weapon.level or 1) >= 2:
+    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
+    if (weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state))
+            and (weapon.level or 1) >= 2 and not _level3_weapon_job_pending(state)):
         name, cost = voucher_for("weapon", weapon.level or 1)
         if name in role.backpack:
             adjacent = [
@@ -705,6 +768,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
         return
 
     if (allow_structure_upgrade and station and (station.level or 1) < 3
+            and not _level3_weapon_job_pending(state)
             and (station.pos.x, station.pos.y) not in pending_targets):
         name, cost = voucher_for("station", station.level or 1)
         from .treasure import shop_buy_allowed
@@ -766,10 +830,7 @@ def _batch_buy_quantity(role: Role, state: "MatchState", job: dict) -> int:
             if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) <= 1
         )
     elif item == "WeaponUpgradeVoucher2":
-        desired = sum(
-            1 for w in state.team_our.roles
-            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) == 2
-        )
+        desired = 1
     elif item == "StationUpgradeVoucher1":
         station = own_station(state)
         desired = 1 if station and (station.level or 1) <= 1 else 0

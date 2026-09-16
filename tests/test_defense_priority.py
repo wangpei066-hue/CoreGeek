@@ -320,9 +320,9 @@ class DefensePriorityTests(unittest.TestCase):
         worker.pos = Pos(8, 9)
         commands = self.decide(state)
         buys = [c for c in commands.values() if c.get('action') == 'buy']
-        self.assertEqual([c['name'] for c in buys if 'StationUpgrade' in c.get('name', '')],
-                         ['StationUpgradeVoucher1'])
-        self.assertFalse(any('WeaponUpgradeVoucher2' in c.get('name', '') for c in buys))
+        self.assertEqual([c['name'] for c in buys if 'WeaponUpgradeVoucher2' in c.get('name', '')],
+                         ['WeaponUpgradeVoucher2'])
+        self.assertFalse(any('StationUpgrade' in c.get('name', '') for c in buys))
         self.assertFalse(any(c.get('name', '').endswith('SummonOrder') for c in buys))
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
