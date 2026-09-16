@@ -482,18 +482,12 @@ def opening_shop_voucher(role, state, blocked, reserved, stage, switch_reason='g
                     cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '腾出背包买券')
                     return _tick(state, role, stage, 'shop', 'weaponShop', target, 0, 'drop', switch_reason, cmd)
             return None
-        from .brain import WEAPON_TYPES, item_cost
+        from .brain import item_cost, upgrade_batch_size
         cost = item_cost('WeaponUpgradeVoucher1', state)
         free = max(0, (role.back_pack_capability or 1) - len(role.backpack or []))
-        needed = sum(
-            1 for w in state.team_our.roles
-            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) <= 1
-        )
-        held = sum(
-            (r.backpack or []).count('WeaponUpgradeVoucher1')
-            for r in state.team_our.roles if r.health > 0
-        )
-        num = max(1, min(max(1, needed - held), free or 1, (state.team_our.gold_num or 0) // cost))
+        # 升级计划已扣掉全队已买未用的券，按顺序买够接下来连续需要的 1 级券。
+        needed = upgrade_batch_size(state, 'WeaponUpgradeVoucher1', exclude_role_id=role.id)
+        num = max(1, min(needed, free or 1, (state.team_our.gold_num or 0) // cost))
         cmd = selected(state, role.id, {'action': 'buy', 'name': 'WeaponUpgradeVoucher1', 'num': num},
                        '批量购买武器升级券')
         if role.role_type == 'pioneer':

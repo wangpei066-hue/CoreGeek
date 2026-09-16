@@ -66,7 +66,8 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_buys_all_level_one_weapon_vouchers_when_gold_and_space_allow(self):
+    def test_level_one_batch_follows_upgrade_chain(self):
+        """升级链先升两门火箭，1 级券只买两张；电磁炮的券等轮到它再买。"""
         state = minimal_state(gold_num=300)
         state.team_our.roles += [
             make_role(21, 12, 10, "rocket", level=1),
@@ -77,7 +78,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         state.team_our.roles.append(worker)
         maybe_start_shop_item_job(worker, state)
         cmd = decide_shop_item_job(worker, state, set(), set())
-        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher1", "num": 3})
+        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher1", "num": 2})
 
     def test_weapon_upgrade_chain_two_rockets_then_station_then_railgun(self):
         state = minimal_state(gold_num=450)
@@ -357,8 +358,9 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(station_first_buyer(state).id, 1)
         maybe_start_shop_item_job(pioneer, state)
         self.assertEqual(state.worker_item_jobs[3]["kind"], "weapon")
+        # 火箭A升3级已有人在买，工人按顺序接着买下一步：基地券
         maybe_start_shop_item_job(worker, state)
-        self.assertNotIn(1, state.worker_item_jobs)
+        self.assertEqual(state.worker_item_jobs[1]["item"], "StationUpgradeVoucher1")
 
     def test_unbought_rear_upgrade_yields_to_front_rocket(self):
         state = minimal_state(gold_num=1000)
@@ -476,7 +478,9 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         maybe_start_shop_item_job(worker_a, state)
         maybe_start_shop_item_job(worker_b, state)
         self.assertIn(10010, state.worker_item_jobs)
-        self.assertNotIn(10012, state.worker_item_jobs)  # 唯一的可升级武器已被 worker_a 占用
+        # 同一门武器的 1→2 已被 worker_a 认领，worker_b 按顺序买下一步 2→3，不重复买 1 级券
+        self.assertEqual(state.worker_item_jobs[10010]["item"], "WeaponUpgradeVoucher1")
+        self.assertEqual(state.worker_item_jobs[10012]["item"], "WeaponUpgradeVoucher2")
 
 
 class ShopItemJobExecutionTests(unittest.TestCase):

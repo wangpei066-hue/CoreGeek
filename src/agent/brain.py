@@ -371,39 +371,100 @@ def _ordered_rockets(state: "MatchState", pending_targets: set = ()):
     )
 
 
-def _pick_weapon_upgrade_chain_target(state: "MatchState", pending_targets: set):
-    """武器升级链：火箭A2 -> 火箭B2 -> 火箭A3 -> 基地 -> 火箭B3 -> 电磁炮2。"""
-    rockets = _ordered_rockets(state, pending_targets)
-    for rocket in rockets[:2]:
-        if (rocket.level or 1) < 2:
-            return rocket
-    if len(rockets) >= 2 and (rockets[0].level or 1) == 2:
-        return rockets[0]
+def upgrade_plan(state: "MatchState"):
+    """升级顺序全表，并把全队已买未用的券按顺序抵扣到对应步骤上。
+
+    顺序：火箭A 1→2、火箭B 1→2、火箭A 2→3、基地 1→2、火箭B 2→3，其余武器（电磁炮等）1→2→3。
+    每一步是 dict(role, level, kind, name, core, covered)：
+    - covered：全队背包里已有这张券（已买未用），这一步不用再买，由持券人去用；
+    - core：基地这一步及之前的步骤、以及所有 1 级升级，排在修墙前面。
+    返回 (steps, surplus)：surplus 是按顺序抵扣后仍用不上的多余券数量。"""
+    live = [r for r in state.team_our.roles if r.health > 0]
+    rockets = _ordered_rockets(state)
+    others = sorted((r for r in live if r.role_type in WEAPON_TYPES and r.role_type != "rocket"),
+                    key=lambda r: (_WEAPON_UPGRADE_ORDER.get(r.role_type, 99), _weapon_front_key(state, r), r.id))
     station = own_station(state)
-    station_ready = bool(station and (station.level or 1) >= 2)
-    if len(rockets) >= 2 and not station_ready:
-        return None  # 火箭A已到3级：下一步是基地，电磁炮和火箭B3都要等基地升完。
-    if len(rockets) >= 2 and station_ready and (rockets[1].level or 1) == 2:
-        return rockets[1]
-    railguns = sorted(
-        (
-            r for r in state.team_our.roles
-            if r.role_type == "railgun" and r.health > 0
-            and (r.pos.x, r.pos.y) not in pending_targets
-        ),
-        key=lambda r: (_weapon_front_key(state, r), r.id),
-    )
-    for railgun in railguns:
-        if (railgun.level or 1) < 2:
-            return railgun
-    return _pick_upgradeable(state, WEAPON_TYPES, pending_targets, max_current_level=2)
+    first, second = (rockets + [None, None])[:2]
+    sequence = []
+    if first:
+        sequence.append((first, 1))
+    if second:
+        sequence.append((second, 1))
+    if first:
+        sequence.append((first, 2))
+    if station and second:
+        sequence.append((station, 1))
+    if second:
+        sequence.append((second, 2))
+    for weapon in rockets[2:] + others:
+        sequence += [(weapon, 1), (weapon, 2)]
+    held = Counter(item for r in live for item in (r.backpack or [])
+                   if isinstance(item, str) and item.startswith(("WeaponUpgradeVoucher", "StationUpgradeVoucher")))
+    steps = []
+    core = True
+    for role, level in sequence:
+        if (role.level or 1) > level:
+            continue
+        kind = "station" if role.role_type == "station" else "weapon"
+        name = voucher_for(kind, level)[0]
+        covered = held[name] > 0
+        if covered:
+            held[name] -= 1
+        steps.append(dict(role=role, level=level, kind=kind, name=name,
+                          core=core or level == 1, covered=covered))
+        if kind == "station":
+            core = False
+    return steps, held
 
 
-def _level3_weapon_job_pending(state: "MatchState") -> bool:
-    return any(
-        job.get("kind") == "weapon" and job.get("item") == "WeaponUpgradeVoucher2"
-        for job in state.worker_item_jobs.values()
-    )
+def _step_key(step):
+    return (step["role"].pos.x, step["role"].pos.y), step["name"]
+
+
+def _claimed_upgrade_steps(state: "MatchState", exclude_role_id=None) -> Counter:
+    """别人已认领、但还没买到券的武器/基地升级任务，按 (目标坐标, 券名) 计数。已买到的算在 covered 里。"""
+    roles = {r.id: r for r in state.team_our.roles}
+    claimed = Counter()
+    for rid, job in state.worker_item_jobs.items():
+        if rid == exclude_role_id or job.get("kind") not in ("weapon", "station"):
+            continue
+        holder = roles.get(rid)
+        if holder is not None and job.get("item") in (holder.backpack or []):
+            continue
+        claimed[(tuple(job["target"]), job.get("item"))] += 1
+    return claimed
+
+
+def _open_upgrade_steps(state: "MatchState", exclude_role_id=None):
+    """按顺序列出还需要有人去买的步骤：没被已买券抵扣、也没被别人认领。"""
+    steps, _surplus = upgrade_plan(state)
+    claimed = _claimed_upgrade_steps(state, exclude_role_id)
+    open_steps = []
+    for step in steps:
+        if step["covered"]:
+            continue
+        key = _step_key(step)
+        if claimed[key]:
+            claimed[key] -= 1
+            continue
+        open_steps.append(step)
+    return open_steps
+
+
+def next_upgrade_step(state: "MatchState", exclude_role_id=None):
+    """下一个该买券的升级步骤（按顺序，跳过已买未用和别人正在买的）。"""
+    open_steps = _open_upgrade_steps(state, exclude_role_id)
+    return open_steps[0] if open_steps else None
+
+
+def upgrade_batch_size(state: "MatchState", name: str, exclude_role_id=None) -> int:
+    """从下一个待买步骤起，连续需要同一种券的步骤数：按顺序一次买够这一段。"""
+    count = 0
+    for step in _open_upgrade_steps(state, exclude_role_id):
+        if step["name"] != name:
+            break
+        count += 1
+    return max(1, count)
 
 
 def structure_priority_day(state: "MatchState") -> bool:
@@ -435,21 +496,6 @@ def station_voucher_use_now(state: "MatchState") -> bool:
     return cycle >= DAY_NIGHT_CYCLE - 2
 
 
-def defer_new_weapon_for_station(state: "MatchState") -> bool:
-    """基地券已成为当前优先级且买得起/已持券时，新的武器升级让位。"""
-    if not (structure_priority_day(state) or station_low_health_upgrade_pending(state)):
-        return False
-    station = own_station(state)
-    if not station or (station.level or 1) >= 2:
-        return False
-    name, _ = voucher_for("station", station.level or 1)
-    if any(name in r.backpack for r in state.team_our.roles if r.health > 0):
-        return True
-    if any(job.get("kind") == "station" for job in state.worker_item_jobs.values()):
-        return True
-    return (state.team_our.gold_num or 0) >= item_cost(name, state)
-
-
 def all_weapons_level_at_least(state: "MatchState", level: int, need: int = 3) -> bool:
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     return len(weapons) >= need and all((w.level or 1) >= level for w in weapons)
@@ -470,14 +516,23 @@ def station_low_health_upgrade_pending(state: "MatchState") -> bool:
 
 
 def station_first_upgrade_pending(state: "MatchState") -> bool:
-    """第一门火箭到 3 级后，先把基地升一次（1→2）。"""
+    """升级顺序走到基地 1→2：前面的步骤都已完成、已买券或有人在买，基地这一步还没买券。"""
     station = own_station(state)
     if not station or (station.level or 1) >= 2:
         return False
-    rockets = _ordered_rockets(state)
-    if len(rockets) < 2:
+    steps, _surplus = upgrade_plan(state)
+    claimed = _claimed_upgrade_steps(state)
+    for step in steps:
+        if step["kind"] == "station":
+            return not step["covered"]
+        key = _step_key(step)
+        if step["covered"]:
+            continue
+        if claimed[key]:
+            claimed[key] -= 1
+            continue
         return False
-    return (rockets[0].level or 1) >= 3
+    return False
 
 
 def station_l2_upgrade_pending(state: "MatchState") -> bool:
@@ -550,8 +605,8 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
     from .opening import REQUIRED_OPENING_UPGRADES, critical_wall_missing
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     l2 = sum((w.level or 1) >= 2 for w in weapons)
-    if defer_new_weapon_for_station(state):
-        return False
+    if station_first_upgrade_pending(state):
+        return False  # 升级顺序已走到基地这一步
     if any((w.level or 1) < 2 for w in weapons):
         if day <= 0:
             return l2 < REQUIRED_OPENING_UPGRADES
@@ -633,8 +688,8 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     old_job = state.worker_item_jobs.get(role.id)
     item_name = old_job.get('item', '') if old_job else ''
     if old_job and item_name not in role.backpack:
-        remaining = pending_targets - {tuple(old_job['target'])}
-        weapon_due = _pick_upgradeable(state, WEAPON_TYPES, remaining, max_current_level=1)
+        plan_next = next_upgrade_step(state, exclude_role_id=role.id)
+        weapon_due = plan_next["role"] if plan_next and plan_next["kind"] == "weapon" and plan_next["core"] else None
         is_repair = item_name == 'WallFixer'
         wall_or_station_upgrade = (
             old_job.get('kind') == 'station'
@@ -650,19 +705,12 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
                   old_kind=old_job.get('kind'), weapon_id=weapon_due.id)
             del state.worker_item_jobs[role.id]
             pending_targets.discard(tuple(old_job['target']))
-        elif old_job.get('kind') == 'weapon' and weapon_due and allow_weapon:
-            current = next((r for r in state.team_our.roles
-                            if (r.pos.x, r.pos.y) == tuple(old_job['target']) and r.role_type in WEAPON_TYPES), None)
-            if current and (
-                (weapon_due.level or 1, _WEAPON_UPGRADE_ORDER.get(weapon_due.role_type, 99),
-                 _weapon_front_key(state, weapon_due), weapon_due.id)
-                < (current.level or 1, _WEAPON_UPGRADE_ORDER.get(current.role_type, 99),
-                   _weapon_front_key(state, current), current.id)
-            ):
-                trace(state, role.id, 'upgrade_job_preempted', '未购入的武器升级让位于更靠前或更低级的火箭炮',
-                      old_kind=current.role_type, weapon_id=weapon_due.id)
-                del state.worker_item_jobs[role.id]
-                pending_targets.discard(tuple(old_job['target']))
+        elif (old_job.get('kind') == 'weapon' and plan_next is not None
+              and (tuple(old_job['target']), item_name) != _step_key(plan_next)):
+            trace(state, role.id, 'upgrade_job_preempted', '未购入的武器任务不是升级顺序上的下一步，重新按顺序领取',
+                  old_item=item_name, next_item=plan_next["name"], next_target=plan_next["role"].id)
+            del state.worker_item_jobs[role.id]
+            pending_targets.discard(tuple(old_job['target']))
         elif (station_first_upgrade_pending(state) and old_job.get('kind') != 'station'):
             trace(state, role.id, 'upgrade_job_preempted',
                   '未购入的其它升级让位于三炮二级后的首次升基地',
@@ -682,54 +730,13 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     if role.id in state.worker_item_jobs:
         return
 
-    held_weapon_voucher = any(
-        isinstance(item, str) and item.startswith("WeaponUpgradeVoucher")
-        for item in (role.backpack or [])
-    )
-    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
-    if (weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state))
-            and ((weapon.level or 1) <= 1 or (
-                weapon.role_type == "rocket"
-                and (weapon.level or 1) == 2
-                and not station_first_upgrade_pending(state)
-            ))):
-        name, cost = voucher_for("weapon", weapon.level or 1)
-        if name in role.backpack:
-            adjacent = [
-                r for r in state.team_our.roles
-                if r.role_type in WEAPON_TYPES
-                and (r.pos.x, r.pos.y) not in pending_targets
-                and (r.level or 1) <= 1
-                and voucher_for("weapon", r.level or 1)[0] == name
-                and chebyshev(role.pos, r.pos) <= 1
-            ]
-            if adjacent:
-                weapon = min(adjacent, key=lambda r: (_weapon_front_key(state, r), r.level or 1, r.id))
-        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
-        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
-            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定武器升级目标，当前金币不足，禁止改做低优先级消费',
-                  weapon_id=weapon.id, current_level=weapon.level or 1,
-                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
-                  next_level=(weapon.level or 1) + 1)
-        return
-
-    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
-    if (weapon and allow_weapon and (weapon.level or 1) >= 2
-            and not _level3_weapon_job_pending(state)
-            and not station_first_upgrade_pending(state)):
-        name, cost = voucher_for("weapon", weapon.level or 1)
-        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
-        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
-            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定首门三级火箭，当前金币不足，禁止改做低优先级消费',
-                  weapon_id=weapon.id, current_level=weapon.level or 1,
-                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
-                  next_level=(weapon.level or 1) + 1)
+    step = next_upgrade_step(state, exclude_role_id=role.id)
+    if step and step["kind"] == "weapon" and step["core"] and allow_weapon:
+        _assign_weapon_step(role, state, step)
         return
 
     station = own_station(state)
     if station_l2_upgrade_pending(state):
-        if _level3_weapon_job_pending(state):
-            return
         if not station or (station.pos.x, station.pos.y) in pending_targets:
             return
         buyer = station_first_buyer(state)
@@ -757,31 +764,12 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             state.worker_item_jobs[role.id] = {"item": name, "target": (wall.pos.x, wall.pos.y), "kind": "wall"}
             return
 
-    weapon = _pick_weapon_upgrade_chain_target(state, pending_targets)
-    if (weapon and allow_weapon and (held_weapon_voucher or not defer_new_weapon_for_station(state))
-            and (weapon.level or 1) >= 2 and not _level3_weapon_job_pending(state)):
-        name, cost = voucher_for("weapon", weapon.level or 1)
-        if name in role.backpack:
-            adjacent = [
-                r for r in state.team_our.roles
-                if r.role_type in WEAPON_TYPES
-                and (r.pos.x, r.pos.y) not in pending_targets
-                and (r.level or 1) == 2
-                and voucher_for("weapon", r.level or 1)[0] == name
-                and chebyshev(role.pos, r.pos) <= 1
-            ]
-            if adjacent:
-                weapon = min(adjacent, key=lambda r: (_weapon_front_key(state, r), r.level or 1, r.id))
-        state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
-        if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
-            trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定武器升级目标，当前金币不足，禁止改做低优先级消费',
-                  weapon_id=weapon.id, current_level=weapon.level or 1,
-                  available_gold=state.team_our.gold_num, required_gold=item_cost(name, state),
-                  next_level=(weapon.level or 1) + 1)
+    step = next_upgrade_step(state, exclude_role_id=role.id)
+    if step and step["kind"] == "weapon" and allow_weapon:
+        _assign_weapon_step(role, state, step)
         return
 
     if (allow_structure_upgrade and station and (station.level or 1) < 3
-            and not _level3_weapon_job_pending(state)
             and (station.pos.x, station.pos.y) not in pending_targets):
         name, cost = voucher_for("station", station.level or 1)
         from .treasure import shop_buy_allowed
@@ -802,11 +790,20 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
 
 
 def held_weapon_voucher_target(role: Role, state: "MatchState", pending_targets: set):
-    """手里的武器券能用在哪门武器上：券等级要和武器当前等级一致（券1→1级，券2→2级）。
-    身边一格内能直接用的优先，其次火箭、离自己近、靠前的。返回 (券名, 武器) 或 None。"""
-    held = [item for item in (role.backpack or [])
-            if isinstance(item, str) and item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")]
-    for name in sorted(set(held)):
+    """手里的武器券用在哪门武器上：按升级顺序，找已被这张券抵扣、且武器现在就到了对应等级的那一步。
+    按顺序完全用不上的多余券，才兜底给身边/最近的同级武器。返回 (券名, 武器) 或 None。"""
+    names = {item for item in (role.backpack or [])
+             if isinstance(item, str) and item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")}
+    if not names:
+        return None
+    steps, surplus = upgrade_plan(state)
+    for step in steps:
+        weapon = step["role"]
+        if (step["kind"] == "weapon" and step["covered"] and step["name"] in names
+                and (weapon.level or 1) == step["level"]
+                and (weapon.pos.x, weapon.pos.y) not in pending_targets):
+            return step["name"], weapon
+    for name in sorted(n for n in names if surplus[n] > 0):
         level = 1 if name.endswith("1") else 2
         candidates = [
             r for r in state.team_our.roles
@@ -822,6 +819,15 @@ def held_weapon_voucher_target(role: Role, state: "MatchState", pending_targets:
     return None
 
 
+def _assign_weapon_step(role: Role, state: "MatchState", step: dict) -> None:
+    weapon, name = step["role"], step["name"]
+    state.worker_item_jobs[role.id] = {"item": name, "target": (weapon.pos.x, weapon.pos.y), "kind": "weapon"}
+    if name not in role.backpack and state.team_our.gold_num < item_cost(name, state):
+        trace(state, role.id, 'weapon_upgrade_funding_gap', '已锁定升级顺序上的下一步，当前金币不足，禁止改做低优先级消费',
+              weapon_id=weapon.id, current_level=weapon.level or 1, step_level=step["level"],
+              available_gold=state.team_our.gold_num, required_gold=item_cost(name, state))
+
+
 def _weapon_job_level_mismatch(state: "MatchState", job: dict) -> bool:
     """武器任务的券和目标武器等级对不上（被别人先升了），券用不出去。"""
     if job.get("kind") != "weapon":
@@ -831,8 +837,8 @@ def _weapon_job_level_mismatch(state: "MatchState", job: dict) -> bool:
                    if r.role_type in WEAPON_TYPES and (r.pos.x, r.pos.y) == (x, y)), None)
     if weapon is None:
         return False
-    need = "WeaponUpgradeVoucher1" if (weapon.level or 1) == 1 else "WeaponUpgradeVoucher2"
-    return (weapon.level or 1) >= 3 or job.get("item") != need
+    item_level = 1 if job.get("item") == "WeaponUpgradeVoucher1" else 2
+    return (weapon.level or 1) > item_level
 
 
 def _job_target_still_exists(state: "MatchState", job: dict) -> bool:
@@ -871,13 +877,9 @@ def _batch_buy_quantity(role: Role, state: "MatchState", job: dict) -> int:
     pending = _pending_item_job_targets(state)
     held = _team_item_count(state, item)
     desired = 1
-    if item == "WeaponUpgradeVoucher1":
-        desired = sum(
-            1 for w in state.team_our.roles
-            if w.role_type in WEAPON_TYPES and w.health > 0 and (w.level or 1) <= 1
-        )
-    elif item == "WeaponUpgradeVoucher2":
-        desired = 1
+    if item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2"):
+        # 升级计划已经扣掉全队已买未用的券，这里不再减。
+        return max(1, min(upgrade_batch_size(state, item, exclude_role_id=role.id), affordable, free))
     elif item == "StationUpgradeVoucher1":
         station = own_station(state)
         desired = 1 if station and (station.level or 1) <= 1 else 0
@@ -907,7 +909,7 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         trace(state, role.id, "job_target_missing", "道具任务目标建筑已不存在，释放任务")
         del state.worker_item_jobs[role.id]
         return None
-    if _weapon_job_level_mismatch(state, job):
+    if job.get("item") in role.backpack and _weapon_job_level_mismatch(state, job):
         trace(state, role.id, "weapon_job_level_mismatch", "目标武器等级已变，券对不上，重新挑同级武器")
         del state.worker_item_jobs[role.id]
         maybe_start_shop_item_job(role, state)

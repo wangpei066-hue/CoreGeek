@@ -451,7 +451,8 @@ class HeldVoucherAndNightRouteTests(unittest.TestCase):
         from src.agent.brain import maybe_start_shop_item_job
         # 编制顺序：火箭A、电磁炮、火箭B；两门火箭已 2 级，升级链下一步要 2 级券
         state = _slot_layout_state(150, levels=(2, 1, 2), station_level=1)
-        worker = make_role(1, 5, 5, 'worker', back_pack_capability=100, backpack=['WeaponUpgradeVoucher1'])
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.backpack = ['WeaponUpgradeVoucher1']
         maybe_start_shop_item_job(worker, state)
         job = state.worker_item_jobs[1]
         self.assertEqual(job['item'], 'WeaponUpgradeVoucher1')
@@ -480,3 +481,33 @@ class HeldVoucherAndNightRouteTests(unittest.TestCase):
         commands = self.decide(state)
         step = commands[worker.id]['targetPos'][0]
         self.assertNotIn((step['x'], step['y']), night_danger_cells(state, include_front=False))
+
+
+class ChainVoucherTests(unittest.TestCase):
+    def test_batch_follows_plan_and_counts_team_held_vouchers(self):
+        from src.agent.brain import next_upgrade_step, upgrade_batch_size
+        state = _slot_layout_state(150, levels=(1, 1, 1))  # 火箭A、电磁炮、火箭B
+        self.assertEqual(upgrade_batch_size(state, 'WeaponUpgradeVoucher1'), 2)  # 电磁炮的券等轮到再买
+        state = _slot_layout_state(150, levels=(2, 1, 1))
+        self.assertEqual(upgrade_batch_size(state, 'WeaponUpgradeVoucher1'), 1)
+        # 有人已买了火箭A升3级的券还没用：下一步直接买基地券
+        state = _slot_layout_state(150, levels=(2, 1, 2))
+        next(r for r in state.team_our.roles if r.id == 2).backpack = ['WeaponUpgradeVoucher2']
+        step = next_upgrade_step(state)
+        self.assertEqual(step['name'], 'StationUpgradeVoucher1')
+        # 基地升好后：火箭B升3级，接着电磁炮 1→2
+        state = _slot_layout_state(150, levels=(3, 1, 2), station_level=2)
+        self.assertEqual(next_upgrade_step(state)['name'], 'WeaponUpgradeVoucher2')
+        state = _slot_layout_state(150, levels=(3, 1, 3), station_level=2)
+        self.assertEqual(upgrade_batch_size(state, 'WeaponUpgradeVoucher1'), 1)
+
+    def test_held_voucher_follows_chain_order(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = _slot_layout_state(150, levels=(1, 1, 1))
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        worker = make_role(1, railgun.pos.x - 1, railgun.pos.y, 'worker',
+                           back_pack_capability=100, backpack=['WeaponUpgradeVoucher1'])
+        maybe_start_shop_item_job(worker, state)
+        target = tuple(state.worker_item_jobs[1]['target'])
+        kind = next(r.role_type for r in state.team_our.roles if (r.pos.x, r.pos.y) == target)
+        self.assertEqual(kind, 'rocket')  # 就站在电磁炮旁也先按顺序升火箭

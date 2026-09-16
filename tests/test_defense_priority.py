@@ -69,7 +69,7 @@ class DefensePriorityTests(unittest.TestCase):
         keeper, economist = workers[0], workers[1]
         self.assertEqual(commands[keeper.id]['name'], 'WallUpgradeVoucher1')
         self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
-        self.assertNotIn(economist.id, state.worker_item_jobs)
+        self.assertNotEqual(state.worker_item_jobs.get(economist.id, {}).get('kind'), 'wall')
 
     def test_keeper_repairs_low_front_walls_before_new_wall_backlog(self):
         state, workers = self._day_three_low_front_walls(2, round_no=270)
