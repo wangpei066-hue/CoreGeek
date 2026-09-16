@@ -357,6 +357,14 @@ def api_command_signature(command):
     return parsed.scheme, parsed.netloc, parsed.path, auth, stable
 
 
+def contradicts_stale_api_warning(task, command):
+    """Detect only command forms explicitly warned about by the task text."""
+    if not re.search(r'过时|不准确|发生变化|stale|outdated', task or '', re.IGNORECASE):
+        return False
+    return bool(re.search(r'X-API-Key|(?:^|[?&])city=|(?:^|[?&])page=',
+                         command or '', re.IGNORECASE))
+
+
 def classify_tool_error(result):
     err = str((result or {}).get('error') or '')
     if err in ('not_found', 'ambiguous_path', 'workspace_invalid', 'tool_timeout',
@@ -1849,6 +1857,16 @@ class PioneerTaskSolver:
                             and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
                         s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
                         self._fact(s, '拦截未定义凭据引用，要求LLM使用有依据的认证值')
+                        s['stage'] = 'ask'
+                        return
+                    if (s.get('taskKind') == 'api'
+                            and contradicts_stale_api_warning(
+                                state.phase_task + '\n' + '\n'.join(
+                                    str(item.get('content') or '') for item in s.get('documents') or []),
+                                command)):
+                        s['history'].append({'blocked': '命令使用了任务明确警告过时的 API 字段',
+                                             'command': command})
+                        self._fact(s, '拦截与任务过时警告冲突的API命令，要求LLM重新核对')
                         s['stage'] = 'ask'
                         return
                     if s.get('taskKind') == 'api':
