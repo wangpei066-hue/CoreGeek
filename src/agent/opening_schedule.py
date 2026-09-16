@@ -302,8 +302,29 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
     from .opening import adjacent_path
     if state.map_info is None:
         return None, None, 'no_map'
+    want = set(want_ores)
+    try:
+        from .news_memory import game_day
+        memory = getattr(state, "news_memory", None)
+        if memory is not None:
+            day = game_day(state.round_no)
+            stockpile = set(memory.ores_to_stockpile(day))
+            banned = set(memory.banned_ores(day))
+        else:
+            from .world_intel import ore_blocked, ores_to_stockpile
+            stockpile = set(ores_to_stockpile(state))
+            banned = {ore for ore in ('iron', 'copper', 'stone') if ore_blocked(state, ore)}
+    except Exception:
+        stockpile, banned = set(), set()
+    want -= banned
+    priority = (stockpile & want) - banned
+    if priority:
+        trace(state, role.id, 'news_stockpile_mine',
+              '官方消息预告后续禁采/涨价，首日经济工优先抢收对应矿石',
+              ores=sorted(priority), banned=sorted(banned))
+        want = priority
     prices = ore_prices(state)
-    known = any(prices.get(name, 0) > 0 for name in want_ores)
+    known = any(prices.get(name, 0) > 0 for name in want)
     occupied = claimed_mines(state, exclude_role_id=role.id)
     goal = _goal(state, role.id)
     sticky = None
@@ -312,7 +333,7 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
     candidates = []
     sticky_cand = None
     for mine in state.map_info.zones:
-        if mine.neutral_type not in want_ores:
+        if mine.neutral_type not in want:
             continue
         path = adjacent_path(role, mine.pos, blocked | reserved, state)
         relaxed_reserved = False
@@ -324,7 +345,7 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
         pos = (mine.pos.x, mine.pos.y)
         length = len(path)
         value = prices.get(mine.neutral_type, 0)
-        if known and value > 0 and want_ores != ('stone',):
+        if known and value > 0 and want != {'stone'}:
             value_score = (length + vendor_return_steps(mine, state, blocked, reserved)) / value
         else:
             value_score = length

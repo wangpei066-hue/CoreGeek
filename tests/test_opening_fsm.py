@@ -324,6 +324,23 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertEqual(tick2.get('goal_type'), 'wall')
         self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
 
+    def test_survival_fallback_batches_one_stone_until_ready(self):
+        """兜底施工也不能一块石头一趟墙，避免绕开 opening_wall_work 的批量规则。"""
+        from src.agent.opening import opening_worker_survival_action
+        from src.agent.opening import assign_weapons, movement_avoid, survival_wall_missing
+        state = opening_state()
+        state.round_no = 45
+        state.team_our.gold_num = 0
+        _rockets(state)
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone')]
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.backpack = ['stone']
+        blocked = build_blocked_set(state) | movement_avoid(state)
+        cmd, status = opening_worker_survival_action(
+            worker, state, blocked, set(), set(), assign_weapons(state), survival_wall_missing(state))
+        self.assertEqual(status, 'MINE_STONE')
+        self.assertIn(cmd['action'], ('move', 'collect'))
+
     def test_claimed_mine_does_not_force_large_detour(self):
         from src.agent.opening_schedule import choose_nearest_mine
         from src.agent.opening import movement_avoid
