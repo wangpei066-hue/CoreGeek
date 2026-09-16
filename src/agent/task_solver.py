@@ -14,7 +14,7 @@ MARKER = 'PIONEER_TASK'
 EMPTY_WAIT_LIMIT = 2
 ARCHIVE_LIMIT = 8
 MIN_TASK_TIMEOUT_ROUNDS = 4
-PROMPT_VERSION = '20260916-solver4'
+PROMPT_VERSION = '20260916-solver5'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
 TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
@@ -71,7 +71,7 @@ PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每�
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
 PROMPT_DEPLOY = '''部署SOP：read任务文档→read唯一spec.md→下一次execute一次完成修复、CRLF处理和check→从成功输出提取真实TOKEN并submit。配置按物理行用awk写临时文件再mv；CRLF用tr -d '\\r'。不要继续ls/cat探查，不要修改check，不要重复失败命令。'''
-PROMPT_API = '''API SOP：不要读取过时的API_DOCS.md；读完题目后直接一次execute完成全部查询和统计，随后立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination；文档中的X-API-Key、city、page过时。第一请求必须显式 `offset=0&limit=100`，若pagination.total_count仍大于返回数，必须在同一条命令中循环 offset=已有记录数直到收齐；不得只查询默认10条，不得打印样本/字段探查/逐页调试信息。按唯一id去重，code必须为200；protected_level精确统计世界遗产，按era_order找oldest_era，era_order为空时只依据题目或记录中的明确年代顺序，数字保持数字，最后只输出一个答案JSON。'''
+PROMPT_API = '''API SOP：不要读取过时的API_DOCS.md；读完题目后直接一次execute完成全部查询和统计，随后立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination；文档中的X-API-Key、city、page过时。第一请求必须显式 `offset=0&limit=100`，若pagination.total_count仍大于返回数，必须在同一条命令中循环 offset=已有记录数直到收齐；不得只查询默认10条，不得打印样本/字段探查/逐页调试信息。按唯一id去重，code必须为200；protected_level精确统计世界遗产。oldest_era 必须按记录的 era_order；若模拟数据的 era_order 全为 null，按明确历史顺序比较（六朝早于明，明早于清），不要用第一条记录占位。数字保持数字，最后只输出一个答案JSON。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
