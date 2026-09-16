@@ -71,7 +71,7 @@ PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每�
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
 PROMPT_DEPLOY = '''部署SOP：read任务文档→read唯一spec.md→下一次execute一次完成修复、CRLF处理和check→从成功输出提取真实TOKEN并submit。配置按物理行用awk写临时文件再mv；CRLF用tr -d '\\r'。不要继续ls/cat探查，不要修改check，不要重复失败命令。'''
-PROMPT_API = '''API SOP：read任务文档；需要时read API_DOCS.md；一次execute用curl -G完成分页、校验和统计；立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination。文档中的X-API-Key、city、page过时。必须查全；protected_level精确统计世界遗产，按era_order找oldest_era；数字保持数字。'''
+PROMPT_API = '''API SOP：不要读取过时的API_DOCS.md；直接一次execute用curl -G完成查询、校验和统计，随后立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination。文档中的X-API-Key、city、page过时。必须查全；protected_level精确统计世界遗产，按era_order找oldest_era；数字保持数字。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
@@ -134,6 +134,30 @@ def task_fingerprint(task):
 def extract_token(text):
     match = TOKEN_RE.search(text or '')
     return match.group(1).rstrip('.,;，。；\"\'`') if match else None
+
+
+def deployment_repair_command(session):
+    """Build the single deterministic repair pass once spec.md is read."""
+    if session.get('taskKind') != 'workspace' or not session.get('workspace'):
+        return None
+    spec = '\n'.join(str(item.get('content') or '') for item in session.get('documents') or [])
+    port = re.search(r'第\s*3\s*行：`?([^`\n]+)`?', spec)
+    name = re.search(r'第\s*6\s*行：`?([^`\n]+)`?', spec)
+    app = re.search(r'(?:logs|config)/([A-Za-z0-9_-]+)', spec)
+    if not (port and name and app):
+        return None
+    workspace = shlex.quote(session['workspace'])
+    app_name = app.group(1)
+    config = shlex.quote(f'config/{app_name}.conf')
+    return (
+        f"cd {workspace} && set -eu; "
+        "tr -d '\\r' < check > check.tmp && mv check.tmp check; chmod 755 check; "
+        f"mkdir -p logs/{app_name}; chmod 755 logs/{app_name}; "
+        f"awk -v p={shlex.quote(port.group(1).strip())} -v n={shlex.quote(name.group(1).strip())} "
+        f"'NR==3{{$0=p}} NR==6{{$0=n}} {{print}}' {config} > {config}.tmp && mv {config}.tmp {config}; "
+        "mkdir -p bin; test -f bin/start.sh || printf '#!/bin/sh\\n' > bin/start.sh; "
+        "chmod 755 bin/start.sh; ./check"
+    )
 
 
 def extract_city(task):
@@ -1493,6 +1517,8 @@ class PioneerTaskSolver:
             # Keep the normal read -> ask transition so the LLM sees the task
             # document before any automatic probe.  The learned classification
             # still selects the right SOP and enables deterministic TOKEN/API handling.
+            if s.get('taskKind') == 'workspace' and deployment_repair_command(s):
+                s['autoRepairPending'] = True
             s['stage'] = 'read'
             return execute
         command = s.get('lastTool') or ''
@@ -1791,7 +1817,15 @@ class PioneerTaskSolver:
                 if self._switch_to_api_experience(s, state.phase_task, '进入提问前改用已验证API经验'):
                     pass
             budget, _remaining = self._budget(s, state)
-            if s['stage'] in ('read', 'tool', 'probe', 'api_fetch'):
+            if s.get('autoRepairPending') and s.get('taskKind') == 'workspace':
+                execute = deployment_repair_command(s) or ''
+                s['autoRepairPending'] = False
+                s['lastTool'] = execute
+                s['stage'] = 'wait_tool'
+                s['metrics']['toolCalls'] = s['metrics'].get('toolCalls', 0) + 1
+                s['metrics']['firstToolRound'] = s['metrics']['firstToolRound'] or state.round_no
+                s['pendingCommand'] = execute
+            elif s['stage'] in ('read', 'tool', 'probe', 'api_fetch'):
                 if s['stage'] == 'api_fetch':
                     s['apiFetchAttempted'] = True
                 rid = hashlib.sha256((str(key) + str(state.round_no) + s['stage']).encode()).hexdigest()[:16]

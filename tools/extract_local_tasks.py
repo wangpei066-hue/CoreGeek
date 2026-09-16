@@ -140,7 +140,8 @@ def write_workspace(root: Path, app: str, number: int, spec: str) -> None:
     check.write_text(
         "#!/bin/sh\nset -eu\nfail=0\n"
         f"[ -d logs/{app} ] || fail=$((fail+1))\n"
-        f"[ \"$(stat -c %a logs/{app} 2>/dev/null || true)\" = 755 ] || fail=$((fail+1))\n"
+        f"mode=$(stat -c %a logs/{app} 2>/dev/null || stat -f %Lp logs/{app} 2>/dev/null || true)\n"
+        "[ \"$mode\" = 755 ] || fail=$((fail+1))\n"
         f"[ \"$(sed -n '3p' config/{app}.conf 2>/dev/null)\" = {json.dumps(port)} ] || fail=$((fail+1))\n"
         f"[ \"$(sed -n '6p' config/{app}.conf 2>/dev/null)\" = {json.dumps(service)} ] || fail=$((fail+1))\n"
         "[ -f bin/start.sh ] || fail=$((fail+1))\n"
