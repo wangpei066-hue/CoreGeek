@@ -1547,12 +1547,15 @@ def opening_worker_survival_action(role, state, blocked, reserved, claimed, assi
     """生存墙模式下给工人明确工作：有石修墙，无石采石，铜铁占包则清包。"""
     from .economy import go_mine, liquidate, worker_has_metal
     stones = role.backpack.count('stone')
-    if stones > 0 and missing:
+    cap = role.back_pack_capability or 0
+    full = cap and len(role.backpack) >= cap
+    batch_target = min(STONE_BATCH, cap or STONE_BATCH, len(missing)) if missing else 0
+    urgent_ready = stones > 0 and day_rounds_remaining(state.round_no) <= MUSTER_BUFFER + 6
+    batch_ready = stones >= batch_target if batch_target else stones > 0
+    if stones > 0 and missing and (full or batch_ready or urgent_ready):
         cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, assignments)
         if cmd:
             return cmd, 'BUILD_SURVIVAL_WALL'
-    cap = role.back_pack_capability or 0
-    full = cap and len(role.backpack) >= cap
     if worker_has_metal(role) and stones == 0 and full:
         if any(z.neutral_type == 'vendor' for z in (state.map_info.zones if state.map_info else [])):
             handled, cmd = liquidate(role, state, blocked, reserved)
@@ -1631,12 +1634,17 @@ def opening_worker_ensure_work(role, state, blocked, reserved, claimed, assignme
                 return None, 'HOLD_WEAPON'
         return opening_yard_wait(role, state, blocked, reserved), 'BLOCKED'
     if survival_missing:
-        if role.backpack.count('stone') > 0:
+        stones = role.backpack.count('stone')
+        cap = role.back_pack_capability or 0
+        full = cap and len(role.backpack) >= cap
+        batch_target = min(STONE_BATCH, cap or STONE_BATCH, len(missing or survival_missing)) if (missing or survival_missing) else 0
+        urgent_ready = stones > 0 and remaining <= MUSTER_BUFFER + 6
+        batch_ready = stones >= batch_target if batch_target else stones > 0
+        if stones > 0 and (full or batch_ready or urgent_ready):
             cmd = claim_opening_wall(role, state, missing or survival_missing, blocked, reserved, claimed, assignments)
             if cmd:
                 return cmd, 'BUILD_SURVIVAL_WALL'
-        cap = role.back_pack_capability or 0
-        if worker_has_metal(role) and (cap and len(role.backpack) >= cap) and role.backpack.count('stone') == 0:
+        if worker_has_metal(role) and (cap and len(role.backpack) >= cap) and stones == 0:
             handled, cmd = liquidate(role, state, blocked, reserved)
             if cmd:
                 return cmd, 'CASHOUT'

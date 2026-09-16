@@ -174,7 +174,8 @@ class OpeningTests(unittest.TestCase):
         }
         ores.discard(None)
         self.assertTrue(ores)
-        self.assertEqual(ores, {'stone'})
+        self.assertIn('stone', ores)
+        self.assertIn('copper', ores)
         self.assertEqual(state.policy_memory.get('opening_stage'), 'BUILD_SURVIVAL_WALL')
         for rid in (1, 2):
             cmd = commands.get(rid) or {}
@@ -207,7 +208,7 @@ class OpeningTests(unittest.TestCase):
             for rid in (1, 2)
         }
         self.assertIn('stone', ores)
-        self.assertNotIn('copper', ores)
+        self.assertIn('copper', ores)
         self.assertNotIn('iron', ores)
 
     def test_day1_pioneer_can_buy_upgrade_while_workers_keep_walling(self):

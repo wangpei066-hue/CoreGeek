@@ -1,0 +1,20 @@
+---
+description: Keep worker stone collection batched before wall construction
+globs: src/agent/opening*.py,src/agent/economy.py,tests/test_opening*.py
+alwaysApply: false
+---
+
+# Stone Batch Wall Building
+
+When changing worker, opening, mining, or wall-building logic, preserve the invariant:
+
+- Workers must not collect one stone, walk back to build one wall, then return to the mine.
+- A worker should switch from stone mining to wall building only when one of these is true:
+  - backpack is full,
+  - carried stone reaches the batch target, usually `min(STONE_BATCH, backpack capacity, remaining wall gaps)`,
+  - reachable stone mines are exhausted or blocked,
+  - the night/defense deadline is close enough that waiting for a full batch would miss the build window.
+- This applies to both the main opening path (`opening_wall_work`) and fallback paths such as
+  `opening_worker_survival_action` and `opening_worker_ensure_work`.
+- If adding a new fallback or emergency wall path, add or update tests proving that one carried stone
+  continues mining early in the day and only builds once the batch/deadline condition is met.

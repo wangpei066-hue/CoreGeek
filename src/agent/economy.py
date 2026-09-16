@@ -539,6 +539,21 @@ def sellable_ores(role, state, dump_extra_stone=False):
     from .brain import own_station
     from .opening import staged_wall_plan
     ores = Counter(i for i in role.backpack if i in ('stone', 'iron', 'copper'))
+    try:
+        from .news_memory import game_day
+        memory = getattr(state, "news_memory", None)
+        if memory is not None:
+            day = game_day(state.round_no)
+            stockpile = set(memory.ores_to_stockpile(day))
+            price_up = set(memory.price_boosted_ores(day))
+        else:
+            from .world_intel import ores_to_stockpile, ores_in_spike
+            stockpile = set(ores_to_stockpile(state))
+            price_up = set(ores_in_spike(state))
+    except Exception:
+        stockpile, price_up = set(), set()
+    for ore in stockpile - price_up:
+        ores[ore] = 0
     base = own_station(state)
     reserve = 0
     if base and role.role_type == 'worker':
@@ -608,12 +623,17 @@ def liquidate(role, state, blocked, reserved):
     from .brain import should_upgrade_weapon
     from .opening import OPENING_METAL_BATCH, day_rounds_remaining, live_l2_weapon_count, REQUIRED_OPENING_UPGRADES, survival_walls_locked
     try:
-        from .world_intel import ores_to_stockpile
-        news_dump_ores = set(ores) & set(ores_to_stockpile(state))
+        from .news_memory import game_day
+        memory = getattr(state, "news_memory", None)
+        if memory is not None:
+            news_sell_ores = set(ores) & set(memory.price_boosted_ores(game_day(state.round_no)))
+        else:
+            from .world_intel import ores_in_spike
+            news_sell_ores = set(ores) & set(ores_in_spike(state))
     except Exception:
-        news_dump_ores = set()
-    if news_dump_ores:
-        triggers.append('官方消息预告该矿即将停工/受限，窗口前先卖掉')
+        news_sell_ores = set()
+    if news_sell_ores:
+        triggers.append('官方消息显示该矿今日涨价，优先卖出囤货')
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
     need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
     gap = voucher_funding_gap(state)
@@ -947,6 +967,26 @@ def profitable_mine(role, state, blocked, reserved):
         return None
     skip_stone = stones_cover_wall_plan(state)
     want = {'iron', 'copper'}
+    try:
+        from .news_memory import game_day
+        memory = getattr(state, "news_memory", None)
+        if memory is not None:
+            day = game_day(state.round_no)
+            stockpile = set(memory.ores_to_stockpile(day))
+            banned = set(memory.banned_ores(day))
+        else:
+            from .world_intel import ore_blocked, ores_to_stockpile
+            stockpile = set(ores_to_stockpile(state))
+            banned = {ore for ore in ('iron', 'copper', 'stone') if ore_blocked(state, ore)}
+    except Exception:
+        stockpile, banned = set(), set()
     if not skip_stone:
         want.add('stone')
+    want -= banned
+    priority = (stockpile & {'iron', 'copper', 'stone'}) - banned
+    if priority:
+        want = priority
+        trace(state, role.id, 'news_stockpile_mine',
+              '官方消息预告后续禁采/涨价，今天优先抢收对应矿石',
+              ores=sorted(priority), banned=sorted(banned))
     return go_mine(role, state, blocked, reserved, want_ores=want, purpose='income')
