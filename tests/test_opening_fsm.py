@@ -172,7 +172,11 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertEqual(fund_rows, [])
         wall_rows = [r for r in trail if r['stage'] == STAGE_WALL]
         self.assertTrue(wall_rows)
-        self.assertEqual([r for r in wall_rows if r['goal_type'] in ('copper', 'iron')], [])
+        builder_rows = [r for r in wall_rows if r['worker_id'] == 1]
+        economist_rows = [r for r in wall_rows if r['worker_id'] == 2]
+        self.assertTrue(any(r['goal_type'] in ('stone', 'wall') for r in builder_rows))
+        self.assertTrue(any(r['goal_type'] in ('copper', 'iron', 'vendor', 'weaponShop', 'rocket')
+                            for r in economist_rows))
         self.assertEqual(len(illegal_switches(trail)), 0)
         self.assertTrue(any(r.get('switch_reason') == 'batch_not_ready' for r in wall_rows))
         self.assertTrue(any(r.get('switch_reason') == 'batch_ready' for r in wall_rows))
@@ -199,7 +203,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertIn(STAGE_WALL, stages)
         self.assertNotIn(STAGE_FUND, stages)
         wall_metal = [r for r in trail if r['stage'] == STAGE_WALL and r['goal_type'] in ('copper', 'iron')]
-        self.assertEqual(wall_metal, [])
+        self.assertTrue(wall_metal)
         self.assertTrue(any(r['stage'] == STAGE_WALL and r['goal_type'] in ('stone', 'wall', 'yard') for r in trail))
         self.assertTrue(any(r['stage'] == STAGE_MUSTER for r in trail))
         self.assertEqual(len(illegal_switches(trail)), 0)
@@ -411,8 +415,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(2, 9), 0, 10, 10, True)]
 
         trail = run_opening(state, 15)  # trail 只记录工人(1,2)，天然排除开拓者
-        bought_by_worker = any(row['action'] == 'buy' for row in trail)
-        self.assertFalse(bought_by_worker, format_trail(trail))
+        bought_by_worker = any(row['worker_id'] == 2 and row['action'] == 'buy' for row in trail)
+        self.assertTrue(bought_by_worker, format_trail(trail))
         self.assertTrue(any(row['stage'] == STAGE_WALL and row['goal_type'] in ('stone', 'wall')
                             for row in trail), format_trail(trail))
 

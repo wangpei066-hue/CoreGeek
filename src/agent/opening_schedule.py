@@ -23,6 +23,7 @@ GOAL_STALL_ROUNDS = 3
 MINE_CLEARLY_CLOSER_STEPS = 2
 CLAIMED_MINE_MAX_DETOUR = 3
 WORKER_GOALS_KEY = 'opening_worker_goals'
+WORKER_ROLES_KEY = 'opening_worker_roles'
 
 
 def opening_cycle(state):
@@ -162,6 +163,62 @@ def _clear_goals_for_stage_change(state):
         if role.role_type == 'worker':
             clear_mine_target(state, role.id)
     (state.policy_memory.get('opening_wall_targets') or {}).clear()
+
+
+def opening_worker_roles(state):
+    """首日固定分工：一名施工工，一名经济工；成员死亡时自动重选。"""
+    workers = sorted(
+        (r for r in (state.team_our.roles if state.team_our else [])
+         if r.role_type == 'worker' and r.health > 0),
+        key=lambda r: r.id,
+    )
+    existing = state.policy_memory.get(WORKER_ROLES_KEY)
+    alive_ids = {w.id for w in workers}
+    if isinstance(existing, dict):
+        builder = existing.get('builder')
+        economist = existing.get('economist')
+        if builder in alive_ids and (economist in alive_ids or economist is None):
+            return existing
+    roles = {'builder': None, 'economist': None}
+    if workers:
+        roles['builder'] = workers[0].id
+    if len(workers) >= 2:
+        roles['economist'] = workers[1].id
+    state.policy_memory[WORKER_ROLES_KEY] = roles
+    trace(state, None, 'opening_worker_roles', '首日工人固定分工：施工工负责武器/墙，经济工负责采卖矿和升级券',
+          builder=roles['builder'], economist=roles['economist'])
+    return roles
+
+
+def opening_worker_mode(state, role):
+    if role.role_type != 'worker':
+        return None
+    roles = opening_worker_roles(state)
+    if role.id == roles.get('builder'):
+        return 'builder'
+    if role.id == roles.get('economist'):
+        return 'economist'
+    return 'backup'
+
+
+def economist_should_help_wall(state, remaining, role):
+    """压力窗口或施工工不可用时，经济工接管最低墙，避免分工变成硬锁死。"""
+    if role.role_type != 'worker':
+        return False
+    roles = opening_worker_roles(state)
+    builder = next((r for r in (state.team_our.roles if state.team_our else [])
+                    if r.id == roles.get('builder') and r.health > 0), None)
+    if builder is None or builder.id == role.id:
+        return True
+    from .opening import MUSTER_BUFFER, survival_wall_missing
+    missing = survival_wall_missing(state)
+    if not missing:
+        return False
+    if day1_wall_floor_met(state):
+        return False
+    if remaining <= MUSTER_BUFFER + 12:
+        return True
+    return False
 
 
 def _store_goal(state, role, stage, kind, target_type, target_pos, distance, stalled, switch_reason,
@@ -554,22 +611,24 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
 
 
 def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments,
-                      excluded_buyer_ids=()):
+                      excluded_buyer_ids=(), stage_label=STAGE_FUND, preferred_buyer_id=None):
     if 'WeaponUpgradeVoucher1' in (role.backpack or []):
-        return opening_apply_voucher(role, state, blocked, reserved, STAGE_FUND)
-    buyer = _voucher_buyer_id(state, gold, cost, excluded_ids=excluded_buyer_ids)
+        return opening_apply_voucher(role, state, blocked, reserved, stage_label)
+    buyer = preferred_buyer_id if preferred_buyer_id is not None else _voucher_buyer_id(
+        state, gold, cost, excluded_ids=excluded_buyer_ids)
     trace(state, role.id, 'voucher_buyer_status', '筹资阶段查看本回合买家判定',
           gold=gold, cost=cost, buyer_id=buyer, is_buyer=(role.id == buyer),
-          excluded_ids=sorted(excluded_buyer_ids))
+          excluded_ids=sorted(excluded_buyer_ids), preferred_buyer_id=preferred_buyer_id,
+          worker_mode=opening_worker_mode(state, role), stage_label=stage_label)
     goal = _goal(state, role.id)
-    if (goal and goal.get('kind') == 'vendor' and goal.get('stage') == STAGE_FUND
+    if (goal and goal.get('kind') == 'vendor' and goal.get('stage') == stage_label
             and _metal_count(role) and gold < cost):
-        cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_FUND, 'sticky')
+        cmd = opening_sell_metal(role, state, blocked, reserved, stage_label, 'sticky')
         if cmd:
             return cmd
     if gold >= cost:
         if role.id == buyer:
-            cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_FUND, 'gold_ready')
+            cmd = opening_shop_voucher(role, state, blocked, reserved, stage_label, 'gold_ready')
             if cmd:
                 return cmd
         elif helper_walls and role.role_type == 'worker':
@@ -585,7 +644,7 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
     known = any(prices.get(n, 0) > 0 for n in ('copper', 'iron'))
     covers = known and gold + team_metal_inventory_value(state) >= cost
     if _metal_count(role) and (_backpack_full(role) or covers):
-        cmd = opening_sell_metal(role, state, blocked, reserved, STAGE_FUND,
+        cmd = opening_sell_metal(role, state, blocked, reserved, stage_label,
                                  'backpack_full' if _backpack_full(role) else 'gold_ready')
         if cmd:
             return cmd
@@ -597,11 +656,11 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
         target = (mine.pos.x, mine.pos.y)
         if path:
             return opening_move(state, role, path, reserved, target, '前往最近可达铜铁',
-                                'mine', mine.neutral_type, reason, STAGE_FUND)
+                                'mine', mine.neutral_type, reason, stage_label)
         cmd = selected(state, role.id, {
             'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
         }, '采集铜铁')
-        return _tick(state, role, STAGE_FUND, 'mine', mine.neutral_type, target, 0, 'collect', reason, cmd)
+        return _tick(state, role, stage_label, 'mine', mine.neutral_type, target, 0, 'collect', reason, cmd)
     trace(state, role.id, 'no_reachable_metal', '筹资阶段没有可达铜铁')
     return None
 
@@ -626,8 +685,9 @@ def _voucher_buyer_id(state, gold, cost, excluded_ids=()):
 
 
 def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls,
-                          excluded_buyer_ids=()):
+                          excluded_buyer_ids=(), remaining=None):
     from .tactics import imminent_contact
+    worker_mode = opening_worker_mode(state, role)
     if imminent_contact(state) and stage != STAGE_BUILD_WEAPONS:
         cmd = opening_muster(role, state, blocked, reserved, assignments, STAGE_MUSTER)
         if cmd:
@@ -638,6 +698,18 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
         if role.role_type != 'worker':
             from .opening import pioneer_stay_clear
             return pioneer_stay_clear(role, state, blocked, reserved, assignments)
+        if worker_mode == 'economist':
+            trace(state, role.id, 'opening_split_economist',
+                  '首日分工：经济工不抢建炮，先采卖铜铁并准备第一张升级券',
+                  stage=stage, available_gold=gold, required_gold=cost)
+            cmd = opening_fund_work(
+                role, state, blocked, reserved, gold, cost, helper_walls=False,
+                claimed=claimed, assignments=assignments, excluded_buyer_ids=excluded_buyer_ids,
+                stage_label=STAGE_BUILD_WEAPONS, preferred_buyer_id=role.id)
+            if cmd:
+                return cmd
+            trace(state, role.id, 'opening_split_economist_fallback',
+                  '经济工当前没有可达铜铁或买券路径，临时帮忙补建武器')
         cmd, _gold = opening_build_weapon(role, state, blocked, reserved, claimed, gold)
         return cmd
     if stage == STAGE_FUND:
@@ -676,8 +748,21 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
                       '生存墙阶段金币不足，开拓者不抢工人采矿，只等待任务金币或墙后备用',
                       available_gold=gold, required_gold=cost)
             return opening_muster(role, state, blocked, reserved, assignments, STAGE_WALL)
+        if (worker_mode == 'economist' and 'stone' not in (role.backpack or [])
+                and not economist_should_help_wall(state, remaining or 70, role)):
+            trace(state, role.id, 'opening_split_economist',
+                  '首日分工：经济工继续采卖矿/买券，施工工负责生存墙',
+                  stage=stage, available_gold=gold, required_gold=cost)
+            return opening_fund_work(
+                role, state, blocked, reserved, gold, cost, helper_walls=False,
+                claimed=claimed, assignments=assignments, excluded_buyer_ids=excluded_buyer_ids,
+                stage_label=STAGE_WALL, preferred_buyer_id=role.id)
+        if worker_mode == 'economist':
+            trace(state, role.id, 'opening_split_economist_wall_help',
+                  '墙压迫或施工工不可用，经济工临时接管生存墙',
+                  stage=stage, remaining=remaining, wall_floor_met=day1_wall_floor_met(state))
         wall_floor_met = day1_wall_floor_met(state)
-        if wall_floor_met and gold >= cost:
+        if worker_mode != 'builder' and wall_floor_met and gold >= cost:
             trace(state, role.id, 'worker_wall_stage_voucher_attempt',
                   '生存墙阶段墙数已达标且金币够，尝试并行买券（无买家协调，可能多人同时去买）',
                   available_gold=gold, required_gold=cost)
@@ -800,7 +885,7 @@ def plan_opening_fsm(state):
                 continue
         cmd = dispatch_opening_role(
             role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls,
-            excluded_buyer_ids=task_pioneers)
+            excluded_buyer_ids=task_pioneers, remaining=remaining)
         if cmd:
             if cmd.get('action') == 'buy':
                 gold -= item_cost(cmd.get('name') or 'WeaponUpgradeVoucher1', state)
