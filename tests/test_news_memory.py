@@ -6,7 +6,7 @@ from pathlib import Path
 
 from src.agent.news_memory import (
     NewsMemory, game_day, heuristic_ore_effect, heuristic_ore_effects, vendor_prices,
-    legend_mentions_open_time,
+    legend_mentions_open_time, merge_ore_effect, is_resume_official,
 )
 from src.agent.prompt_router import PromptRouter, parse_json_object, make_treasure_prompt
 from src.agent.protocol import MatchState, MapInfo, TeamOur, WorldNews, ShopItem, Zone, Pos, Role
@@ -76,6 +76,62 @@ class NewsMemoryTests(unittest.TestCase):
         ores = {row["affectedOre"]: row["mineBannedDays"] for row in effects}
         self.assertEqual(ores["iron"], [2, 3])
         self.assertEqual(ores["copper"], [2, 3])
+
+    def test_merge_ore_effect_keeps_prior_window_on_status_update(self):
+        previous = {
+            "affectedOre": "iron",
+            "mineBannedDays": [3, 4],
+            "priceUpDays": [3, 4],
+            "source": "llm",
+            "publishedDay": 2,
+        }
+        incoming = {
+            "affectedOre": "iron",
+            "mineBannedDays": [3],
+            "priceUpDays": [3],
+            "notes": "仍在修复",
+            "source": "llm",
+            "publishedDay": 3,
+        }
+        merged = merge_ore_effect(previous, incoming, resume=False)
+        self.assertEqual(merged["mineBannedDays"], [3, 4])
+        self.assertEqual(merged["priceUpDays"], [3, 4])
+        cleared = merge_ore_effect(previous, {
+            "affectedOre": "iron", "mineBannedDays": [], "priceUpDays": [],
+            "notes": "恢复", "source": "llm", "publishedDay": 5,
+        }, resume=True)
+        self.assertEqual(cleared["mineBannedDays"], [])
+        self.assertTrue(is_resume_official("铁矿区修复工程完成，即日起恢复开采。"))
+
+    def test_status_update_llm_merges_with_memory(self):
+        state = self._state(131, official=IRON_COLLAPSE)
+        self.memory.ingest(state)
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [3, 4],
+            "priceUpDays": [3, 4],
+            "notes": "明日停工2天",
+        }, published_day=2)
+        self.assertEqual(self.memory.banned_ores(3), {"iron"})
+        self.assertEqual(self.memory.banned_ores(4), {"iron"})
+
+        state = self._state(261, official="铁矿区修复工程仍在进行中，修复过程中无法采集铁矿")
+        self.memory.ingest(state)
+        self.assertEqual(len(self.memory.data["officialHistory"]), 2)
+        # pending plan 仍应带着旧窗，不能清空记忆
+        plan = self.memory.store_official_plan(261)
+        self.assertEqual(plan["oreEffects"][0]["mineBannedDays"], [3, 4])
+        self.assertEqual(plan["bannedOres"], ["iron"])
+
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [3],
+            "priceUpDays": [3],
+            "notes": "只写了今天",
+        }, published_day=3)
+        effect = self.memory.data["oreEffects"][0]
+        self.assertEqual(effect["mineBannedDays"], [3, 4])
+        self.assertEqual(self.memory.banned_ores(4), {"iron"})
 
     def test_ingest_official_and_legend(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")
@@ -316,6 +372,7 @@ class NewsMemoryTests(unittest.TestCase):
             prompt = router.request_prompt(state)
             self.assertIn("官方消息", prompt)
             self.assertIn("previousOreEffects", prompt)
+            self.assertIn("officialHistory", prompt)
             state.round_no = 1
             state.llm_resp = json.dumps({
                 "affectedOre": "iron",

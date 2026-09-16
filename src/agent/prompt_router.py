@@ -50,19 +50,29 @@ def make_ore_prompt(state: MatchState, memory: NewsMemory) -> str:
         '{"affectedOre":"iron|copper|stone","mineBannedDays":[int,...],'
         '"priceUpDays":[int,...],"notes":"简短说明"}'
     )
+    history = []
+    for row in memory.data.get("officialHistory") or []:
+        if isinstance(row, dict) and row.get("text"):
+            history.append({
+                "heardOnDay": row.get("day"),
+                "heardAtRound": row.get("round"),
+                "text": row.get("text"),
+            })
     return (
-        "你是《未来战争》官方消息解析器。只根据本条官方消息推断矿价/禁采日程，不要使用民间传闻。"
-        "游戏日从1起算；首发停工通知里「今天还能抢采、明日停工」时，禁采从次日开始。"
+        "你是《未来战争》官方消息解析器。综合 officialHistory 全部原文与 previousOreEffects 推断矿价/禁采日程，"
+        "不要使用民间传闻。游戏日从1起算；首发停工通知里「今天还能抢采、明日停工」时，禁采从次日开始。"
         f"当前第{day}天（roundNo={state.round_no}，每天{DAY_NIGHT_CYCLE}回合）。"
         "规则："
         "- 明确写停工/禁采/塌方及工期时：写出完整 mineBannedDays（游戏日整数列表），priceUpDays 通常与禁采日相同。"
-        "- 「修复仍在进行/无法采集」是进度确认：把当前日列入禁采，并保留 previousOreEffects 里尚未结束的合理日程；不要把禁采窗无故整体后移。"
+        "- 「修复仍在进行/无法采集」是进度确认：必须保留 previousOreEffects 中尚未结束的禁采日，"
+        "再把当前日并入；禁止只返回当前日而丢掉更早推出的后续禁采日（例如旧窗[3,4]时不得改成只含[3]）。"
         "- 「恢复开采/修复完成/即日起恢复」：对该矿返回空的 mineBannedDays 与 priceUpDays，用于清除旧禁采。"
-        "- 没有明确矿种或停工/涨价/恢复措辞时：选最相关矿种，两个数组都为空，notes 说明依据不足。"
+        "- 没有明确矿种或停工/涨价/恢复措辞时：选最相关矿种，两个数组都为空，notes 说明依据不足（系统会保留旧窗）。"
         f"只返回一个JSON对象，不要Markdown：{schema}。"
         "\n输入：" + json.dumps({
             "currentDay": day,
             "officialNews": news,
+            "officialHistory": history,
             "previousOreEffects": memory.data.get("oreEffects") or [],
         }, ensure_ascii=False)
     )
