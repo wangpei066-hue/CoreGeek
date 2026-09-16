@@ -1013,7 +1013,7 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
         return None
     night = not is_day_round(state.round_no)
     danger = night_danger_cells(state) if night else set()
-    base = own_station(state) if night else None
+    base = own_station(state) if (night or purpose == 'stone') else None
 
     def route_to(mine):
         if night:
@@ -1087,8 +1087,8 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
             continue
         score, batch, path_len, return_len, plan = ranked
         claimed = (mine.pos.x, mine.pos.y) in occupied
-        if night:
-            # 夜里只看来回距离：走过去 + 离基地多远，越近越好。
+        if night or purpose == 'stone':
+            # 夜里、以及施工工采石：只看往返距离（走过去 + 矿离基地多远），越近越好。
             candidates.append((1 if claimed else 0, path_len + home_distance(mine), path_len,
                                mine, path, batch, return_len, score))
         elif purpose == 'voucher':

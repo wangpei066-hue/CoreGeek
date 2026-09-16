@@ -59,11 +59,37 @@ class OpeningTests(unittest.TestCase):
     def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
         ring = wall_ring(state, state.team_our.roles[0])
-        self.assertEqual(len(ring), 14)  # 单层：正面一列 + 两侧翼，无外层
+        self.assertEqual(len(ring), 16)  # 单层：正面一列 + 两翼延伸到院子后沿，无外层
         # 后方竖边保持开放；侧墙延伸到最靠后的短射程武器列。
         self.assertFalse(any(x == 9 and 7 < y < 12 for x, y in ring))
         self.assertTrue(all(x == 13 for x, y in ring[:6]))
         self.assertIn((13, 12), ring)
+
+    def test_wings_extend_front_to_back_before_rear_corners(self):
+        state = opening_state()
+        ring = wall_ring(state, state.team_our.roles[0])
+        wings = [p for p in ring[6:]]
+        xs = [x for x, _ in wings]
+        self.assertEqual(xs, sorted(xs, reverse=True))  # 基地朝右：两翼从靠前（x大）往后修
+        self.assertEqual({p[0] for p in wings[-2:]}, {8})  # 最后才是后沿两个角
+
+    def test_builder_keeps_collecting_until_batch_is_enough(self):
+        from src.agent.brain import V1Strategy, BasicActionValidator
+        state = opening_state()
+        state.round_no = 150
+        state.team_our.roles += [
+            make_role(20, 12, 8, 'rocket', level=1),
+            make_role(21, 11, 8, 'rocket', level=1),
+            make_role(22, 12, 11, 'railgun', level=1),
+        ]
+        builder = state.team_our.roles[1]
+        builder.pos = Pos(5, 9)  # 石矿 (6, 9) 旁
+        builder.backpack = ['stone'] * 3
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[builder.id], {'action': 'collect', 'targetPos': [{'x': 6, 'y': 9}]})
+        builder.backpack = ['stone'] * 16
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotEqual(commands[builder.id]['action'], 'collect')
 
     def test_failed_wall_position_is_not_counted_as_completed(self):
         state = opening_state()
@@ -277,7 +303,7 @@ class OpeningTests(unittest.TestCase):
         base = state.team_our.roles[0]
         base.pos = Pos(30, 8)
         line = wall_ring(state, base)
-        self.assertEqual(len(line), 14)
+        self.assertEqual(len(line), 16)
         self.assertFalse(any(x == 32 and 5 < y < 10 for x, y in line))
         self.assertTrue(all(x == 28 for x, y in line[:6]))
 

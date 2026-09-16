@@ -395,3 +395,57 @@ class NightRouteTests(unittest.TestCase):
         picked = pick_mine(worker, state, build_blocked_set(state), set(), ('iron',))
         self.assertIsNotNone(picked)
         self.assertEqual(picked[0].pos, rear_mine.pos)
+
+
+def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):
+    """按正式炮位编制布三门炮和整圈单层墙。"""
+    from src.agent.opening import wall_ring, weapon_slot_plan
+    state = opening_state()
+    state.round_no = round_no
+    state.team_our.gold_num = 0
+    state.team_our.player_tasks = []
+    base = state.team_our.roles[0]
+    base.level = station_level
+    state.team_our.roles = [r for r in state.team_our.roles if r.role_type not in ('rocket', 'gatling', 'railgun')]
+    for i, ((name, (x, y)), level) in enumerate(zip(weapon_slot_plan(state, base), levels)):
+        state.team_our.roles.append(make_role(20 + i, x, y, name, level=level, attack_range=20, health=1000))
+    for i, (x, y) in enumerate(wall_ring(state, base)):
+        state.team_our.roles.append(make_role(100 + i, x, y, 'wall', level=1, health=1000))
+    return state
+
+
+class ThirdNightRepairTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def _pressure_state(self, wall_pos):
+        state = _slot_layout_state(340)
+        state.robot.roles = [RobotRole(100 + i, Pos(16, 8 + i), 'smallRobot', 10) for i in range(4)]
+        wall = next(r for r in state.team_our.roles if r.role_type == 'wall' and (r.pos.x, r.pos.y) == wall_pos)
+        wall.health = 300
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.backpack = ['WallUpgradeVoucher1']
+        return state, builder
+
+    def test_builder_repairs_front_wall_from_inside_yard_under_pressure(self):
+        state, builder = self._pressure_state((13, 10))
+        builder.pos = Pos(12, 10)
+        commands = self.decide(state)
+        self.assertEqual(commands[builder.id], {'action': 'use', 'name': 'WallUpgradeVoucher1',
+                                                'targetPos': [{'x': 13, 'y': 10}]})
+        self.assertFalse(any(c.get('controllerId') == str(builder.id) for c in commands.values()))
+
+    def test_builder_mans_gun_when_damaged_wall_is_outside_yard_reach(self):
+        state, builder = self._pressure_state((13, 7))  # 角落墙只能从墙外够到
+        self.decide(state)
+        self.assertIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        self.assertFalse(any(e['code'] == 'night_worker_released_to_economy' for e in state.decision_events))
+
+    def test_upgrade_chain_waits_for_station_after_first_level_three_rocket(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        # 编制顺序：火箭A、电磁炮、火箭B
+        state = _slot_layout_state(150, levels=(3, 1, 2), station_level=1)
+        state.team_our.gold_num = 1000
+        worker = make_role(1, 5, 5, 'worker', back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]['kind'], 'station')
