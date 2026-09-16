@@ -25,3 +25,9 @@
 - 版本：待提交
 - 修改：在 `summarize_heritage_records` 中加入有证据的中国历史年代标签排序，解决模拟数据 `era_order=null` 时的 oldest 选择浪费轮次。
 - 验证：`py_compile` 通过；南京单任务 solver5 仍为14轮超时，说明还需绕过模型对 API_DOCS 的重复探查。
+
+## 迭代 4（2026-09-16）
+
+- 版本：待提交
+- 修改：读取 API 任务简报后自动复用已验证遗产 API 合同，跳过过时 `API_DOCS.md` 探查；保留 `location`、Bearer 和分页契约。
+- 目标：API 任务在读取简报后直接进入确定性分页，减少至少两轮 LLM 往返。
