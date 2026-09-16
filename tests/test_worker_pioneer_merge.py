@@ -163,7 +163,7 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             kinds = sorted(w.role_type for w in assignment.values())
             self.assertEqual(kinds, ['railgun', 'rocket'], (first, second))
 
-    def test_released_worker_stays_on_guns_when_defense_is_due(self):
+    def test_second_night_releases_worker_even_when_defense_is_due(self):
         state = self._dual_rocket_night()
         worker = next(r for r in state.team_our.roles if r.id == 1)
         worker.pos = Pos(9, 10)
@@ -172,9 +172,31 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(10, 12)
         state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
-        self.decide(state)
-        self.assertIn(str(freed.id), state.policy_memory['weapon_assignment'])
-        self.assertTrue(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        commands = self.decide(state)
+        self.assertIn(freed.id, commands)
+        self.assertEqual(commands[freed.id]['action'], 'collect')
+        self.assertFalse(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
+
+    def test_third_night_worker_stays_on_guns_when_defense_is_due(self):
+        state = self._dual_rocket_night()
+        state.round_no = 270
+        freed = next(r for r in state.team_our.roles if r.id == 1)
+        freed.pos = Pos(9, 10)
+        economy = next(r for r in state.team_our.roles if r.id == 2)
+        economy.pos = Pos(7, 9)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(10, 12)
+        state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
+        freed.backpack = ['stone'] * 6
+        economy.backpack = ['stone'] * 6
+        commands = self.decide(state)
+        repairers = [
+            rid for rid in (freed.id, economy.id)
+            if rid in commands and commands[rid]['action'] in ('move', 'build')
+        ]
+        self.assertTrue(repairers)
+        self.assertFalse(any(c.get('controllerId') == str(rid) for rid in repairers for c in commands.values()))
 
     def test_ordinary_voucher_does_not_preempt_feasible_task(self):
         state = opening_state()

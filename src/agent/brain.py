@@ -1886,7 +1886,7 @@ def plan_pioneer_tasks(state, blocked, reserved):
 
 def _night_economy_worker_to_release(state, blocked, task_pioneers):
     """两人三炮：开拓者没在做任务时，两名守炮的人之外放经济工夜间采矿。
-    施工工和开拓者必须能及时守住三门炮，经济工还得在敌人到达前赶得回来。"""
+    第三天前两人守三炮即可；第三天起才要求经济工能及时回墙/回炮。"""
     if self_evolution_work_open(state) or task_pioneers:
         return None
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
@@ -1895,10 +1895,18 @@ def _night_economy_worker_to_release(state, blocked, task_pioneers):
     from .opening import MUSTER_BUFFER, crew_covers_without, station_return_steps
     from .opening_schedule import opening_worker_mode
     from .tactics import threat_eta_to_base
-    released = max(workers, key=lambda w: (opening_worker_mode(state, w) == "economist",
-                                          len(w.backpack or []), w.id))
+    if structure_priority_day(state):
+        released = max(workers, key=lambda w: (opening_worker_mode(state, w) == "builder",
+                                              len(w.backpack or []), w.id))
+    else:
+        released = max(workers, key=lambda w: (opening_worker_mode(state, w) == "economist",
+                                              len(w.backpack or []), w.id))
     if not crew_covers_without(state, {released.id}, blocked):
         return None
+    if not structure_priority_day(state):
+        return released
+    if walls_still_to_build(state):
+        return released
     # 夜里没有“天黑前”余量，按敌人实际距离判断：回炮步数加余量必须小于敌人到达回合，
     # 否则不放出，留在开炮名单里，回到炮位后能正常开火。
     eta = threat_eta_to_base(state, released)

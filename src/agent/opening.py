@@ -1215,10 +1215,12 @@ def guns_covered_without(state, excluded_ids, blocked):
 
 
 def crew_covers_without(state, excluded_ids, blocked):
-    """没有压力且其余两人能守住三门炮时，被排除的那个人可以去做任务或采矿。"""
-    from .tactics import front_breached, pressure
-    if pressure(state) or front_breached(state):
-        return False
+    """其余两人能守住三门炮时，被排除的那个人可以去做任务或采矿。"""
+    from .brain import structure_priority_day
+    if structure_priority_day(state):
+        from .tactics import front_breached, pressure
+        if pressure(state) or front_breached(state):
+            return False
     return guns_covered_without(state, excluded_ids, blocked)
 
 
