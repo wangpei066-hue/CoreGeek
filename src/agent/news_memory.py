@@ -13,6 +13,13 @@ from .news_logging import log_folk_plan, log_news_event, log_official_plan
 
 DAY_NIGHT_CYCLE = 130
 TREASURE_ACT_CONFIDENCE = 0.7
+_CN_DAY = r'(?:[0-9]+|[一二三四五六七八九十]+)'
+_OPEN_TIME_IN_TEXT = re.compile(
+    rf'第\s*{_CN_DAY}\s*[天日].{{0,16}}(?:开|启|召唤|解开|可进|窗口)'
+    rf'|(?:开|启|召唤|解开|可进|窗口).{{0,16}}第\s*{_CN_DAY}\s*[天日]'
+    rf'|回合\s*\d+',
+    re.I,
+)
 COMBAT_ITEM_NAMES = {
     "Medicine", "DizzyWeapon", "Bomb", "WallFixer",
     "WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2",
@@ -185,6 +192,15 @@ def heuristic_ore_effect(official_news: str, published_day: int) -> Optional[dic
     """LLM 失败时的弱假设：识别矿种 + 停工/涨价时间窗。多矿种时返回第一条。"""
     effects = heuristic_ore_effects(official_news, published_day)
     return effects[0] if effects else None
+
+
+def joined_legend_text(legends) -> str:
+    return " ".join(str(row.get("text") or "") for row in (legends or []) if isinstance(row, dict))
+
+
+def legend_mentions_open_time(text: str) -> bool:
+    """正文是否明确写了开启日/回合。听到传闻的那天、上古传说里的「开启」都不算。"""
+    return bool(text and _OPEN_TIME_IN_TEXT.search(text))
 
 
 class NewsMemory:
@@ -385,9 +401,12 @@ class NewsMemory:
             hyp["altarPos"] = None
         if not hyp["altarPos"] or not hyp["items"] or confidence < TREASURE_ACT_CONFIDENCE:
             hyp["ready"] = False
+        if not legend_mentions_open_time(joined_legend_text(self.data.get("legends"))):
+            hyp["openFromRound"] = None
+            hyp["openToRound"] = None
         self.data["treasureHypothesis"] = hyp
-        # 置信度不够就等后续传闻再解，不要把低分结果当成定论。
-        self.data["needTreasureDecode"] = confidence < TREASURE_ACT_CONFIDENCE
+        # 这一批原文已经解过；等新传闻或召唤失败 2/3 再问，避免同一批低分重刷额度。
+        self.data["needTreasureDecode"] = False
         self.data["lastTreasureDecodeDay"] = self.data.get("llmDay")
         plan = self.store_folk_plan()
         self.save()

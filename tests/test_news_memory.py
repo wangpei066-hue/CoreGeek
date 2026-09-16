@@ -6,8 +6,9 @@ from pathlib import Path
 
 from src.agent.news_memory import (
     NewsMemory, game_day, heuristic_ore_effect, heuristic_ore_effects, vendor_prices,
+    legend_mentions_open_time,
 )
-from src.agent.prompt_router import PromptRouter, parse_json_object
+from src.agent.prompt_router import PromptRouter, parse_json_object, make_treasure_prompt
 from src.agent.protocol import MatchState, MapInfo, TeamOur, WorldNews, ShopItem, Zone, Pos, Role
 from src.agent.brain import best_ore_to_sell, nearest_mine
 
@@ -218,20 +219,22 @@ class NewsMemoryTests(unittest.TestCase):
         router.consume_llm_resp(state)
         self.assertIn("iron", self.memory.banned_ores(2))
 
-    def test_low_confidence_treasure_json_is_not_ready_and_retries(self):
+    def test_low_confidence_treasure_json_is_not_ready_and_waits_for_new_legend(self):
         state = self._state(0, folk="西部有一石门")
         self.memory.ingest(state)
         router = PromptRouter(self.memory)
         prompt = router.request_prompt(state)
         self.assertIn("置信度", prompt)
         self.assertIn("allowedTaskItems", prompt)
+        self.assertIn("heardOnDay", prompt)
+        self.assertIn("禁止用 now、heardOnDay", prompt)
         state.round_no = 1
         state.llm_resp = json.dumps({
             "ready": True,
             "altarPos": {"x": 1, "y": 2},
             "items": ["AcientTablet"],
-            "openFromRound": None,
-            "openToRound": None,
+            "openFromRound": 260,
+            "openToRound": 389,
             "confidence": 0.4,
             "notes": "只有石门，没有坐标原文",
         })
@@ -239,7 +242,46 @@ class NewsMemoryTests(unittest.TestCase):
         hyp = self.memory.data["treasureHypothesis"]
         self.assertEqual(hyp["confidence"], 0.4)
         self.assertFalse(hyp["ready"])
+        self.assertIsNone(hyp["openFromRound"])
+        self.assertIsNone(hyp["openToRound"])
+        self.assertFalse(self.memory.data["needTreasureDecode"])
+        state.round_no = 131
+        state.world_news.folk_legends = "武器店有铭文石板"
+        self.memory.ingest(state)
         self.assertTrue(self.memory.data["needTreasureDecode"])
+
+    def test_open_window_kept_when_legend_names_day(self):
+        state = self._state(0, folk="祭坛第4天开启，坐标(12,8)，需铭文石板")
+        self.memory.ingest(state)
+        self.assertTrue(legend_mentions_open_time(state.world_news.folk_legends))
+        self.memory.apply_treasure_llm({
+            "ready": True,
+            "altarPos": {"x": 12, "y": 8},
+            "items": ["AcientTablet"],
+            "openFromRound": 390,
+            "openToRound": 519,
+            "confidence": 0.9,
+        })
+        hyp = self.memory.data["treasureHypothesis"]
+        self.assertEqual(hyp["openFromRound"], 390)
+        self.assertEqual(hyp["openToRound"], 519)
+
+    def test_treasure_prompt_strips_guessed_window_from_previous(self):
+        state = self._state(262, folk="西部有一石门，门需三钥")
+        self.memory.ingest(state)
+        self.memory.data["treasureHypothesis"] = {
+            "ready": False, "altarPos": None,
+            "items": ["AcientTablet"],
+            "openFromRound": 260, "openToRound": 389,
+            "confidence": 0.6, "source": "llm",
+        }
+        prompt = make_treasure_prompt(state, self.memory)
+        payload = json.loads(prompt.split("输入：", 1)[1])
+        self.assertEqual(payload["now"]["gameDay"], 3)
+        self.assertEqual(payload["legends"][0]["heardOnDay"], 3)
+        self.assertNotIn("day", payload["legends"][0])
+        self.assertIsNone(payload["previousHypothesis"]["openFromRound"])
+        self.assertIsNone(payload["previousHypothesis"]["openToRound"])
 
     def test_parse_fenced_json(self):
         self.assertEqual(parse_json_object('```json\n{"a":1}\n```'), {"a": 1})

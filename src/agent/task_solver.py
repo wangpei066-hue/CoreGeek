@@ -1011,7 +1011,14 @@ def default_heritage_experience(task, documents):
     blob = '\n'.join(str(item.get('content') or '') for item in documents or [])
     urls = [clean_url(url) for url in URL_RE.findall(blob + '\n' + (task or ''))]
     parsed = urlparse(urls[0]) if urls else urlparse('http://localhost:8899/api/v1/heritage/search')
-    path = parsed.path or '/api/v1/heritage/search'
+    # Task briefs commonly provide only the service origin (for example
+    # ``http://localhost:8899``); treating its root path as the API endpoint
+    # causes an avoidable 404 when stale API_DOCS is intentionally skipped.
+    # Preserve an explicitly documented heritage endpoint, otherwise use the
+    # verified search route for this known heritage service.
+    explicit_path = parsed.path.rstrip('/')
+    path = (explicit_path if 'heritage' in explicit_path.lower() or '遗产' in explicit_path
+            else '/api/v1/heritage/search')
     if 'heritage' not in path.lower() and '遗产' not in blob:
         return None
     base = '%s://%s' % (parsed.scheme or 'http', parsed.netloc or 'localhost:8899')
