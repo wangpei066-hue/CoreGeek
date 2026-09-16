@@ -156,7 +156,8 @@ class PioneerScheduleTests(unittest.TestCase):
         self.assertFalse(scheduler_task_session(state))
         self.assertFalse(solver_ready_to_submit(state))
         commands = self.decide(state)
-        self.assertIn('3', {c['controllerId'] for c in commands.values() if c.get('action') == 'attack'})
+        # 服务器上任务仍在进行（phaseTask 非空）：过期会话不影响，开拓者照样留在任务点。
+        self.assertNotIn('3', {c['controllerId'] for c in commands.values() if c.get('action') == 'attack'})
 
     def test_stale_task_session_does_not_leak_into_new_task(self):
         """phaseTask 换了新任务时，求解器必须重新开会话，不能把旧任务的"已可提交"状态带过来。"""

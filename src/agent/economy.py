@@ -523,26 +523,8 @@ def solver_ready_to_submit(state) -> bool:
 
 
 def pioneer_should_hold_task(pioneer, state) -> bool:
-    """回防窗里「本回合能提交且敌人还来不及打到」，或「两名工人能守住三门炮」时留在任务点；否则回炮，解题会话本身不清。"""
-    if pioneer is None or pioneer.health <= 0 or not state.phase_task:
-        return False
-    from .tactics import pressure, threat_eta_to_base
-    if pressure(state):
-        return False
-    eta = threat_eta_to_base(state, pioneer)
-    from .grid import build_blocked_set
-    from .opening import MUSTER_BUFFER, station_return_steps
-    blocked = build_blocked_set(state)
-    if solver_ready_to_submit(state):
-        back = station_return_steps(pioneer, state, blocked)
-        if back is None:
-            return False
-        need = 1 + back + MUSTER_BUFFER
-        if eta is None or eta > need:
-            return True
-        return False
-    from .opening import crew_covers_without
-    return crew_covers_without(state, {pioneer.id}, blocked)
+    """任务开始后离开任务点就直接失败：有进行中的任务就一直留在任务点，直到做完或超时。"""
+    return bool(pioneer is not None and pioneer.health > 0 and state.phase_task)
 
 
 def muster_for_night(role, state, blocked, reserved):
@@ -607,8 +589,13 @@ def _vendor_choices(role, state, blocked, reserved):
     if not state.map_info:
         return []
     choices = []
+    from .brain import is_day_round
+    from .opening import night_safe_path
     for vendor in (z for z in state.map_info.zones if z.neutral_type == 'vendor'):
-        path = adjacent_path(role, vendor.pos, blocked | reserved, state)
+        if is_day_round(state.round_no):
+            path = adjacent_path(role, vendor.pos, blocked | reserved, state)
+        else:
+            path = night_safe_path(role, vendor.pos, blocked | reserved, state)
         if path is not None:
             choices.append((len(path), vendor.pos.x, vendor.pos.y, vendor, path))
     return choices

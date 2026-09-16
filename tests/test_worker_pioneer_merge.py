@@ -24,24 +24,19 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 self.assertEqual(commands[worker]['name'], 'rocket')
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == '武器' for e in state.decision_events))
 
-    def test_opening_active_task_yields_at_muster_time(self):
+    def test_active_task_is_never_abandoned(self):
+        """离开任务点任务就失败：即使入夜且工人都阵亡，开拓者也留在任务点。"""
         for round_no in (0, 75):
             with self.subTest(round_no=round_no):
                 state = opening_state()
                 state.round_no = round_no
                 state.phase_task = '请计算1+1'
                 state.team_our.roles.append(make_role(20, 9, 10, 'gatling', level=1))
-                # 工人被困在围栏里赶不到炮位，入夜后开拓者必须放下任务回炮。
                 for worker in state.team_our.roles:
                     if worker.role_type == 'worker':
                         worker.health = 0
                 commands = self.decide(state)
-                if round_no == 0:
-                    self.assertNotIn(3, commands)
-                else:
-                    self.assertEqual(commands[3]['action'], 'move')
-                    self.assertTrue(any(e['code'] in ('income_muster', 'no_free_weapon', 'weapon_assignment') and e['role_id'] == 3
-                                        for e in state.decision_events))
+                self.assertNotIn(3, commands)
 
     def test_task_pioneer_keeps_self_healing_during_opening(self):
         state = opening_state()
@@ -53,25 +48,22 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(command['action'], 'use')
         self.assertEqual(command['name'], 'Medicine')
 
-    def test_night_task_yields_weapon_to_nearest_fighter_including_pioneer(self):
-        for active in (False, True):
-            with self.subTest(active=active):
-                state = opening_state()
-                state.round_no = 80
-                state.phase_task = '任务进行中' if active else ''
-                state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
-                # 先锋距离炮台最近，工人赶不及，夜间先锋应参与操控。
-                state.team_our.roles.append(make_role(20, 10, 11, 'gatling', level=1, attack_range=20))
-                for worker, pos in zip([r for r in state.team_our.roles if r.role_type == 'worker'],
-                                       (Pos(2, 2), Pos(3, 2))):
-                    worker.pos = pos
-                state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
-                commands = self.decide(state)
-                allocations = [e for e in state.decision_events if e['code'] == 'weapon_assignment']
-                self.assertEqual(len(allocations), 1)
-                self.assertEqual(allocations[0]['role_id'], 3)
-                self.assertEqual(commands[20]['controllerId'], '3')
-                self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
+    def test_idle_pioneer_mans_gun_when_workers_cannot_reach(self):
+        """没有进行中的任务、工人赶不到时，离得最近的开拓者操炮，不新接任务。"""
+        state = opening_state()
+        state.round_no = 80
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        state.team_our.roles.append(make_role(20, 10, 11, 'gatling', level=1, attack_range=20))
+        for worker, pos in zip([r for r in state.team_our.roles if r.role_type == 'worker'],
+                               (Pos(2, 2), Pos(3, 2))):
+            worker.pos = pos
+        state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
+        commands = self.decide(state)
+        allocations = [e for e in state.decision_events if e['code'] == 'weapon_assignment']
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0]['role_id'], 3)
+        self.assertEqual(commands[20]['controllerId'], '3')
+        self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
 
     def test_night_pioneer_takes_task_when_workers_cover_all_guns(self):
         for active in (False, True):
@@ -449,3 +441,42 @@ class ThirdNightRepairTests(unittest.TestCase):
         worker = make_role(1, 5, 5, 'worker', back_pack_capability=100)
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]['kind'], 'station')
+
+
+class HeldVoucherAndNightRouteTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def test_held_level_one_voucher_is_used_even_when_chain_wants_level_three(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        # 编制顺序：火箭A、电磁炮、火箭B；两门火箭已 2 级，升级链下一步要 2 级券
+        state = _slot_layout_state(150, levels=(2, 1, 2), station_level=1)
+        worker = make_role(1, 5, 5, 'worker', back_pack_capability=100, backpack=['WeaponUpgradeVoucher1'])
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        self.assertEqual(job['item'], 'WeaponUpgradeVoucher1')
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        self.assertEqual(tuple(job['target']), (railgun.pos.x, railgun.pos.y))
+
+    def test_night_gunner_uses_voucher_when_no_target(self):
+        state = _slot_layout_state(80)
+        state.robot.roles = [RobotRole(100, Pos(40, 31), 'smallRobot', 10)]
+        for weapon in state.team_our.roles:
+            if weapon.role_type in ('rocket', 'railgun'):
+                weapon.attack_range = 3  # 敌人在射程外
+        gunner = next(r for r in state.team_our.roles if r.id == 2)
+        gunner.backpack = ['WeaponUpgradeVoucher1']
+        commands = self.decide(state)
+        self.assertEqual(commands[gunner.id]['action'], 'use')
+        self.assertEqual(commands[gunner.id]['name'], 'WeaponUpgradeVoucher1')
+
+    def test_night_worker_returning_to_gun_avoids_robot_route(self):
+        from src.agent.opening import night_danger_cells
+        state = _slot_layout_state(80)
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 14), 0, 10, 10, True)]
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(16, 4)  # 在墙外，机器人正从右边压过来
+        state.robot.roles = [RobotRole(100, Pos(22, 6), 'smallRobot', 10)]
+        commands = self.decide(state)
+        step = commands[worker.id]['targetPos'][0]
+        self.assertNotIn((step['x'], step['y']), night_danger_cells(state, include_front=False))

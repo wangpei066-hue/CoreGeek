@@ -66,10 +66,21 @@ def night_danger_cells(state, include_front=True):
     width, height = state.map_info.width, state.map_info.height
     cells = set()
     r = NIGHT_ROBOT_AVOID_RADIUS
+    base = own_station(state)
+    yard = courtyard_cells(state, base) if base is not None else set()
     for robot in threat_robots(state):
         cells.update((x, y) for x in range(robot.pos.x - r, robot.pos.x + r + 1)
                      for y in range(robot.pos.y - r, robot.pos.y + r + 1))
-    base = own_station(state)
+        if base is not None:
+            # 机器人朝基地推进的路线（每步 x、y 各向基地靠一格），两侧各留一格，院子里不算。
+            x, y = robot.pos.x, robot.pos.y
+            for _ in range(width + height):
+                cells.update((cx, cy) for cx in (x - 1, x, x + 1) for cy in (y - 1, y, y + 1)
+                             if (cx, cy) not in yard)
+                if chebyshev(Pos(x, y), base.pos) <= 1:
+                    break
+                x += (base.pos.x > x) - (base.pos.x < x)
+                y += (base.pos.y > y) - (base.pos.y < y)
     if include_front and base is not None:
         left, right, _, _ = defense_bounds(state, base)
         direction = attack_direction(state, base)
@@ -712,11 +723,11 @@ def survival_wall_plan(state, base):
         return (cover_base, cover_weapon, cover_gunner, abs(y - base.pos.y), y)
 
     ordered = sorted(front, key=front_key)
-    if flanks:
-        by_y = sorted(flanks, key=lambda p: (p[1], p[0]))
-        for point in (by_y[0], by_y[-1]) if len(by_y) > 1 else by_y:
-            if point not in ordered:
-                ordered.append(point)
+    # 两翼各取紧挨正面的那一格（flanks 已按由前往后排序），不取后沿。
+    for row in sorted({p[1] for p in flanks}):
+        point = next(p for p in flanks if p[1] == row)
+        if point not in ordered:
+            ordered.append(point)
     if len(ordered) < SURVIVAL_WALL_FLOOR:
         for point in inner:
             if point not in ordered:

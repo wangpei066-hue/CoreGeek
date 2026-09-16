@@ -73,6 +73,15 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(xs, sorted(xs, reverse=True))  # 基地朝右：两翼从靠前（x大）往后修
         self.assertEqual({p[0] for p in wings[-2:]}, {8})  # 最后才是后沿两个角
 
+    def test_day_one_survival_walls_are_front_plus_wing_heads(self):
+        from src.agent.opening import survival_wall_plan
+        state = opening_state()
+        base = state.team_our.roles[0]
+        plan = survival_wall_plan(state, base)
+        self.assertEqual(len(plan), 8)
+        self.assertEqual(set(plan), set(wall_ring(state, base)[:8]))
+        self.assertNotIn((8, 7), plan)
+
     def test_builder_keeps_collecting_until_batch_is_enough(self):
         from src.agent.brain import V1Strategy, BasicActionValidator
         state = opening_state()
