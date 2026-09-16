@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 import shutil
 import stat
 import tempfile
@@ -154,7 +155,11 @@ class LocalTaskEnvironment:
             app = self.task_name.rsplit("_", 1)[1].removesuffix(".md")
             workspace = self.runtime / f"ws_{number}"
             spec = (workspace / "spec.md").read_text(encoding="utf-8")
-            required = [line.split("`", 2)[1] for line in spec.splitlines() if "第 " in line and "`" in line]
+            required = []
+            for line in spec.splitlines():
+                match = re.search(r"第 \d+ 行：`?([^`\n]+)`?", line)
+                if match:
+                    required.append(match.group(1).strip())
             config = (workspace / "config" / f"{app}.conf")
             lines = config.read_text(encoding="utf-8").splitlines() if config.is_file() else []
             log_dir, start = workspace / "logs" / app, workspace / "bin" / "start.sh"
