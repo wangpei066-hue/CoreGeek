@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from src.agent.news_memory import (
-    NewsMemory, game_day, heuristic_ore_effect, vendor_prices,
+    NewsMemory, game_day, heuristic_ore_effect, heuristic_ore_effects, vendor_prices,
 )
 from src.agent.prompt_router import PromptRouter, parse_json_object
 from src.agent.protocol import MatchState, MapInfo, TeamOur, WorldNews, ShopItem, Zone, Pos, Role
@@ -47,6 +47,34 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(effect["affectedOre"], "iron")
         self.assertEqual(effect["mineBannedDays"], [2, 3])
         self.assertEqual(effect["priceUpDays"], [2, 3])
+
+    def test_heuristic_reads_duration_and_immediate_start(self):
+        three = heuristic_ore_effect("铜矿区即日起停产，预计需要3天恢复开采。", 2)
+        self.assertEqual(three["affectedOre"], "copper")
+        self.assertEqual(three["mineBannedDays"], [2, 3, 4])
+        two_cn = heuristic_ore_effect("石矿明日全面停工，修复需要两天左右。", 1)
+        self.assertEqual(two_cn["affectedOre"], "stone")
+        self.assertEqual(two_cn["mineBannedDays"], [2, 3])
+
+    def test_heuristic_price_only_and_collapse_without_停工(self):
+        priced = heuristic_ore_effect("小贩通报：铜资源回收价上调，市场紧缺。", 1)
+        self.assertEqual(priced["affectedOre"], "copper")
+        self.assertEqual(priced["mineBannedDays"], [])
+        self.assertEqual(priced["priceUpDays"], [2, 3])
+        collapse = heuristic_ore_effect("北部铁矿区昨夜发生严重矿井塌方，主巷道受损。", 1)
+        self.assertEqual(collapse["mineBannedDays"], [2, 3])
+
+    def test_heuristic_skips_negation_and_blank(self):
+        self.assertIsNone(heuristic_ore_effect("今日无重大新闻", 1))
+        self.assertIsNone(heuristic_ore_effect("铁矿区评估后确认未停工，暂不涨价。", 1))
+        self.assertIsNone(heuristic_ore_effect("安全监察部门表示不会全面停工。", 1))
+        self.assertEqual(heuristic_ore_effects("无重大新闻", 1), [])
+
+    def test_heuristic_multiple_ores(self):
+        effects = heuristic_ore_effects("铁矿与铜矿明日同时禁采，停工2天。", 1)
+        ores = {row["affectedOre"]: row["mineBannedDays"] for row in effects}
+        self.assertEqual(ores["iron"], [2, 3])
+        self.assertEqual(ores["copper"], [2, 3])
 
     def test_ingest_official_and_legend(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")

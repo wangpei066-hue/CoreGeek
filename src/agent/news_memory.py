@@ -22,11 +22,27 @@ COMBAT_ITEM_NAMES = {
     "LargeRobotSummonOrder", "BossRobotSummonOrder",
 }
 ORE_ALIASES = {
-    "iron": ("iron", "铁", "铁矿"),
-    "copper": ("copper", "铜", "铜矿"),
-    "stone": ("stone", "石", "石矿", "石头"),
+    "iron": ("铁矿区", "铁矿", "铁资源", "iron"),
+    "copper": ("铜矿区", "铜矿", "铜资源", "copper"),
+    "stone": ("石矿区", "石矿", "石资源", "石料", "石头", "stone"),
 }
+# 短名容易误伤（「铁」可出现在无关词里），仅在已有采矿语境时作为兜底。
+ORE_SHORT = {"iron": "铁", "copper": "铜"}
 DEFAULT_ORE_PRICES = {"stone": 1, "iron": 3, "copper": 5}
+_CN_DAYS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5}
+_DISRUPT_RE = re.compile(
+    r"停工|停产|停采|禁采|无法采集|无法开采|不能开采|停止开采|暂停开采|"
+    r"中断开采|无法产出|矿区关闭|关闭矿区|封闭矿区|全面停工|暂停作业|停止作业"
+)
+_COLLAPSE_RE = re.compile(r"塌方|矿难|巷道.{0,6}受损|矿井.{0,8}事故")
+_PRICE_RE = re.compile(
+    r"涨价|稀缺|紧缺|回收价|收购价|价格上涨|价格上调|报价上调|供不应求|上浮|溢价"
+)
+_NEGATE_RE = re.compile(
+    r"(?:未发生|并未发生|没有发生|不会发生).{0,8}(?:塌方|停工|矿难|停产)|"
+    r"(?:不会|暂不|尚未|并未|未)(?:全面)?(?:停工|停产|禁采|停采|涨价)|"
+    r"(?:不停工|未停工|不涨价|未涨价|无需停工)"
+)
 
 
 def clamp_confidence(value) -> float:
@@ -51,37 +67,124 @@ def vendor_prices(state: MatchState) -> dict:
     return prices
 
 
-def heuristic_ore_effect(official_news: str, published_day: int) -> Optional[dict]:
-    """LLM 失败时的弱假设：识别矿种 + 停工/涨价时间词。"""
-    if not official_news or official_news in ("今日无重大新闻",):
-        return None
-    text = official_news
-    ore = None
-    for name, aliases in ORE_ALIASES.items():
-        if any(a in text for a in aliases):
-            ore = name
-            break
-    if ore is None:
-        return None
+def _normalize_official(text: str) -> str:
+    text = (text or "").strip()
+    trans = str.maketrans("０１２３４５６７８９，。；", "0123456789,.;")
+    return text.translate(trans)
+
+
+def _is_blank_official(text: str) -> bool:
+    if not text:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    return compact in ("今日无重大新闻", "无重大新闻", "暂无官方消息", "无")
+
+
+def _detect_ores(text: str) -> list:
+    found = []
+    mining = bool(re.search(r"矿|资源|回收|采集|开采|小贩|停工|停产|塌方", text))
+    for ore, aliases in ORE_ALIASES.items():
+        hit = False
+        for alias in sorted(aliases, key=len, reverse=True):
+            if alias.isascii():
+                if re.search(rf"\b{re.escape(alias)}\b", text, re.IGNORECASE):
+                    hit = True
+                    break
+            elif alias in text:
+                hit = True
+                break
+        if not hit and mining:
+            short = ORE_SHORT.get(ore)
+            if short and short in text:
+                hit = True
+        if hit:
+            found.append(ore)
+    return found
+
+
+def _parse_duration(text: str, default: int = 2) -> int:
+    """停工/修复持续几天；读不到则默认 2（任务书示例）。上限 5，避免误吃无关数字。"""
+    patterns = (
+        r"(?:需要|需时|需|为期|工期|修复|停工|停产|封闭|关闭|持续|连续|暂停)[^\d一二两三四五]{0,8}(\d+)\s*天",
+        r"(\d+)\s*天\s*(?:左右|上下)",
+        r"约\s*(\d+)\s*天",
+        r"为期\s*(\d+)\s*天",
+        r"停工\s*(\d+)\s*天",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return max(1, min(int(match.group(1)), 5))
+    match = re.search(r"(?:需要|需|为期|修复|停工|连续)\s*([一二两三四五])\s*天", text)
+    if match:
+        return _CN_DAYS[match.group(1)]
+    match = re.search(r"([一二两三四五])\s*天\s*(?:左右|上下)", text)
+    if match:
+        return _CN_DAYS[match.group(1)]
+    return default
+
+
+def _parse_start_offset(text: str, has_disrupt: bool) -> Optional[int]:
+    """相对发布日的禁采起始偏移。任务书示例里『今天还能抢采』与『明日停工』同时出现时，以明日为准。"""
+    if re.search(r"明日|明天|次日|翌日", text):
+        return 1
+    if "大后天" in text:
+        return 3
+    if "后天" in text:
+        return 2
+    if re.search(r"即日起|立即(?:停|关|禁|封)|即刻|从即日起", text):
+        return 0
+    if has_disrupt and re.search(r"今天|今日|当日|今夜|今晚", text):
+        return 0
+    if has_disrupt:
+        return 1
+    return None
+
+
+def heuristic_ore_effects(official_news: str, published_day: int) -> list:
+    """从官方消息抽出各矿种的禁采/涨价日；匹配失败不编造。"""
+    text = _normalize_official(official_news)
+    if _is_blank_official(text) or _NEGATE_RE.search(text):
+        return []
+    ores = _detect_ores(text)
+    if not ores:
+        return []
+    disrupt = bool(_DISRUPT_RE.search(text) or _COLLAPSE_RE.search(text))
+    priced = bool(_PRICE_RE.search(text))
+    if not disrupt and not priced:
+        return []
+    start_offset = _parse_start_offset(text, disrupt)
+    duration = _parse_duration(text) if disrupt else _parse_duration(text, default=2)
     banned, price_up = [], []
-    if re.search(r"明日|明天|次日", text) and re.search(r"停工|停产|无法采集|不能开采|全面停工", text):
-        banned.extend([published_day + 1, published_day + 2])
-        price_up.extend([published_day + 1, published_day + 2])
-    elif re.search(r"今天|当日", text) and re.search(r"停工|停产", text):
-        banned.append(published_day)
-        price_up.append(published_day)
-    if re.search(r"涨价|稀缺|回收价", text) and not price_up:
-        price_up.extend([published_day + 1, published_day + 2])
+    if disrupt and start_offset is not None:
+        start = published_day + start_offset
+        banned = list(range(start, start + duration))
+        price_up = list(banned)
+    elif priced:
+        if re.search(r"今天|今日|当日|即日起", text):
+            price_up = [published_day]
+        else:
+            start = published_day + (start_offset if start_offset is not None else 1)
+            price_up = list(range(start, start + duration))
     if not banned and not price_up:
-        return None
-    return {
-        "affectedOre": ore,
-        "mineBannedDays": sorted(set(banned)),
-        "priceUpDays": sorted(set(price_up)),
-        "notes": "heuristic",
-        "source": "heuristic",
-        "publishedDay": published_day,
-    }
+        return []
+    return [
+        {
+            "affectedOre": ore,
+            "mineBannedDays": sorted(set(banned)),
+            "priceUpDays": sorted(set(price_up)),
+            "notes": "heuristic",
+            "source": "heuristic",
+            "publishedDay": published_day,
+        }
+        for ore in ores
+    ]
+
+
+def heuristic_ore_effect(official_news: str, published_day: int) -> Optional[dict]:
+    """LLM 失败时的弱假设：识别矿种 + 停工/涨价时间窗。多矿种时返回第一条。"""
+    effects = heuristic_ore_effects(official_news, published_day)
+    return effects[0] if effects else None
 
 
 class NewsMemory:
@@ -185,15 +288,17 @@ class NewsMemory:
             meaningful = official.strip() and "无重大新闻" not in official
             if meaningful:
                 self.data["needOreParse"] = True
-                weak = heuristic_ore_effect(official, day)
-                if weak:
+                effects = heuristic_ore_effects(official, day)
+                for weak in effects:
                     self._upsert_ore_effect(weak)
-                    if getattr(state, "decision_events", None) is not None:
-                        trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程", effect=weak)
+                if effects and getattr(state, "decision_events", None) is not None:
+                    trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
+                          effects=effects)
+                weak = effects[0] if effects else None
                 log_news_event(
                     event="official_ingested", roundNo=state.round_no,
                     title=f"【新闻】官方消息 | {headline(official)}",
-                    officialNews=official, oreEffect=weak,
+                    officialNews=official, oreEffect=weak, oreEffects=effects,
                 )
                 log_official_plan(state.round_no, self.store_official_plan(state.round_no),
                                   source=(weak or {}).get("source") or "pending_llm")
