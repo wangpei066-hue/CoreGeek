@@ -337,6 +337,26 @@ def failure_fingerprint(action, target, workspace, error_class):
     ))
 
 
+def api_command_signature(command):
+    """Return semantic request identity without inspecting or changing values."""
+    text = str(command or '')
+    urls = [clean_url(url) for url in URL_RE.findall(text)]
+    if not urls:
+        return None
+    parsed = urlparse(urls[0])
+    params = parse_qs(parsed.query)
+    for match in re.finditer(r'--data-urlencode\s+["\']?([^\s"\']+)', text):
+        pair = match.group(1)
+        if '=' in pair:
+            key, value = pair.split('=', 1)
+            params.setdefault(key, [value])
+    stable = tuple(sorted((key, tuple(values)) for key, values in params.items()
+                          if key not in PAGE_PARAM_KEYS))
+    auth = 'bearer' if re.search(r'Authorization[^\n]*Bearer', text, re.IGNORECASE) else (
+        'api-key' if re.search(r'X-API-Key', text, re.IGNORECASE) else 'unknown')
+    return parsed.scheme, parsed.netloc, parsed.path, auth, stable
+
+
 def classify_tool_error(result):
     err = str((result or {}).get('error') or '')
     if err in ('not_found', 'ambiguous_path', 'workspace_invalid', 'tool_timeout',
@@ -1257,7 +1277,17 @@ class PioneerTaskSolver:
                     if name and path_basename(item.get('target')) == name:
                         return True
         fingerprint = failure_fingerprint(action, target, workspace, error_class)
-        return any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or [])
+        if any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or []):
+            return True
+        if s.get('taskKind') == 'api' and action == 'execute':
+            signature = api_command_signature(target)
+            if signature is not None:
+                return any(
+                    item.get('action') == 'execute'
+                    and item.get('errorClass') == error_class
+                    and api_command_signature(item.get('target')) == signature
+                    for item in s.get('failedActions') or [])
+        return False
 
     def _switch_to_api_experience(self, s, task, reason):
         hit = matching_api_experience(self.experience, task)
