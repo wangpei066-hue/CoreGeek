@@ -157,22 +157,30 @@ def rear_weapon_x(state, base):
     return left + 1 if attack_direction(state, base) == 1 else right - 1
 
 
-def weapon_slots(state, base):
-    """两门放最后一排上下两侧，一门放到另一侧再靠前一格，避免堵在迎敌墙内侧。"""
+def weapon_slot_plan(state, base):
+    """武器编位：前排两侧一火箭一电磁，火箭侧后方再补一门火箭。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
-    rear_x = rear_weapon_x(state, base)
-    forward_x = rear_x + direction
+    front_x = (right if direction == 1 else left) - direction
+    rear_x = front_x - direction
     y_low, y_high = bottom + 1, top - 1
     width, height = state.map_info.width, state.map_info.height
-    slots = [(rear_x, y_low), (rear_x, y_high), (forward_x, y_high)]
+    slots = [
+        ('rocket', (front_x, y_low)),
+        ('railgun', (front_x, y_high)),
+        ('rocket', (rear_x, y_low)),
+    ]
     station = {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
     cleaned = []
-    for x, y in slots:
+    for name, (x, y) in slots:
         if not (0 <= x < width and 0 <= y < height) or (x, y) in station:
             continue
-        cleaned.append((x, y))
+        cleaned.append((name, (x, y)))
     return cleaned
+
+
+def weapon_slots(state, base):
+    return [point for _name, point in weapon_slot_plan(state, base)]
 
 
 def wall_ring(state, base):
@@ -1113,12 +1121,13 @@ def weapon_approach_path(role, weapon, blocked, reserved, state):
 
 
 def weapon_candidates(state, base, name, extra_names=(), extra_positions=()):
-    """按编制空位补齐：先最后一排两门，再另一侧靠前一格。extra_names 仅兼容调用方。"""
+    """按编制空位补齐：火箭侧两门、另一侧电磁；类型和位置绑定。"""
     occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles
                 if r.health > 0 and r.role_type in ('gatling', 'railgun', 'rocket', 'wall', 'station')}
     occupied.update((p[0], p[1]) for p in extra_positions)
     occupied.update((base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1))
-    slots = [p for p in weapon_slots(state, base) if p not in occupied]
+    slots = [p for slot_name, p in weapon_slot_plan(state, base)
+             if slot_name == name and p not in occupied]
     if slots:
         return slots
     left, right, bottom, top = defense_bounds(state, base)

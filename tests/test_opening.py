@@ -134,12 +134,15 @@ class OpeningTests(unittest.TestCase):
                             for e in state.decision_events))
 
     def test_two_weapons_on_rear_rank_one_cell_forward(self):
-        from src.agent.opening import weapon_slots
+        from src.agent.opening import weapon_slot_plan, weapon_slots
         state = opening_state()
+        plan = weapon_slot_plan(state, state.team_our.roles[0])
         slots = weapon_slots(state, state.team_our.roles[0])
         self.assertEqual(len(slots), 3)
+        self.assertEqual([name for name, _point in plan], ['rocket', 'railgun', 'rocket'])
         self.assertEqual(slots[0][0], slots[1][0])
-        self.assertEqual(slots[2][0], slots[0][0] + 1)
+        self.assertEqual(slots[2][0], slots[0][0] - 1)
+        self.assertEqual(slots[0][1], slots[2][1])
         self.assertNotEqual(slots[0][1], slots[1][1])
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):

@@ -141,21 +141,19 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapons_occupy_rear_rank_and_one_forward_flank(self):
+    def test_weapon_layout_front_flanks_and_rear_rocket_pair(self):
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            first = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(50, first[0], first[1], 'rocket'))
-            second = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(51, second[0], second[1], 'rocket'))
-            third = weapon_candidates(state, base, 'rocket')[0]
-            self.assertEqual(first[0], second[0])
-            self.assertEqual(third[0], first[0] + direction)
-            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10) - 4)
-            self.assertNotEqual(first[1], second[1])
-            state.team_our.roles.pop()
+            front_rocket = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(50, front_rocket[0], front_rocket[1], 'rocket'))
+            rear_rocket = weapon_candidates(state, base, 'rocket')[0]
+            railgun = weapon_candidates(state, base, 'railgun')[0]
+            self.assertEqual(rear_rocket[0], front_rocket[0] - direction)
+            self.assertEqual(rear_rocket[1], front_rocket[1])
+            self.assertEqual(railgun[0], front_rocket[0])
+            self.assertNotEqual(railgun[1], front_rocket[1])
             state.team_our.roles.pop()
 
     def test_rebuild_missing_wall_beats_third_tier_upgrade(self):

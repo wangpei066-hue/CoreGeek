@@ -435,7 +435,7 @@ def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
     if base is None or gold < 25:
         trace(state, role.id, 'opening_no_gold', '武器资金不足；三座火箭未齐前不改去修墙')
         return None, gold
-    pending = []
+    pending = list(getattr(state, '_opening_pending_weapon_names', []))
     name = pick_weapon_name(state, pending)
     for point in weapon_candidates(state, base, name, extra_positions=claimed):
         if point in claimed or (*point, 'weapon') in state.failed_build_spots:
@@ -445,14 +445,16 @@ def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
             continue
         claimed.add(point)
         if path:
+            state._opening_pending_weapon_names = pending + [name]
             cmd = opening_move(state, role, path, reserved, point, '前往武器施工位',
                                'weapon', 'rocket', 'build_weapons', STAGE_BUILD_WEAPONS)
             return cmd, gold
         cmd = selected(state, role.id, {
-            'action': 'build', 'name': pick_weapon_name(state, []),
+            'action': 'build', 'name': name,
             'targetPos': [{'x': point[0], 'y': point[1]}],
         }, '建造武器')
         reserved.add(point)
+        state._opening_pending_weapon_names = pending + [name]
         return _tick(state, role, STAGE_BUILD_WEAPONS, 'weapon', 'rocket', point, 0, 'build',
                      'build_weapons', cmd), gold - 25
     return None, gold
@@ -691,6 +693,7 @@ def plan_opening_fsm(state):
         return {}
     remaining = day_rounds_remaining(state.round_no)
     blocked, reserved = build_blocked_set(state) | movement_avoid(state), set()
+    state._opening_pending_weapon_names = []
     fighters = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0]
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     gold = state.team_our.gold_num if state.team_our else 0

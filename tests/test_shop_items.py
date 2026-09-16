@@ -14,6 +14,7 @@ from src.agent.brain import (
     V1Strategy,
     BasicActionValidator,
     decide_shop_item_job,
+    maintain_front_wall_health,
     maybe_start_shop_item_job,
     voucher_for,
 )
@@ -303,6 +304,21 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WallUpgradeVoucher1")
         self.assertEqual(job["kind"], "wall")
 
+    def test_day3_keeper_repairs_front_wall_even_with_new_wall_backlog(self):
+        from src.agent.grid import build_blocked_set
+        state = minimal_state(round_no=260, gold_num=1000)
+        state.team_our.roles[0] = make_role(10013, 10, 10, "station", health=1500, level=1)
+        keeper = make_role(1, 19, 20, "worker", health=220, back_pack_capability=100)
+        economist = make_role(2, 18, 20, "worker", health=220, back_pack_capability=100)
+        low_front_wall = make_role(40000, 13, 10, "wall", health=400, level=1)
+        state.team_our.roles += [keeper, economist, low_front_wall]
+
+        cmd = maintain_front_wall_health(keeper, state, build_blocked_set(state), set())
+
+        self.assertIsNotNone(cmd)
+        self.assertEqual(state.worker_item_jobs[keeper.id]["kind"], "wall")
+        self.assertEqual(state.worker_item_jobs[keeper.id]["target"], (13, 10))
+
     def test_no_job_started_without_enough_gold(self):
         state = minimal_state(gold_num=5)
         worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
@@ -404,7 +420,7 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
     def test_pioneer_starts_and_executes_upgrade_job(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 1  # 基地 level1，会先选中它升级
-        pioneer = make_role(10011, 10, 11, "pioneer", back_pack_capability=40)  # 邻接基地 (10,10)
+        pioneer = make_role(10011, 12, 8, "pioneer", back_pack_capability=40)  # 站在新火箭预留位上
         state.team_our.roles.append(pioneer)
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
