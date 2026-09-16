@@ -3,7 +3,7 @@
 墙线是候选几何规划，不是官方合法区域；以快照中的建筑判断完成。
 """
 from collections import deque
-from itertools import permutations
+from itertools import combinations, permutations
 
 from .protocol import Pos
 from .grid import build_blocked_set, chebyshev, neighbors8
@@ -1036,13 +1036,34 @@ def assign_weapons(state, excluded_ids=(), persist=False):
             distances[fighter.id, weapon.id] = len(path) if path is not None else 10000
     fighter_order = {f.id: i for i, f in enumerate(sorted(fighters, key=lambda r: _fighter_layer(state, r)))}
     weapon_order = {w.id: i for i, w in enumerate(sorted(weapons, key=lambda r: _weapon_layer(state, r)))}
+    # 人少炮多时，一人站两门火箭共同邻格可轮流开火：优先让另一人去开非火箭炮，覆盖全部武器。
+    dual_pairs = []
+    if len(fighters) < len(weapons):
+        rockets = [w for w in weapons if w.role_type == 'rocket']
+        dual_pairs = [(a, b) for a, b in combinations(rockets, 2)
+                      if dual_rocket_stands(state, a, b, static)]
+
+    def covered(pairs):
+        assigned = {w.id for _, w in pairs}
+        extra = set()
+        for a, b in dual_pairs:
+            if a.id in assigned and b.id not in assigned:
+                extra.add(b.id)
+            elif b.id in assigned and a.id not in assigned:
+                extra.add(a.id)
+        return len(assigned | extra)
+
+    def score_of(pairs):
+        base = _assignment_score(pairs, distances, fighter_order, weapon_order)
+        return (base[0], -covered(pairs)) + base[1:]
+
     best = None
     assignment = {}
     count = min(len(fighters), len(weapons))
     for chosen in permutations(fighters, count):
         for targets in permutations(weapons, count):
             pairs = list(zip(chosen, targets))
-            score = _assignment_score(pairs, distances, fighter_order, weapon_order)
+            score = score_of(pairs)
             if best is None or score < best:
                 best = score
                 assignment = {f.id: w for f, w in pairs}
@@ -1059,7 +1080,7 @@ def assign_weapons(state, excluded_ids=(), persist=False):
             prev[fid] = weapon
     if len(prev) == count and len({w.id for w in prev.values()}) == count:
         prev_pairs = [(next(f for f in fighters if f.id == fid), weapon) for fid, weapon in prev.items()]
-        prev_score = _assignment_score(prev_pairs, distances, fighter_order, weapon_order)
+        prev_score = score_of(prev_pairs)
         if best is None or prev_score <= best:
             assignment = prev
     if persist:

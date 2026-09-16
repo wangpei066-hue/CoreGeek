@@ -302,6 +302,29 @@ def _pick_damaged_wall(state: "MatchState", pending_targets: set):
     return min(candidates, key=lambda r: r.health)
 
 
+def _pick_front_wall_below_floor(state: "MatchState", pending_targets: set, floor: float = 0.5):
+    """前排墙低于安全血线时优先升级；升级会回满血。"""
+    base = own_station(state)
+    if base is None:
+        return None
+    from .opening import primary_wall_plan, wall_priority
+    front = {
+        p for p in primary_wall_plan(state, base)
+        if wall_priority(state, base, p) == 0
+    }
+    candidates = [
+        r for r in state.team_our.roles
+        if r.role_type == "wall"
+        and r.health > 0
+        and (r.pos.x, r.pos.y) in front
+        and (r.pos.x, r.pos.y) not in pending_targets
+        and r.health < max_health(r) * floor
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda r: ((r.level or 1) >= 3, r.health / max(1, max_health(r)), r.id))
+
+
 def _weapon_front_key(state: "MatchState", role: Role):
     """迎敌方向越靠前越小，供 min() 选取最前武器。"""
     from .opening import attack_direction
@@ -536,6 +559,10 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
           available_gold=state.team_our.gold_num, reserved_target_count=len(pending_targets))
 
     release_stale_repair_job(role, state)
+    # 第三天起经济工不接围墙升级/修复，交给专职修墙工；矿价上涨日的集中升级阶段除外。
+    from .economy import spike_cashout_phase
+    allow_wall_jobs = (day3_worker_duty(state, role) != "economist"
+                       or spike_cashout_phase(state) == "upgrade")
     # 未购入任务按 升级武器 > 升墙/基地 > 紧急修墙 让位。已买到手的道具继续用完。
     old_job = state.worker_item_jobs.get(role.id)
     item_name = old_job.get('item', '') if old_job else ''
@@ -627,7 +654,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             return
 
     wall = _pick_upgradeable(state, ("wall",), pending_targets, min_health_ratio=0.0)
-    if wall and allow_structure_upgrade:
+    if wall and allow_structure_upgrade and allow_wall_jobs:
         name, cost = voucher_for("wall", wall.level or 1)
         if name in role.backpack or state.team_our.gold_num >= item_cost(name, state):
             state.worker_item_jobs[role.id] = {"item": name, "target": (wall.pos.x, wall.pos.y), "kind": "wall"}
@@ -668,7 +695,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             trace(state, role.id, "station_upgrade_unaffordable", "基地可升级，但余额不足", available_gold=state.team_our.gold_num, required_gold=cost)
 
     damaged_wall = _pick_damaged_wall(state, pending_targets)
-    if damaged_wall and 'WallFixer' in role.backpack:
+    if damaged_wall and allow_wall_jobs and 'WallFixer' in role.backpack:
         state.worker_item_jobs[role.id] = {
             "item": "WallFixer", "target": (damaged_wall.pos.x, damaged_wall.pos.y), "kind": "wall",
         }
@@ -823,6 +850,93 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         return selected(state, role.id, {"action": "buy", "name": item, "num": num}, '批量购买升级券并按队列逐个使用')
     return move_on_path(state, role, adjacent_path(role, shop.pos, walkable, state), reserved, '执行维修/升级道具任务')
 
+
+
+def day3_worker_duty(state: "MatchState", worker: Role) -> Optional[str]:
+    """第三天起沿用首日分工：施工工专职修墙/升墙（keeper），经济工专职采卖矿和武器券（economist）。
+    只剩一名工人时由他兼任 keeper。"""
+    if worker.role_type != "worker" or not structure_priority_day(state):
+        return None
+    from .opening_schedule import opening_worker_mode
+    return "keeper" if opening_worker_mode(state, worker) == "builder" else "economist"
+
+
+def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, reserved: set):
+    """第三天起由专职修墙工保持前排墙半血以上；低于半血优先升级回血。"""
+    if role.role_type != "worker" or not state.team_our:
+        return None
+    if day3_worker_duty(state, role) != "keeper":
+        return None
+    job = state.worker_item_jobs.get(role.id)
+    if job and (job.get("kind") == "weapon" or job.get("item") in role.backpack):
+        # 手里已有道具或正在升武器：不顶掉，先把当前任务做完。
+        return None
+    if any(isinstance(item, str) and item.startswith("WeaponUpgradeVoucher") for item in (role.backpack or [])):
+        return None
+    wall = _pick_front_wall_below_floor(state, _pending_item_job_targets(state), floor=0.5)
+    if wall is None:
+        return None
+    level = wall.level or 1
+    item = voucher_for("wall", level)[0] if level < 3 else "WallFixer"
+    if item not in role.backpack and state.team_our.gold_num < item_cost(item, state):
+        trace(state, role.id, "front_wall_health_unfunded",
+              "前排墙低于半血但金币不足，无法立刻购买升级/修复道具",
+              wall_id=wall.id, wall_health=wall.health, wall_level=level,
+              item=item, gold=state.team_our.gold_num)
+        return None
+    state.worker_item_jobs[role.id] = {
+        "item": item, "target": (wall.pos.x, wall.pos.y), "kind": "wall",
+    }
+    cmd = decide_shop_item_job(role, state, blocked, reserved)
+    if cmd:
+        trace(state, role.id, "front_wall_health_maintenance",
+              "前排墙低于半血，优先升级/修复回血，避免机器人直打基地",
+              wall_id=wall.id, wall_health=wall.health, wall_level=level, item=item)
+    return cmd
+
+
+def spike_day_cashout(worker: Role, state: "MatchState", blocked: set, reserved: set):
+    """矿价上涨日：经济工白天先清空背包，再买券回家升级武器/基地/围墙，做完再去采矿。"""
+    from .economy import (
+        liquidate, muster_for_night, sellable_ores, set_spike_cashout_phase, spike_cashout_phase,
+    )
+    from .opening_schedule import opening_worker_mode
+    phase = spike_cashout_phase(state)
+    if phase in (None, "done") or worker.role_type != "worker":
+        return None
+    if opening_worker_mode(state, worker) != "economist":
+        return None
+    if phase == "sell":
+        if sellable_ores(worker, state, dump_extra_stone=True, ignore_stockpile=True):
+            handled, cmd = liquidate(worker, state, blocked, reserved,
+                                     force_reason="矿价上涨日，经济工先清空背包")
+            if cmd:
+                trace(state, worker.id, "spike_day_cashout", "矿价上涨日清包变现", phase="sell")
+                return cmd
+            if handled:
+                return None  # 小贩暂时不可达：保持清包阶段，交给常规流程。
+        set_spike_cashout_phase(state, "upgrade")
+        trace(state, worker.id, "spike_day_phase", "清包完成或来不及卖，转入买券升级", phase="upgrade")
+    handled, cmd = muster_for_night(worker, state, blocked, reserved)
+    if handled:
+        return cmd
+    for _ in range(3):
+        maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=True)
+        if worker.id not in state.worker_item_jobs:
+            break
+        cmd = decide_shop_item_job(worker, state, blocked, reserved)
+        if cmd:
+            trace(state, worker.id, "spike_day_cashout", "矿价上涨日买券并升级武器/基地/围墙",
+                  phase="upgrade", item=state.worker_item_jobs.get(worker.id, {}).get("item"))
+            return cmd
+    job = state.worker_item_jobs.get(worker.id)
+    if job and (job.get("item") in worker.backpack
+                or state.team_our.gold_num >= item_cost(job.get("item"), state)):
+        return None  # 券在手或买得起但本回合走不了，保持升级阶段，由常规流程继续推进。
+    set_spike_cashout_phase(state, "done")
+    trace(state, worker.id, "spike_day_phase", "金币已用完或没有可升级目标，回去采矿", phase="done",
+          gold=state.team_our.gold_num)
+    return None
 
 
 def item_cost(name: str, state: "MatchState") -> int:
@@ -1098,8 +1212,17 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if seal:
         return seal
     release_stale_repair_job(worker, state)
+    spike = spike_day_cashout(worker, state, blocked, reserved)
+    if spike:
+        return spike
+    front_wall = maintain_front_wall_health(worker, state, blocked, reserved)
+    if front_wall:
+        return front_wall
     allow_build = worker_should_build_walls(state, worker)
     allow_weapon = worker_should_shop_weapon_voucher(worker, state, blocked)
+    # 第三天起经济工只在正面出现关键缺口时帮墙，其余时间留给采卖矿和武器券。
+    economist = day3_worker_duty(state, worker) == 'economist'
+    wall_help = not economist or critical_wall_missing(state)
     cashout = in_pre_night_cashout_window(worker, state, blocked, reserved)
     job = state.worker_item_jobs.get(worker.id)
     held_item = bool(job and job.get('item') in worker.backpack)
@@ -1144,7 +1267,26 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         cmd = decide_shop_item_job(worker, state, blocked, reserved)
         if cmd:
             return cmd
-    if structure_priority_day(state) and (not cashout or critical_wall_missing(state)):
+    if economist and (staged_walls_incomplete(state) or critical_wall_missing(state)):
+        # 墙有缺口时由施工工补墙；经济工先清空背包，再按到手金币决定买券升级还是帮墙。
+        from .economy import sellable_ores
+        if sellable_ores(worker, state, ignore_stockpile=True):
+            handled, cmd = liquidate(worker, state, blocked, reserved,
+                                     force_reason='第三天经济工先清空背包，再判断金币够不够升级',
+                                     keep_wall_stone=True)
+            if cmd:
+                return cmd
+        maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=True)
+        eco_job = state.worker_item_jobs.get(worker.id)
+        if eco_job and (eco_job.get('item') in worker.backpack
+                        or state.team_our.gold_num >= item_cost(eco_job.get('item'), state)):
+            cmd = decide_shop_item_job(worker, state, blocked, reserved)
+            if cmd:
+                trace(state, worker.id, 'economist_upgrade_during_wall_gap',
+                      '墙有缺口由施工工补，经济工先用现有金币买券升级',
+                      item=eco_job.get('item'), gold=state.team_our.gold_num)
+                return cmd
+    if structure_priority_day(state) and wall_help and (not cashout or critical_wall_missing(state)):
         handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=False, allow_build=allow_build)
         if cmd:
             return cmd
@@ -1173,7 +1315,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         cmd = decide_shop_item_job(worker, state, blocked, reserved)
         if cmd:
             return cmd
-    if not cashout or critical_wall_missing(state):
+    if wall_help and (not cashout or critical_wall_missing(state)):
         handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True, allow_build=allow_build)
         if cmd:
             return cmd
@@ -1191,7 +1333,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
     if cmd:
         return cmd
-    if not cashout and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
+    if not cashout and not economist and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, allow_build=allow_build)
         if cmd:
             return cmd
@@ -1588,6 +1730,8 @@ def _night_economy_worker_to_release(state, blocked, task_pioneers):
     if len(workers) < 2 or not pioneers or len(rockets) < 2 or not non_rockets:
         return None
     from .opening import dual_rocket_partner, weapon_approach_path
+    from .opening_schedule import opening_worker_mode
+    is_economist = {w.id: opening_worker_mode(state, w) == "economist" for w in workers}
     dual_workers = []
     for worker in workers:
         for rocket in rockets:
@@ -1596,17 +1740,26 @@ def _night_economy_worker_to_release(state, blocked, task_pioneers):
                 continue
             path = weapon_approach_path(worker, rocket, blocked, set(), state)
             if path is not None:
-                dual_workers.append((len(path), worker.id, rocket.id, worker, rocket))
+                # 施工工优先守双火箭，经济工留给夜间采矿。
+                dual_workers.append((is_economist[worker.id], len(path), worker.id, rocket.id, worker, rocket))
     if not dual_workers:
         return None
-    _, _id, _rid, dual_worker, _rocket = min(dual_workers)
+    dual_worker = min(dual_workers)[4]
     if not any(weapon_approach_path(pioneer, weapon, blocked, set(), state) is not None
                for pioneer in pioneers for weapon in non_rockets):
         return None
     candidates = [w for w in workers if w.id != dual_worker.id]
     if not candidates:
         return None
-    return max(candidates, key=lambda w: (len(w.backpack or []), w.id))
+    released = max(candidates, key=lambda w: (is_economist[w.id], len(w.backpack or []), w.id))
+    # 已进入回防时段就不放出：留在开炮名单里，回到炮位后能正常开火。
+    from .economy import defense_occupancy
+    occupancy, _snap = defense_occupancy(released, state, blocked)
+    if occupancy != "free":
+        trace(state, released.id, "night_worker_release_skipped",
+              "夜间回防余量不足，经济工不外出采矿，留在炮位名单", occupancy=occupancy)
+        return None
+    return released
 
 
 def plan_night(state: "MatchState") -> dict:

@@ -114,6 +114,48 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertIn(commands[freed.id]['action'], ('move', 'collect', 'sell', 'buy'))
         self.assertFalse(any(c.get('controllerId') == str(freed.id) for c in commands.values()))
 
+    def _dual_rocket_night(self):
+        state = opening_state()
+        state.round_no = 80
+        state.team_our.gold_num = 0
+        state.team_our.player_tasks = []
+        state.team_our.roles = [
+            r for r in state.team_our.roles
+            if r.role_type not in ('rocket', 'gatling', 'railgun')
+        ]
+        state.team_our.roles += [
+            make_role(20, 9, 9, 'rocket', level=2, attack_range=20, cooldown=0, health=1000),
+            make_role(21, 9, 11, 'rocket', level=2, attack_range=20, cooldown=2, health=1000),
+            make_role(22, 11, 12, 'railgun', level=2, attack_range=20, cooldown=0, health=1000),
+        ]
+        state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
+        return state
+
+    def test_two_fighters_cover_three_guns_via_dual_rockets(self):
+        from src.agent.opening import assign_weapons
+        for first, second in ((Pos(9, 10), Pos(8, 8)), (Pos(8, 12), Pos(10, 8)), (Pos(10, 10), Pos(8, 11))):
+            state = self._dual_rocket_night()
+            w1, w2 = [r for r in state.team_our.roles if r.role_type == 'worker']
+            w1.pos, w2.pos = first, second
+            pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+            assignment = assign_weapons(state, excluded_ids={pioneer.id})
+            kinds = sorted(w.role_type for w in assignment.values())
+            self.assertEqual(kinds, ['railgun', 'rocket'], (first, second))
+
+    def test_released_worker_stays_on_guns_when_defense_is_due(self):
+        from unittest import mock
+        state = self._dual_rocket_night()
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(9, 10)
+        freed = next(r for r in state.team_our.roles if r.id == 2)
+        freed.pos = Pos(7, 9)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(10, 12)
+        with mock.patch('src.agent.economy.defense_occupancy', return_value=('returning', {})):
+            self.decide(state)
+        self.assertIn(str(freed.id), state.policy_memory['weapon_assignment'])
+        self.assertTrue(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
+
     def test_ordinary_voucher_does_not_preempt_feasible_task(self):
         state = opening_state()
         state.round_no = 140

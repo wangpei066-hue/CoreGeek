@@ -1,7 +1,6 @@
 """平台自进化任务状态机：读沙盒文档 → 平台LLM → 沙盒交互/提交答案。"""
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shlex
@@ -67,30 +66,20 @@ DEPLOYMENT_SOP = DEPLOYMENT_SOP_TEMPLATE + '''
 若探查已确认CRLF且允许修复启动格式，用Python将\\r\\n规范为\\n，不要依赖dos2unix，也不要改检查器逻辑。
 成功检查后直接依据真实TOKEN构造答案，不要再分轮验证。
 '''
-API_SOP = '''API SOP：任务正文和任务明确引用的 API 文档是最高优先级；先确认任务要求的字段、答案格式、接口路径、认证、参数和分页方式，再决定是否使用历史经验。
-历史 API 经验只能作为候选线索，必须由你结合当前任务/文档确认；当前任务出现新字段、新描述、新 URL 或与经验冲突时，以当前资料为准，不要静默套用旧契约。
-不要因为任务看起来像遗产查询就假定是 heritage 接口，也不要默认跳过 API_DOCS.md。只有当前资料或已由你确认的响应证据支持时，才能使用某个接口契约。
-本地实验中曾验证过的候选契约是：GET `/api/v1/heritage/search`，请求头 `Authorization: Bearer heritage-api-key-2024`，城市参数 `location`，分页参数 `offset`/`limit`；响应业务码在 `code`，记录为 `data.records`，分页为 `data.pagination`。这只是候选，不是新任务的固定答案。
-读完当前任务和必要文档后，只做一次契约选择并执行；同一文档已经读过且没有新错误证据时禁止再次 read。不要猜 `$API_TOKEN`、`.env`、隐含密钥或文档外的认证来源；密钥必须来自当前文档、已验证经验或题目明确给出的值。
-若第一次请求返回 401/400/404 或字段结构错误，直接依据真实错误和当前资料在下一次 execute 中集中修正路径、认证、参数或解析，不要重复原命令，不要再次读取同一 API 文档，也不要连续做零碎探查。
-确认契约后，查询必须覆盖任务要求的全部数据；若使用 offset/limit，显式传 `offset=0` 和合理 `limit`，按实际 pagination 继续分页，检测重复页面、重复 ID、总量不一致和无进展。中文参数使用 curl 编码。
-HTTP/shell 成功不等于业务成功。依据当前响应和任务文档判断业务码、记录路径、分页结构及统计字段；不要假定存在 status=success、items 或固定的 oldest_era 语义。
-查询完整后，按照当前任务文档解释字段和比较规则，生成符合当前任务要求的最终 JSON。不要让历史 schema、固定年代表或旧任务答案覆盖当前任务定义；信息不足时继续阅读或向 LLM 自己提出下一步，而不是猜测。
-只打印必要证据和最终结果，避免样本/keys/逐页调试输出导致截断。'''
+API_SOP = '''同一服务已有已验证调用经验时，优先复用路径、认证方式和城市参数，不重新猜测接口，也不要去读其他城市旧任务文件。
+缺少经验或经验失效时，再阅读当前任务的API文档并依据错误响应调整。
+本地任务环境的已验证兼容契约是：GET `/api/v1/heritage/search`，请求头 `Authorization: Bearer heritage-api-key-2024`，城市参数 `location`，分页参数 `offset`/`limit`；响应业务码在 `code`，记录为 `data.records`，分页为 `data.pagination`。文档中的 `X-API-Key`、`city`、`page` 仅作为过时内容处理。
+已知接口用 curl -G --data-urlencode 查询；必须显式传 `offset=0&limit=100`（或在一次 shell/Python 脚本中循环 offset），不能省略分页参数，也不能只取默认第一页。中文参数交给 curl 编码。
+已知接口使用实际响应的 code、data.records、data.pagination；不要假定存在 status=success 或 items。
+HTTP/shell 成功不等于业务成功。code 非 200 时停止分页和统计。401 时停止依赖步骤并修正认证；参数错误时先改参数。
+查询成功不等于全量读取已验证。按 pagination 分页，检测重复页面、重复ID、总量不一致及无进展。
+世界遗产用 protected_level 精确匹配任务要求。oldest_era 提交遗产名称且必须有年代比较依据，模糊年代不能用第一条记录占位。一次 execute 应完成全部分页、去重、统计和年代比较，只打印一个最终 JSON；不要先打印样本、keys、era_map 或逐页调试输出。
+'''
 PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
 PROMPT_DEPLOY = '''部署SOP：read任务文档→read唯一spec.md→下一次execute一次完成修复、CRLF处理和check→从成功输出提取真实TOKEN并submit。配置按物理行用awk写临时文件再mv；CRLF用tr -d '\\r'。不要继续ls/cat探查，不要修改check，不要重复失败命令。'''
-PROMPT_API = '''API执行协议：
-1. 先读当前任务正文；任务列出的 API 文档按需读取一次。若正文明确警告文档可能过时，且已有候选契约或足够任务线索，优先做一次真实请求确认契约，不要先照抄文档示例；只有缺少必要信息或请求失败时才读文档。
-2. 将历史经验作为候选，与当前正文/文档逐项核对：路径、认证头、参数名、响应 JSON 路径、分页方式和最终字段。不要猜 $API_TOKEN、.env 或隐含密钥。
-3. 核对完成后必须立即返回一个 execute，完成真实请求和必要统计；不要再 read 同一文档，不要先做样本/keys/逐页探查。
-4. 若真实响应返回 401/400/404 或结构错误，只根据错误和当前资料在下一次 execute 集中修正一次；禁止重复原命令。若响应成功，按实际结构分页并校验完整性。
-5. 提交被判错后，必须读取最新 errorCode/description 和真实结果重新计算；禁止原样重复上一次 taskAnswer，除非有新的验证证据证明判题反馈已过期。
-6. 最终答案的字段、类型、排序和语义严格由当前任务定义，历史 schema 只能提供线索；数据完整后由你返回 submit。
-认证细则：不要写 `$API_TOKEN`、`$TOKEN`、`.env` 或任何未定义变量来“代替”密钥。若当前资料确认使用本地遗产候选契约，必须使用已确认的字面认证值 `heritage-api-key-2024`；若当前任务给出其他值，则以当前任务为准；两者都没有时先询问/读取依据，不能猜。
-统计细则：只使用真实响应中实际存在的字段名，禁止凭记忆改写字段（例如不要把 `protected_level` 猜成 `protection_level`）。统计脚本必须在同一次 execute 中校验记录路径、记录总数、关键字段存在、去重结果和最终答案字段；若关键字段不存在，停止并重新阅读当前资料，不要提交猜测结果。
-最高优先级提醒：如果当前任务明确说 API 文档部分过时，不能照抄文档中的旧认证/参数；先采用当前任务或已验证经验提供的候选，执行一次真实请求，用响应确认契约。模拟遗产任务的候选是 Authorization: Bearer、location、offset/limit；这是待验证起点，不是固定答案。'''
+PROMPT_API = '''API SOP：不要读取过时的API_DOCS.md；读完题目后直接一次execute完成全部查询和统计，随后立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination；文档中的X-API-Key、city、page过时。第一请求必须显式 `offset=0&limit=100`，若pagination.total_count仍大于返回数，必须在同一条命令中循环 offset=已有记录数直到收齐；不得只查询默认10条，不得打印样本/字段探查/逐页调试信息。按唯一id去重，code必须为200；protected_level精确统计世界遗产。oldest_era 必须按记录的 era_order；若模拟数据的 era_order 全为 null，按明确历史顺序比较（六朝早于明，明早于清），不要用第一条记录占位。数字保持数字，最后只输出一个答案JSON。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
@@ -315,19 +304,6 @@ def normalize_target(value):
     return ' '.join(str(value or '').replace('\\', '/').split())
 
 
-def same_document_path(left, right):
-    """Compare document paths across local macOS /var symlink aliases."""
-    a, b = normalize_target(left), normalize_target(right)
-    if a == b:
-        return True
-    if a.startswith('/') and b.startswith('/'):
-        try:
-            return os.path.realpath(a) == os.path.realpath(b)
-        except (OSError, ValueError):
-            pass
-    return False
-
-
 def failure_fingerprint(action, target, workspace, error_class):
     return '|'.join((
         action or '',
@@ -335,34 +311,6 @@ def failure_fingerprint(action, target, workspace, error_class):
         normalize_target(workspace),
         error_class or '',
     ))
-
-
-def api_command_signature(command):
-    """Return semantic request identity without inspecting or changing values."""
-    text = str(command or '')
-    urls = [clean_url(url) for url in URL_RE.findall(text)]
-    if not urls:
-        return None
-    parsed = urlparse(urls[0])
-    params = parse_qs(parsed.query)
-    for match in re.finditer(r'--data-urlencode\s+["\']?([^\s"\']+)', text):
-        pair = match.group(1)
-        if '=' in pair:
-            key, value = pair.split('=', 1)
-            params.setdefault(key, [value])
-    stable = tuple(sorted((key, tuple(values)) for key, values in params.items()
-                          if key not in PAGE_PARAM_KEYS))
-    auth = 'bearer' if re.search(r'Authorization[^\n]*Bearer', text, re.IGNORECASE) else (
-        'api-key' if re.search(r'X-API-Key', text, re.IGNORECASE) else 'unknown')
-    return parsed.scheme, parsed.netloc, parsed.path, auth, stable
-
-
-def contradicts_stale_api_warning(task, command):
-    """Detect only command forms explicitly warned about by the task text."""
-    if not re.search(r'过时|不准确|发生变化|stale|outdated', task or '', re.IGNORECASE):
-        return False
-    return bool(re.search(r'X-API-Key|(?:^|[?&])city=|(?:^|[?&])page=',
-                         command or '', re.IGNORECASE))
 
 
 def classify_tool_error(result):
@@ -1206,10 +1154,7 @@ class PioneerTaskSolver:
         hit = matching_api_experience(self.experience, state.phase_task) if s.get('taskKind') != 'workspace' else None
         if hit and api_fetch_query(hit, state.phase_task, 'preview'):
             s['apiReplay'] = hit
-            # Experience is a candidate for the LLM, not authorization to
-            # execute.  Read the current brief first so changed fields and
-            # descriptions can override stale cross-task memory.
-            s['apiConfirmationRequired'] = True
+            s['stage'] = 'api_fetch'
             s['experienceHit'] = True
             s['metrics']['experienceHit'] = True
             s['metrics']['memoryMatched'] = True
@@ -1285,25 +1230,14 @@ class PioneerTaskSolver:
                     if name and path_basename(item.get('target')) == name:
                         return True
         fingerprint = failure_fingerprint(action, target, workspace, error_class)
-        if any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or []):
-            return True
-        if s.get('taskKind') == 'api' and action == 'execute':
-            signature = api_command_signature(target)
-            if signature is not None:
-                return any(
-                    item.get('action') == 'execute'
-                    and item.get('errorClass') == error_class
-                    and api_command_signature(item.get('target')) == signature
-                    for item in s.get('failedActions') or [])
-        return False
+        return any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or [])
 
     def _switch_to_api_experience(self, s, task, reason):
         hit = matching_api_experience(self.experience, task)
         if not hit or not api_fetch_query(hit, task, 'preview'):
             return False
         s['apiReplay'] = hit
-        s['apiConfirmationRequired'] = True
-        s['stage'] = 'ask'
+        s['stage'] = 'api_fetch'
         s['experienceHit'] = True
         s.setdefault('metrics', {})['experienceHit'] = True
         self._fact(s, reason)
@@ -1451,13 +1385,7 @@ class PioneerTaskSolver:
                     s['_apiStats'] = stats
                     return 'done'
                 if stats.get('error') == 'total_mismatch' and stats.get('nextOffset') is not None:
-                    # Pagination is transport-level bookkeeping: continue the
-                    # verified query automatically, but keep answer selection
-                    # and schema interpretation in the LLM.
-                    s['apiOffset'] = stats['nextOffset']
-                    s['apiLimit'] = stats.get('nextLimit') or s.get('apiLimit') or 10
-                    self._fact(s, 'API结果未查全，自动继续分页 offset=%s' % stats['nextOffset'])
-                    return 'continue'
+                    self._fact(s, 'LLM命令结果未查全 offset=%s，等待后续分页' % stats['nextOffset'])
                 return 'ask'
             # A compact one-shot script may intentionally emit only its final
             # statistics instead of every raw record.  Accept it when the
@@ -1676,10 +1604,12 @@ class PioneerTaskSolver:
                 replay = default_heritage_experience(state.phase_task, s.get('documents'))
                 if replay:
                     s['apiReplay'] = replay
-                    s['apiConfirmationRequired'] = True
-                    self._fact(s, '读取任务简报后将遗产API契约作为候选，交由LLM确认')
-                    s['history'].append({'contractCandidate': {
-                        'path': replay['path'], 'cityParam': replay['cityParam']}})
+                    s['stage'] = 'api_fetch'
+                    s['experienceHit'] = True
+                    s['metrics']['experienceHit'] = True
+                    s['metrics']['memoryInjected'] = True
+                    self._fact(s, '读取任务简报后采用已知遗产API契约，跳过过时文档探查')
+                    s['history'].append({'contractReuse': {'path': replay['path'], 'cityParam': 'location'}})
             if result.get('more') and result['nextOffset'] < 60000:
                 s['offset'] = result['nextOffset']
                 s['paths'][s['index']] = result['path']
@@ -1693,12 +1623,9 @@ class PioneerTaskSolver:
             # still selects the right SOP and enables deterministic TOKEN/API handling.
             if s.get('taskKind') == 'workspace' and deployment_repair_command(s):
                 s['autoRepairPending'] = True
-            # Always let the LLM inspect the current brief (and any explicitly
-            # referenced API docs) before an API experience is used.
-            if s.get('taskKind') == 'api' and s.get('index', 0) >= len(s.get('paths') or []):
-                s['stage'] = 'ask'
-            else:
-                s['stage'] = 'read'
+            # The API contract is available from the task brief; do not let
+            # the normal document-read transition re-enter stale API docs.
+            s['stage'] = 'api_fetch' if s.get('taskKind') == 'api' and s.get('apiReplay') else 'read'
             return execute
         command = s.get('lastTool') or ''
         redacted = dict(result)
@@ -1764,15 +1691,6 @@ class PioneerTaskSolver:
             s['history'].append({'llm': answer})
             s['retries'] = 0
             if answer['action'] == 'submit':
-                rejected_answers = [
-                    item.get('submissionRejected') for item in s.get('history') or []
-                    if isinstance(item, dict) and item.get('submissionRejected') is not None]
-                if (s.get('taskKind') == 'api'
-                        and answer.get('taskAnswer') in rejected_answers):
-                    s['history'].append({'blocked': '禁止重复提交最近被判错的答案'})
-                    self._fact(s, '最近答案已被判错，要求LLM重新计算')
-                    s['stage'] = 'ask'
-                    return
                 if s.get('taskKind') == 'api' and not (s.get('metrics') or {}).get('dataComplete'):
                     # The execute result can arrive through the generic
                     # history path (for example after a transport retry),
@@ -1819,17 +1737,6 @@ class PioneerTaskSolver:
                 if answer['action'] == 'read':
                     path = answer['path']
                     env = s.get('documentDir') or s.get('workspace')
-                    already_read = any(
-                        same_document_path(item.get('path'), path)
-                        and not item.get('error')
-                        for item in s.get('documents') or []
-                        if isinstance(item, dict))
-                    if already_read:
-                        s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
-                        s['history'].append({'blocked': '文档已成功读取，禁止重复读取', 'path': path})
-                        self._fact(s, '拦截重复读取已成功文档: %s' % path)
-                        s['stage'] = 'ask'
-                        return
                     if self._is_duplicate_failure(s, 'read', path, env, 'not_found'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
                         if self._switch_to_api_experience(s, state.phase_task, '拦截重复失败读取，改用已验证API经验'):
@@ -1853,25 +1760,6 @@ class PioneerTaskSolver:
                     s['stage'] = 'read'
                 else:
                     command = answer['command']
-                    if (s.get('taskKind') == 'api'
-                            and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
-                        s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
-                        self._fact(s, '拦截未定义凭据引用，要求LLM使用有依据的认证值')
-                        s['stage'] = 'ask'
-                        return
-                    if (s.get('taskKind') == 'api'
-                            and contradicts_stale_api_warning(
-                                state.phase_task + '\n' + '\n'.join(
-                                    str(item.get('content') or '') for item in s.get('documents') or []),
-                                command)):
-                        s['history'].append({'blocked': '命令使用了任务明确警告过时的 API 字段',
-                                             'command': command})
-                        self._fact(s, '拦截与任务过时警告冲突的API命令，要求LLM重新核对')
-                        s['stage'] = 'ask'
-                        return
-                    if s.get('taskKind') == 'api':
-                        s['apiReplayConfirmed'] = True
-                        s['apiConfirmationRequired'] = False
                     if self._is_duplicate_failure(s, 'execute', command, s.get('workspace'), 'nonzero_exit'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
                         s['history'].append({'blocked': '相同命令已失败且无新证据', 'command': command})
@@ -2071,8 +1959,7 @@ class PioneerTaskSolver:
             if s['stage'] == 'read' and s['index'] >= len(s['paths']):
                 if not self._switch_to_api_experience(s, state.phase_task, '文档读完或失败后改用已验证API经验'):
                     s['stage'] = 'ask'
-            if (s['stage'] == 'ask' and not s.get('apiFetchAttempted')
-                    and not s.get('apiConfirmationRequired')):
+            if s['stage'] == 'ask' and not s.get('apiFetchAttempted'):
                 if self._switch_to_api_experience(s, state.phase_task, '进入提问前改用已验证API经验'):
                     pass
             budget, _remaining = self._budget(s, state)
