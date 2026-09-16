@@ -1868,6 +1868,12 @@ class PioneerTaskSolver:
             s['stage'] = 'ask'
         for field, value in task_context(state.phase_task).items():
             s.setdefault(field, value)
+        # `exhausted` is not a server-side task state.  Recover sessions from
+        # older local versions so a real match never becomes permanently
+        # stuck because of a client-side budget guard.
+        if s.get('stage') == 'exhausted':
+            s['stage'] = 'submit' if s.get('answer') else 'ask'
+            s.pop('endReason', None)
         s.setdefault('metrics', empty_metrics(state.round_no))
         s.setdefault('promptVersion', PROMPT_VERSION)
         s.setdefault('promptHash', PROMPT_HASH)
@@ -1971,19 +1977,15 @@ class PioneerTaskSolver:
                 if execute:
                     s['pendingCommand'] = execute
             elif s['stage'] == 'ask':
-                if budget == 'insufficient' and not s.get('answer'):
-                    self._fact(s, '回合预算不足，不编造答案')
-                    s['endReason'] = 'budget_insufficient'
-                    s['stage'] = 'exhausted'
-                elif s['calls'] < 12:
-                    prompt = self.make_prompt(state)
-                    s['calls'] += 1
-                    s['metrics']['llmCalls'] = s['calls']
-                    s['metrics']['firstActiveRound'] = s['metrics'].get('firstActiveRound') or state.round_no
-                    s['llmPending'] = True
-                    s['stage'] = 'wait_llm'
-                else:
-                    s['stage'] = 'exhausted'
+                # The real platform does not impose a solver-side LLM-call
+                # ceiling.  The local driver enforces its own max_rounds for
+                # simulation, so never turn a real session into `exhausted`.
+                prompt = self.make_prompt(state)
+                s['calls'] += 1
+                s['metrics']['llmCalls'] = s['calls']
+                s['metrics']['firstActiveRound'] = s['metrics'].get('firstActiveRound') or state.round_no
+                s['llmPending'] = True
+                s['stage'] = 'wait_llm'
             elif s['stage'] in ('submit', 'wait_submit'):
                 # phaseTask can rotate away immediately after the first
                 # submitAnswer.  When this session is restored, wait_submit
