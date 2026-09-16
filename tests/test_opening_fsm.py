@@ -136,6 +136,9 @@ def illegal_switches(trail):
         'clearly_closer', 'nearest_relaxed_reserved', 'sticky_relaxed_reserved',
         'clearly_closer_relaxed_reserved', 'stalled_relaxed_reserved',
         'sticky_gone_relaxed_reserved', 'sticky_stalled_relaxed_reserved',
+        # 建造工状态机：成批施工、夜前囤石到第二天、以及带原因的等待。
+        'build_batch', 'build_batch_retry', 'stock_for_day2',
+        'backpack_full_no_buildable_slot', 'stone_mine_exhausted', 'no_reachable_work',
     }
     return [row for row in trail if row.get('switch_reason') not in allowed]
 
@@ -316,13 +319,15 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertEqual(late_tick.get('goal_type'), 'wall')
         self.assertEqual(late_tick.get('switch_reason'), 'urgent_wall')
 
+        # 批量大小是动态的（按剩余墙位、背包空位和夜前工时算），所以这里只断言行为：
+        # 手上有一批石头就留在墙线连续施工，不会回头再去采一块。
         worker.backpack = ['stone'] * 6
         state.round_no = 45
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick2 = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
         self.assertEqual(tick2.get('goal_type'), 'wall')
-        self.assertEqual(tick2.get('switch_reason'), 'batch_ready')
+        self.assertIn(tick2.get('switch_reason'), ('batch_ready', 'build_batch'))
 
     def test_survival_fallback_batches_one_stone_until_ready(self):
         """兜底施工也不能一块石头一趟墙，避免绕开 opening_wall_work 的批量规则。"""

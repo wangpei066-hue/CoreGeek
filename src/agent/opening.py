@@ -158,14 +158,16 @@ def rear_weapon_x(state, base):
 
 
 def weapon_slots(state, base):
-    """两门放最后一排上下两侧，一门放到另一侧再靠前一格，避免堵在迎敌墙内侧。"""
+    """前两门火箭围绕同一个操炮站位，便于冷却间隔内单人切炮。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     rear_x = rear_weapon_x(state, base)
     forward_x = rear_x + direction
-    y_low, y_high = bottom + 1, top - 1
+    y_mid = (bottom + top) // 2
+    y_low = max(bottom + 1, y_mid - 1)
+    y_high = min(top - 1, y_mid + 1)
     width, height = state.map_info.width, state.map_info.height
-    slots = [(rear_x, y_low), (rear_x, y_high), (forward_x, y_high)]
+    slots = [(rear_x, y_low), (rear_x, y_high), (forward_x, y_low)]
     station = {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
     cleaned = []
     for x, y in slots:
@@ -792,14 +794,16 @@ def opening_time_budget(state, missing, remaining, muster_need, gold, upgraded_o
 
 
 def staged_wall_plan(state, base):
-    """按天限制迎敌墙数量：首日正面约8段，次日补到12段，之后再铺满一层。"""
+    """当前墙目标：按动态防线需求裁剪，不用 8/12 之类的常数截断当天墙数。
+
+    DAY1_WALL_TARGET 只是"第一批关键墙"的批次大小；只要资源、路径和夜前工时允许，
+    第一天可以继续把墙线扩到 10 段以上。
+    """
+    from .work_orders import wall_feasible_target
     plan = primary_wall_plan(state, base)
-    day = day_index(state)
-    if day <= 0:
-        return plan[:DAY1_WALL_TARGET]
-    if day == 1:
-        return plan[:DAY2_WALL_TARGET]
-    return plan
+    if day_index(state) >= 2:
+        return plan
+    return plan[:max(0, wall_feasible_target(state))]
 
 
 def staged_wall_missing(state):
@@ -1379,6 +1383,30 @@ def safe_wall(state, point, blocked, assignments):
                 continue
             if path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height) is None:
                 return False
+        # 首日墙还没备够石头时，不能先把院内到石矿/商店的出口彻底封死。
+        # 否则建造工会修到半圈后被困在院内，后续白天只剩 no_reachable_work。
+        if day_index(state) == 0:
+            workers = [r for r in actors if r.role_type == 'worker' and r.health > 0]
+            stone_zones = [z.pos for z in state.map_info.zones if z.neutral_type == 'stone']
+            if workers and stone_zones:
+                try:
+                    missing_after = len(staged_wall_missing(state)) - (1 if point in staged_wall_missing(state) else 0)
+                except RecursionError:
+                    missing_after = 0
+                carried_stone = sum(r.backpack.count('stone') for r in workers)
+                if carried_stone < max(0, missing_after):
+                    anchor = courtyard_anchor(state, base, obstacles)
+                    before = obstacles - {point}
+                    had_stone_path = any(
+                        adjacent_path(_actor_at(workers[0], anchor), mine, before, state) is not None
+                        for mine in stone_zones
+                    )
+                    keeps_stone_path = any(
+                        adjacent_path(_actor_at(workers[0], anchor), mine, obstacles, state) is not None
+                        for mine in stone_zones
+                    )
+                    if had_stone_path and not keeps_stone_path:
+                        return False
     # 同时保留原本可达的经济/任务目的地，不能只保证能回炮台。
     before = obstacles - {point}
     destinations = [z.pos for z in state.map_info.zones if z.neutral_type in ('vendor', 'weaponShop', 'stone')]

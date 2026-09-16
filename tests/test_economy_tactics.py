@@ -235,7 +235,13 @@ class EconomyTests(unittest.TestCase):
         state, role = economy_state()
         state.team_our.roles[0].health = 1500
         role.backpack = ['stone']*20 + ['Medicine', 'Bomb', 'WeaponUpgradeVoucher1']
-        self.assertEqual(sellable_ores(role, state), {'stone': 8})
+        # 墙目标是动态的，断言不变式：缺口所需的石头全部留着，只卖超出部分，道具永不出售。
+        from src.agent.brain import own_station
+        from src.agent.opening import staged_wall_plan
+        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                 if r.role_type == 'wall' and r.health > 0}
+        missing = len(set(staged_wall_plan(state, own_station(state))) - walls)
+        self.assertEqual(sellable_ores(role, state), {'stone': 20 - missing})
 
     def test_day1_still_uses_small_stone_reserve(self):
         state, role = economy_state()

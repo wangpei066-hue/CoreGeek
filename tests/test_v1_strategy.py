@@ -210,6 +210,19 @@ class V1StrategyNightTests(unittest.TestCase):
         commands = self.strategy.decide(state)
         self.assertNotIn(10040, commands)
 
+    def test_fighter_switches_to_adjacent_ready_rocket_when_assigned_rocket_cools_down(self):
+        state = minimal_state(round_no=75)
+        cooling = make_role(10040, 9, 10, "rocket", attack_range=10, level=1, cooldown=2)
+        ready = make_role(10041, 10, 10, "rocket", attack_range=10, level=1, cooldown=0)
+        worker = make_role(10010, 9, 11, "worker", backpack=[], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], cooling, ready, worker]
+        state.policy_memory["weapon_assignment"] = {"10010": 10040}
+        state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
+        commands = self.strategy.decide(state)
+        self.assertNotIn(10040, commands)
+        self.assertEqual(commands[10041]["action"], "attack")
+        self.assertEqual(commands[10041]["controllerId"], "10010")
+
     def test_multi_target_count_matches_weapon_level(self):
         state = minimal_state(round_no=75)
         gatling = make_role(10020, 9, 10, "gatling", attack_range=5, level=2)

@@ -132,7 +132,17 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
         self.assertEqual(job["kind"], "weapon")
 
-    def test_weapon_upgrade_picks_frontmost_lowest_level(self):
+    def test_weapon_upgrade_picks_rocket_before_frontmost_railgun(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        railgun = make_role(21, 12, 8, "railgun", level=1)
+        rocket = make_role(22, 10, 8, "rocket", level=1)
+        state.team_our.roles += [railgun, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (10, 8))
+
+    def test_weapon_upgrade_picks_frontmost_within_same_weapon_type(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
         rear = make_role(21, 10, 8, "rocket", level=1)
@@ -436,13 +446,12 @@ class SellDoesNotDumpNonOreItemsTests(unittest.TestCase):
 class PioneerParticipatesInJobsTests(unittest.TestCase):
     def test_pioneer_starts_and_executes_upgrade_job(self):
         state = minimal_state(gold_num=1000)
-        state.team_our.roles[0].level = 1  # 基地 level1，会先选中它升级
-        pioneer = make_role(10011, 10, 11, "pioneer", back_pack_capability=40)  # 邻接基地 (10,10)
+        pioneer = make_role(10011, 9, 10, "pioneer", back_pack_capability=40)  # 站在火箭预留位上，应让开施工位
         state.team_our.roles.append(pioneer)
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
         self.assertIn(10011, commands)
-        self.assertIn(commands[10011]["action"], ("move", "buy", "use"))
+        self.assertEqual(commands[10011]["action"], "move")
 
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):

@@ -325,8 +325,8 @@ def _pick_upgradeable(state: "MatchState", role_types, pending_targets: set, min
         return None
     return min(candidates, key=lambda r: (
         r.level or 1,
-        _weapon_front_key(state, r),
         _WEAPON_UPGRADE_ORDER.get(r.role_type, 99),
+        _weapon_front_key(state, r),
         r.health,
         r.id,
     ))
@@ -448,10 +448,9 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
     weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
     if not weapons:
         return False
-    from .opening import DAY2_WALL_TARGET, REQUIRED_OPENING_UPGRADES
+    from .opening import REQUIRED_OPENING_UPGRADES, critical_wall_missing
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     l2 = sum((w.level or 1) >= 2 for w in weapons)
-    walls = sum(r.role_type == "wall" and r.health > 0 for r in state.team_our.roles)
     if defer_new_weapon_for_station(state):
         return False
     if any((w.level or 1) < 2 for w in weapons):
@@ -466,7 +465,8 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
         return False
     if day <= 0:
         return False
-    if day == 1 and walls < DAY2_WALL_TARGET:
+    # 只有真正的关键缺口能压住武器升级；普通扩墙不设墙数门槛，否则升级会被无限推迟。
+    if day == 1 and critical_wall_missing(state):
         return False
     return any((w.level or 1) < 3 for w in weapons)
 
@@ -530,8 +530,10 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             current = next((r for r in state.team_our.roles
                             if (r.pos.x, r.pos.y) == tuple(old_job['target']) and r.role_type in WEAPON_TYPES), None)
             if current and (
-                (weapon_due.level or 1, _weapon_front_key(state, weapon_due), weapon_due.id)
-                < (current.level or 1, _weapon_front_key(state, current), current.id)
+                (weapon_due.level or 1, _WEAPON_UPGRADE_ORDER.get(weapon_due.role_type, 99),
+                 _weapon_front_key(state, weapon_due), weapon_due.id)
+                < (current.level or 1, _WEAPON_UPGRADE_ORDER.get(current.role_type, 99),
+                   _weapon_front_key(state, current), current.id)
             ):
                 trace(state, role.id, 'upgrade_job_preempted', '未购入的武器升级让位于更靠前或更低级的火箭炮',
                       old_kind=current.role_type, weapon_id=weapon_due.id)
@@ -1438,6 +1440,29 @@ def target_positions_for_weapon(weapon: Role, target):
     return [{"x": target.pos.x, "y": target.pos.y}] * count
 
 
+def adjacent_ready_rocket(fighter: Role, assigned: Optional[Role], state: "MatchState", robots: list,
+                          commands: dict):
+    """火箭冷却时，同一操作者可切到相邻且已冷却的另一门火箭炮。"""
+    used_weapons = set(commands)
+    candidates = []
+    for weapon in state.team_our.roles:
+        if weapon.role_type != "rocket" or weapon.health <= 0 or weapon.id in used_weapons:
+            continue
+        if assigned is not None and weapon.id == assigned.id:
+            continue
+        if chebyshev(fighter.pos, weapon.pos) > 1:
+            continue
+        if weapon.cooldown or 0:
+            continue
+        target = pick_attack_target(weapon, robots)
+        if target:
+            candidates.append((weapon.level or 1, -weapon.id, weapon, target))
+    if not candidates:
+        return None, None
+    _, _, weapon, target = max(candidates)
+    return weapon, target
+
+
 def plan_pioneer_tasks(state, blocked, reserved):
     """先规划先锋任务；接管的先锋不再参与开局或武器分配。"""
     commands, handled_ids = {}, set()
@@ -1517,6 +1542,20 @@ def plan_night(state: "MatchState") -> dict:
         if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
             target = pick_attack_target(weapon, robots) if ready else None
+            if target is None and weapon.role_type == "rocket":
+                alternate, alt_target = adjacent_ready_rocket(fighter, weapon, state, robots, commands)
+                if alternate is not None:
+                    trace(state, fighter.id, "weapon_assignment",
+                          "分配火箭冷却，切到相邻已冷却火箭炮开火", weapon_id=alternate.id,
+                          assigned_weapon_id=weapon.id)
+                    trace(state, fighter.id, "selected",
+                          "优先BOSS、大型、中型、小型；同等级优先低血量",
+                          weapon_id=alternate.id, target_robot_id=alt_target.id)
+                    commands[alternate.id] = {
+                        "action": "attack", "controllerId": str(fighter.id),
+                        "targetPos": target_positions_for_weapon(alternate, alt_target),
+                    }
+                    continue
             if target:
                 trace(state, fighter.id, "weapon_assignment", "一人一炮；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
                 trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
