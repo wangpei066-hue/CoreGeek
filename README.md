@@ -121,7 +121,8 @@ python -m unittest discover -s tests -v
 
 日志 schema v2 增加 `diagnostics`，本地 JSON、可读 TXT 与平台分类 stderr 均可查看。平台下载请先读 [`docs/logging.md`](docs/logging.md)。
 
-- `source_version`：策略及诊断源文件指纹，配合 UTC 时间、队伍、回合和请求序号，确认下载日志对应哪版代码。它不是 Git 提交号。
+- 进程启动时 stderr 第一行是 `BUILD_INFO` / `event=commit`（整次执行只打一次），字段 `commit` 为 git HEAD；找不到 `.git` 时为 `unknown`。
+- `source_version`：策略及诊断源文件指纹，配合 UTC 时间、队伍、回合和请求序号。它不是 Git 提交号。
 - `primary/outer`：分别列出规划数、已建数、缺口坐标、待升级和待维修位置；第一层侧墙延伸至短射程武器列，确保三座新建武器都位于正面与侧面墙体之后；`outer_unlocked` 显示二层准入状态。
 - `actors`：矿石数量、当前报价估值、未知报价品类、背包容量、卖矿承诺、到小贩和分配武器的寻路步数。分配为诊断估算，实际动作以 `roles.command` 为准；步数 `null` 表示不可达或无目标，不代表零步。
 - `weapons`：位置、等级、血量、射程、冷却、附近操作者、射程内机器人和实际攻击指令。
