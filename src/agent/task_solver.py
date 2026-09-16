@@ -1726,6 +1726,15 @@ class PioneerTaskSolver:
             s['history'].append({'llm': answer})
             s['retries'] = 0
             if answer['action'] == 'submit':
+                rejected_answers = [
+                    item.get('submissionRejected') for item in s.get('history') or []
+                    if isinstance(item, dict) and item.get('submissionRejected') is not None]
+                if (s.get('taskKind') == 'api'
+                        and answer.get('taskAnswer') in rejected_answers):
+                    s['history'].append({'blocked': '禁止重复提交最近被判错的答案'})
+                    self._fact(s, '最近答案已被判错，要求LLM重新计算')
+                    s['stage'] = 'ask'
+                    return
                 if s.get('taskKind') == 'api' and not (s.get('metrics') or {}).get('dataComplete'):
                     # The execute result can arrive through the generic
                     # history path (for example after a transport retry),
@@ -1806,6 +1815,12 @@ class PioneerTaskSolver:
                     s['stage'] = 'read'
                 else:
                     command = answer['command']
+                    if (s.get('taskKind') == 'api'
+                            and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
+                        s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
+                        self._fact(s, '拦截未定义凭据引用，要求LLM使用有依据的认证值')
+                        s['stage'] = 'ask'
+                        return
                     if s.get('taskKind') == 'api':
                         s['apiReplayConfirmed'] = True
                         s['apiConfirmationRequired'] = False
