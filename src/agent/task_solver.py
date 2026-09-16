@@ -1587,7 +1587,9 @@ class PioneerTaskSolver:
             # still selects the right SOP and enables deterministic TOKEN/API handling.
             if s.get('taskKind') == 'workspace' and deployment_repair_command(s):
                 s['autoRepairPending'] = True
-            s['stage'] = 'read'
+            # The API contract is available from the task brief; do not let
+            # the normal document-read transition re-enter stale API docs.
+            s['stage'] = 'api_fetch' if s.get('taskKind') == 'api' and s.get('apiReplay') else 'read'
             return execute
         command = s.get('lastTool') or ''
         redacted = dict(result)
