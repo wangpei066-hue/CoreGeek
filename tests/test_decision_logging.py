@@ -153,3 +153,18 @@ class DecisionLoggingTests(unittest.TestCase):
                    if 'STRATEGY_DECISION' in line]
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]['roundNo'], 1)
+
+    def test_commit_banner_prints_once_per_process(self):
+        from src.agent import log_format
+        log_format._COMMIT_LOGGED = False
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            log_format.log_commit_banner(0)
+            log_format.log_commit_banner(1)
+            log_format.log_commit_banner(2)
+        lines = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]['marker'], 'BUILD_INFO')
+        self.assertEqual(lines[0]['event'], 'commit')
+        self.assertEqual(lines[0]['roundNo'], 0)
+        self.assertTrue(lines[0].get('commit'))

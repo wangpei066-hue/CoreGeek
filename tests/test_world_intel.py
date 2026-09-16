@@ -57,29 +57,44 @@ class OfficialNewsTests(unittest.TestCase):
         self.assertTrue(ore_blocked(state, "iron"))
         self.assertEqual(ores_in_spike(state), {"iron"})
         cmd = profitable_mine(role, state, build_blocked_set(state), set())
-        self.assertIsNotNone(cmd)
-        self.assertIn(cmd["action"], ("move", "collect"))
+        self.assertIsNone(cmd)
 
-    def test_does_not_hold_stockpiled_iron_for_news(self):
+    def test_stockpile_ore_is_preferred_over_nearby_regular_metal(self):
+        state, role = economy_state()
+        state.round_no = 10
+        state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
+        ingest_news(state)
+        state.map_info.zones = [
+            Zone(Pos(5, 5), "vendor"),
+            Zone(Pos(2, 1), "copper"),
+            Zone(Pos(8, 1), "iron"),
+        ]
+        cmd = profitable_mine(role, state, build_blocked_set(state), set())
+        target = state.policy_memory["mine_targets"][str(role.id)]
+        self.assertEqual(target["ore"], "iron")
+        self.assertEqual(cmd["action"], "move")
+
+    def test_holds_stockpiled_iron_until_price_up_window(self):
         state, role = economy_state()
         state.round_no = 10
         state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
         ingest_news(state)
         role.backpack = ["iron"] * 8
-        self.assertIn("iron", sellable_ores(role, state))
+        self.assertNotIn("iron", sellable_ores(role, state))
 
-    def test_liquidates_forecast_ore_before_block_window(self):
+    def test_liquidates_forecast_ore_during_price_up_window(self):
         state, role = economy_state()
         state.round_no = 10
         state.world_news = WorldNews(official_news=IRON_COLLAPSE, folk_legends="")
         ingest_news(state)
+        state.round_no = 140
         role.backpack = ["iron"]
         handled, cmd = liquidate(role, state, build_blocked_set(state), set())
         self.assertTrue(handled)
         self.assertIsNotNone(cmd)
         self.assertTrue(any(
             e["code"] == "cashout_priority"
-            and any("官方消息预告" in trigger for trigger in (e.get("triggers") or []))
+            and any("今日涨价" in trigger for trigger in (e.get("triggers") or []))
             for e in state.decision_events
         ))
 

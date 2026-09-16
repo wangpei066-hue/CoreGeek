@@ -1,7 +1,7 @@
 # 官方新闻与民间传闻
 
 任务书把世界新闻分成两类：**官方消息**（矿价/停工）和 **民间传闻**（祭坛宝藏）。  
-策略只产出标准 JSON，写入 `NewsMemory` 并打 `NEWS_INFER` 日志。当前默认**不**据此指挥工人采矿或开拓者 `summonTreasure`；接线时用本文「代码里怎么拿」。
+策略把官方消息产出的标准 JSON 写入 `NewsMemory` 并打 `NEWS_INFER` 日志。工人经济逻辑会使用官方 `plan`：禁采日不挖对应矿，禁采/涨价前一日优先抢收，涨价日优先卖出囤货。民间传闻仍只写入宝藏 plan，开拓者是否行动看 `folkPlan.ready` 与置信度。
 
 落盘：`state/news_memory.json`（字段 `officialPlan` / `folkPlan`）。
 
@@ -36,7 +36,7 @@
 每天新闻 LLM 最多 3 次，每回合 HTTP `prompt` 最多 1 条。自进化 `phaseTask` 占用时不送新闻。
 
 - **官方**：先跑启发式。命中则写入 `officialPlan`，**不再**申请矿价 LLM。未命中则当天最多送 **1 次**矿价 LLM，且排在传闻前面。
-- **传闻**：只累积原文，**不做**正则启发式；待解码时走宝藏 LLM。每天至少预留 **1 次**成功送推（最后 1 次额度不让官方占完）。
+- **传闻**：只累积原文，**不做**正则启发式；待解码时走宝藏 LLM。每天至少预留 **1 次**成功送推（最后 1 次额度不让官方占完）。同一批原文成功解过就不再重问；等新传闻或召唤失败（地点/物品不对）再送。开启窗口只认正文里的「第N天开启」，听到日和当前日不算。
 
 ## 官方 `plan`（工人）
 
@@ -151,7 +151,11 @@ stockpile = memory.ores_to_stockpile(day)
 price_up = memory.price_boosted_ores(day)
 ```
 
-空 plan（没新闻或启发式未命中）时三个集合都是空的，按原经济逻辑即可。
+空 plan（没新闻或启发式未命中）时三个集合都是空的，按原经济逻辑即可。当前接入点：
+
+- `profitable_mine` / `opening_schedule.choose_nearest_mine`：`stockpileOres` 优先于普通铜铁；`bannedOres` 从候选矿里排除。
+- `sellable_ores`：`stockpileOres` 在涨价前不卖，防止刚抢收就低价变现。
+- `liquidate`：`priceUpOres` 触发优先出售，把囤货兑现。
 
 ### 开拓者：拿传闻 plan
 
