@@ -2058,7 +2058,21 @@ class PioneerTaskSolver:
             holding, pioneer = False, None
         if pioneer is not None and not holding:
             s.setdefault('metrics', {})['holdBlockRounds'] = s['metrics'].get('holdBlockRounds', 0) + 1
-        if holding:
+        # Submission is the terminal action for a completed task.  It must
+        # not depend on whether the task pioneer is still considered to be
+        # holding the task; that flag may be cleared by the scheduler in the
+        # same round in which the answer becomes ready.
+        if s['stage'] in ('submit', 'wait_submit'):
+            if (pioneer and s.get('answer') and s.get('submitStatus') != 'accepted'
+                    and pioneer.id not in commands):
+                submission[pioneer.id] = {
+                    'action': 'submitAnswer', 'taskAnswer': s['answer']}
+                commands.update(submission)
+                s['pioneer'] = pioneer.id
+                s['stage'] = 'wait_submit'
+                s['submitStatus'] = 'sent'
+                s['metrics']['submitSentRound'] = state.round_no
+        elif holding:
             if s.get('resendPending') and s.get('pendingCommand') and s['stage'] == 'wait_read':
                 execute = s['pendingCommand']
                 s['resendPending'] = False
@@ -2126,19 +2140,6 @@ class PioneerTaskSolver:
                 s['metrics']['firstActiveRound'] = s['metrics'].get('firstActiveRound') or state.round_no
                 s['llmPending'] = True
                 s['stage'] = 'wait_llm'
-            elif s['stage'] in ('submit', 'wait_submit'):
-                # phaseTask can rotate away immediately after the first
-                # submitAnswer.  When this session is restored, wait_submit
-                # must remain an active resend state until the platform sends
-                # a definitive result; otherwise the answer is silently lost.
-                if (pioneer and s.get('answer') and s.get('submitStatus') != 'accepted'
-                        and pioneer.id not in commands):
-                    submission[pioneer.id] = {'action': 'submitAnswer', 'taskAnswer': s['answer']}
-                    commands.update(submission)
-                    s['pioneer'] = pioneer.id
-                    s['stage'] = 'wait_submit'
-                    s['submitStatus'] = 'sent'
-                    s['metrics']['submitSentRound'] = state.round_no
         s['round'] = state.round_no
         s['response'] = dict(prompt=prompt, executeCmd=execute, submission=submission)
         s['incomplete'] = s.get('stage') in INCOMPLETE_STAGES
