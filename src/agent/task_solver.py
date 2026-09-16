@@ -88,6 +88,7 @@ PROMPT_API = '''API执行协议：
 5. 提交被判错后，必须读取最新 errorCode/description 和真实结果重新计算；禁止原样重复上一次 taskAnswer，除非有新的验证证据证明判题反馈已过期。
 6. 最终答案的字段、类型、排序和语义严格由当前任务定义，历史 schema 只能提供线索；数据完整后由你返回 submit。
 认证细则：不要写 `$API_TOKEN`、`$TOKEN`、`.env` 或任何未定义变量来“代替”密钥。若当前资料确认使用本地遗产候选契约，必须使用已确认的字面认证值 `heritage-api-key-2024`；若当前任务给出其他值，则以当前任务为准；两者都没有时先询问/读取依据，不能猜。
+统计细则：只使用真实响应中实际存在的字段名，禁止凭记忆改写字段（例如不要把 `protected_level` 猜成 `protection_level`）。统计脚本必须在同一次 execute 中校验记录路径、记录总数、关键字段存在、去重结果和最终答案字段；若关键字段不存在，停止并重新阅读当前资料，不要提交猜测结果。
 最高优先级提醒：如果当前任务明确说 API 文档部分过时，不能照抄文档中的旧认证/参数；先采用当前任务或已验证经验提供的候选，执行一次真实请求，用响应确认契约。模拟遗产任务的候选是 Authorization: Bearer、location、offset/limit；这是待验证起点，不是固定答案。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
@@ -1757,6 +1758,18 @@ class PioneerTaskSolver:
                 if answer['action'] == 'read':
                     path = answer['path']
                     env = s.get('documentDir') or s.get('workspace')
+                    normalized_path = normalize_target(path)
+                    already_read = any(
+                        normalize_target(item.get('path')) == normalized_path
+                        and not item.get('error')
+                        for item in s.get('documents') or []
+                        if isinstance(item, dict))
+                    if already_read:
+                        s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
+                        s['history'].append({'blocked': '文档已成功读取，禁止重复读取', 'path': path})
+                        self._fact(s, '拦截重复读取已成功文档: %s' % path)
+                        s['stage'] = 'ask'
+                        return
                     if self._is_duplicate_failure(s, 'read', path, env, 'not_found'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
                         if self._switch_to_api_experience(s, state.phase_task, '拦截重复失败读取，改用已验证API经验'):
