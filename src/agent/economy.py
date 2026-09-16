@@ -607,6 +607,13 @@ def liquidate(role, state, blocked, reserved):
     triggers = []
     from .brain import should_upgrade_weapon
     from .opening import OPENING_METAL_BATCH, day_rounds_remaining, live_l2_weapon_count, REQUIRED_OPENING_UPGRADES, survival_walls_locked
+    try:
+        from .world_intel import ores_to_stockpile
+        news_dump_ores = set(ores) & set(ores_to_stockpile(state))
+    except Exception:
+        news_dump_ores = set()
+    if news_dump_ores:
+        triggers.append('官方消息预告该矿即将停工/受限，窗口前先卖掉')
     waiting_weapon_job = any(job.get('kind') == 'weapon' for job in state.worker_item_jobs.values())
     need_voucher = should_upgrade_weapon(state) or waiting_weapon_job
     gap = voucher_funding_gap(state)

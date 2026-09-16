@@ -101,6 +101,42 @@ class EconomyTests(unittest.TestCase):
                    for e in state.decision_events)
         )
 
+    def test_day2_worker_buys_weapon_voucher_before_muster_when_gold_is_ready(self):
+        state, role = defended_state(gold=150)
+        state.round_no = 150
+        role.pos = Pos(6, 6)
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(6, 5), 'weaponShop'),
+        ]
+        state.team_our.roles = [
+            state.team_our.roles[0],
+            role,
+            make_role(21, 12, 10, 'rocket', level=2, health=1000, attack_range=10),
+            make_role(22, 12, 8, 'rocket', level=1, health=1000, attack_range=10),
+            make_role(23, 12, 12, 'railgun', level=1, health=1000, attack_range=10),
+        ]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[role.id]['action'], 'buy')
+        self.assertEqual(commands[role.id]['name'], 'WeaponUpgradeVoucher1')
+
+    def test_held_weapon_voucher_is_used_before_muster(self):
+        state, role = defended_state(gold=0)
+        state.round_no = 190
+        role.pos = Pos(12, 9)
+        role.backpack = ['WeaponUpgradeVoucher1']
+        state.team_our.roles = [
+            state.team_our.roles[0],
+            role,
+            make_role(21, 12, 10, 'rocket', level=2, health=1000, attack_range=10),
+            make_role(22, 12, 8, 'rocket', level=1, health=1000, attack_range=10),
+            make_role(23, 12, 12, 'railgun', level=1, health=1000, attack_range=10),
+        ]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[role.id]['action'], 'use')
+        self.assertEqual(commands[role.id]['name'], 'WeaponUpgradeVoucher1')
+        self.assertTrue(any(e['code'] == 'pre_muster_weapon_voucher' for e in state.decision_events))
+
     def test_pre_night_too_late_still_must_return_to_gun(self):
         state, role = defended_state()
         state.round_no = 198
