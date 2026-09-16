@@ -849,6 +849,15 @@ def summarize_heritage_records(records, total=None, complete=False):
     oldest_name = None
     oldest_year = None
     fuzzy = []
+    # The local/official heritage fixtures use dynasty labels instead of a
+    # numeric year.  Preserve evidence-based ordering so the solver can finish
+    # without spending extra LLM turns on an avoidable clarification.
+    era_order = {
+        '旧石器': -100000, '新石器': -5000, '夏': -2100, '商': -1600,
+        '周': -1046, '春秋': -770, '战国': -475, '秦': -221,
+        '汉': -206, '六朝': 220, '唐': 618, '宋': 960,
+        '元': 1271, '明': 1368, '清': 1644, '民国': 1912, '现代': 1949,
+    }
     for rec in records or []:
         if not isinstance(rec, dict):
             continue
@@ -873,6 +882,11 @@ def summarize_heritage_records(records, total=None, complete=False):
         if name and year is not None and (oldest_year is None or year < oldest_year):
             oldest_year = year
             oldest_name = name
+        if name and isinstance(era, str):
+            known = next((value for label, value in era_order.items() if label in era), None)
+            if known is not None and (oldest_year is None or known < oldest_year):
+                oldest_year = known
+                oldest_name = name
     stats = dict(
         types=types, typeCount=len(types), worldHeritageCount=world_heritage,
         oldestEraName=oldest_name,
