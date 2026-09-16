@@ -5,7 +5,7 @@ import json
 import re
 
 from .decision_log import trace
-from .news_memory import NewsMemory, game_day
+from .news_memory import NewsMemory, game_day, joined_legend_text, legend_mentions_open_time
 from .news_logging import log_news_event
 from .protocol import MatchState
 
@@ -68,33 +68,59 @@ def make_treasure_prompt(state: MatchState, memory: NewsMemory) -> str:
         '{"ready":bool,"altarPos":{"x":int,"y":int}|null,"items":[str,...],'
         '"openFromRound":int|null,"openToRound":int|null,'
         '"confidence":0.0,'
-        '"notes":"一句中文：哪些字段有原文依据、缺什么"}'
+        '"notes":"一句中文：哪些字段有正文依据、缺什么"}'
     )
+    x_max = width - 1 if width else "?"
+    y_max = height - 1 if height else "?"
     rules = (
-        "你只解读民间传闻，推断祭坛宝藏；不要解读官方消息，不要编造地图上没写的坐标或物品。\n"
+        "你只解读 legends[].text 正文里的民间传闻，推断祭坛宝藏。"
+        "不要解读官方消息。不要编造正文里没有的坐标、物品或开启时间。\n"
         "规则：\n"
-        f"- 地图范围 x∈[0,{width - 1 if width else '?'}]，y∈[0,{height - 1 if height else '?'}]；越界坐标必须改成 null。\n"
-        f"- items 只能从 allowedTaskItems 里选，英文名必须完全一致；战斗/升级/召唤令不是献祭用品。当前可选：{catalog or ['（商店暂无任务用品）']}。\n"
-        f"- 传闻说「第N天」时：openFromRound=(N-1)*{DAY_NIGHT_CYCLE}，openToRound=N*{DAY_NIGHT_CYCLE}-1。"
-        f"当前 roundNo={state.round_no}，游戏日从1起算。\n"
-        "- lastSummonTreasureResult：0未探测或非法，1成功，2地点/时间不对，3物品不对，4已空。2/3 时不要照抄 previousHypothesis。\n"
-        "- previousHypothesis 仅供对照。传闻没写到的字段不要为了填满而沿用旧值；与新传闻冲突时以新传闻为准。\n"
-        "置信度 confidence∈[0,1]，必须按证据打分，禁止无依据给高分：\n"
+        f"- 地图范围 x∈[0,{x_max}]，y∈[0,{y_max}]；越界坐标必须改成 null。\n"
+        f"- items 只能从 allowedTaskItems 里选，英文名必须完全一致；战斗/升级/召唤令不是献祭用品。"
+        f"当前可选：{catalog or ['（商店暂无任务用品）']}。"
+        "正文没有对应描述（石板/粉末/火焰等）时 items 用 []。\n"
+        "- legends[].heardOnDay / heardAtRound 只表示「哪一天听到这条」，不是祭坛开启日。\n"
+        f"- now.gameDay / now.roundNo 只表示现在，禁止用来填开启窗口。每天{DAY_NIGHT_CYCLE}回合，游戏日从1起算。\n"
+        f"- 开启窗口：仅当正文明确写「第N天开启/可召唤/解开」时，"
+        f"openFromRound=(N-1)*{DAY_NIGHT_CYCLE}，openToRound=N*{DAY_NIGHT_CYCLE}-1。"
+        "上古传说、方位、听到日都不是开启时间。没有开启日原文时两个字段必须 null，"
+        "禁止用 now、heardOnDay 或 previousHypothesis 填。\n"
+        "- altarPos：正文必须出现具体数字坐标（如 (12,8) 或 x=12,y=8）。"
+        "只有「西部」「东侧」等方位 → 必须 null，不要猜地图中点。\n"
+        "- lastSummonTreasureResult：0未探测或非法，1成功，2地点/时间不对，3物品不对，4已空。"
+        "2/3 时不要照抄 previousHypothesis。\n"
+        "- previousHypothesis 仅供对照。无新正文依据的字段不要沿用。\n"
+        "置信度 confidence∈[0,1]，必须按正文证据打分：\n"
         "- 0.0–0.3：几乎没有坐标/物品原文，只是猜测。\n"
-        "- 0.3–0.6：只抽出部分字段，或坐标/物品/时间互相矛盾。\n"
+        "- 0.3–0.6：只抽出部分字段（例如有物品无坐标），或字段互相矛盾。\n"
         "- 0.6–0.8：坐标和物品都有原文，窗口仍含糊。\n"
-        "- 0.8–1.0：坐标、献祭物品、开启时间都能在传闻中找到对应句子。\n"
-        "ready=true 仅当：altarPos、items 都有原文依据，且 confidence≥0.7。否则 ready=false。"
-        "信息不足时仍可给出当前最佳猜测，但必须 ready=false、confidence 偏低，notes 写明缺什么。\n"
+        "- 0.8–1.0：坐标、献祭物品、开启时间都能在正文中找到对应句子。\n"
+        "ready=true 仅当：altarPos、items 都有正文依据，且 confidence≥0.7。否则 ready=false。"
+        "信息不足时仍可给出当前最佳猜测，但必须 ready=false，notes 写明缺什么。\n"
         f"只返回一个JSON对象，不要Markdown：{schema}。"
     )
+    legends = []
+    for row in memory.data.get("legends") or []:
+        if not isinstance(row, dict):
+            continue
+        legends.append({
+            "heardOnDay": row.get("heardOnDay", row.get("day")),
+            "heardAtRound": row.get("heardAtRound", row.get("round")),
+            "text": row.get("text"),
+        })
+    prev = memory.data.get("treasureHypothesis")
+    if isinstance(prev, dict):
+        prev = dict(prev)
+        if not legend_mentions_open_time(joined_legend_text(memory.data.get("legends"))):
+            prev["openFromRound"] = None
+            prev["openToRound"] = None
     return rules + "\n输入：" + json.dumps({
-        "roundNo": state.round_no,
-        "gameDay": game_day(state.round_no),
+        "now": {"roundNo": state.round_no, "gameDay": game_day(state.round_no)},
         "map": {"width": width, "height": height},
-        "legends": memory.data.get("legends", []),
+        "legends": legends,
         "allowedTaskItems": catalog,
-        "previousHypothesis": memory.data.get("treasureHypothesis"),
+        "previousHypothesis": prev,
         "lastSummonTreasureResult": state.last_summon_treasure_result,
         "resultCodeHint": {0: "未探测或非法", 1: "成功", 2: "地点或时间不对", 3: "物品不对", 4: "已空"},
     }, ensure_ascii=False)
