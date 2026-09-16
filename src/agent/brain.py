@@ -7,7 +7,7 @@ from typing import Optional
 from .protocol import (
     ActionValidator, GameState, MatchState, Pos, Role, Strategy
 )
-from .decision_log import trace, selected
+from .decision_log import trace, selected, log_judge_feedback
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
 from .pioneer_schedule import (
@@ -1095,7 +1095,15 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         if build_cmd:
             return build_cmd
 
-    return profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
+    final_cmd = profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
+    if not final_cmd:
+        trace(state, worker.id, 'worker_day_no_command', '第二天及以后白天流程走完仍无命令',
+              allow_build=allow_build, allow_weapon=allow_weapon, cashout=cashout,
+              held_item=held_item, job_kind=(job or {}).get('kind'),
+              structure_priority_day=structure_priority_day(state),
+              gold=state.team_our.gold_num if state.team_our else None,
+              backpack=list(worker.backpack or []), position={'x': worker.pos.x, 'y': worker.pos.y})
+    return final_cmd
 
 
 
@@ -1635,6 +1643,7 @@ class V1Strategy(Strategy):
         from .tactics import begin_round
         begin_round(state)
         learn_from_last_round(state)
+        log_judge_feedback(state)
         if not state.team_our or not state.map_info:
             trace(state, None, "missing_state", "缺少队伍或地图快照，不能生成指令")
             commands = {}
