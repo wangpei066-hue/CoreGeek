@@ -130,6 +130,51 @@ class EconomyTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertTrue(any(e['code'] == 'cashout_priority' for e in state.decision_events))
 
+    def test_day1_split_metal_still_sends_a_worker_to_vendor(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 50
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1, health=1000),
+            make_role(21, 12, 8, 'rocket', level=1, health=1000),
+            make_role(22, 12, 12, 'rocket', level=1, health=1000),
+        ]
+        state.map_info.zones = [
+            Zone(Pos(6, 9), 'stone'),
+            Zone(Pos(1, 11), 'vendor'),
+            Zone(Pos(1, 9), 'weaponShop'),
+        ]
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 3)]
+        a = next(r for r in state.team_our.roles if r.id == 1)
+        b = next(r for r in state.team_our.roles if r.id == 2)
+        a.backpack = ['copper'] * 5
+        b.backpack = ['copper'] * 5
+        blocked = build_blocked_set(state)
+        handled_a, cmd_a = liquidate(a, state, blocked, set())
+        handled_b, cmd_b = liquidate(b, state, blocked, set())
+        self.assertTrue(handled_a or handled_b)
+        self.assertTrue(cmd_a or cmd_b)
+        self.assertTrue(any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_day1_sells_metal_without_vendor_quote(self):
+        state = opening_state()
+        state.round_no = 20
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=1, health=1000),
+            make_role(21, 12, 8, 'rocket', level=1, health=1000),
+            make_role(22, 12, 12, 'rocket', level=1, health=1000),
+        ]
+        state.map_info.zones = [Zone(Pos(1, 11), 'vendor'), Zone(Pos(1, 9), 'weaponShop')]
+        state.vendor_shop_list = []
+        role = next(r for r in state.team_our.roles if r.id == 1)
+        role.backpack = ['copper'] * 6
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertTrue(handled)
+        self.assertIsNotNone(cmd)
+        self.assertTrue(any(e['code'] == 'sale_value_unknown' for e in state.decision_events))
+        self.assertFalse(any('无价值' in (e.get('message') or '') for e in state.decision_events))
+
     def test_batch_fill_goes_to_vendor(self):
         state, role = economy_state()
         role.back_pack_capability = 10
@@ -243,6 +288,41 @@ class EconomyTests(unittest.TestCase):
         target = state.policy_memory['mine_targets'][str(role.id)]
         self.assertEqual(target['ore'], 'iron')
         self.assertEqual((target['x'], target['y']), (2, 1))
+
+    def test_voucher_mine_prefers_near_high_price_iron(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'iron'),
+            Zone(Pos(25, 25), 'copper'),
+        ]
+        state.vendor_shop_list = [ShopItem('iron', 10), ShopItem('copper', 5)]
+        picked = pick_mine(role, state, build_blocked_set(state), set(),
+                           want_ores=('iron', 'copper'), purpose='voucher')
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked[0].neutral_type, 'iron')
+
+    def test_voucher_mine_prefers_near_copper_when_far_iron_takes_more_rounds(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'copper'),
+            Zone(Pos(25, 25), 'iron'),
+        ]
+        state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 10)]
+        picked = pick_mine(role, state, build_blocked_set(state), set(),
+                           want_ores=('iron', 'copper'), purpose='voucher')
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked[0].neutral_type, 'copper')
+
+    def test_voucher_mine_without_vendor_prices_does_not_invent_them(self):
+        state, role = economy_state()
+        role.backpack = []
+        state.vendor_shop_list = []
+        self.assertIsNone(pick_mine(role, state, build_blocked_set(state), set(),
+                                    want_ores=('iron', 'copper'), purpose='voucher'))
 
     def test_cashout_window_clears_mine_target(self):
         state, role = defended_state()
@@ -365,7 +445,6 @@ class TacticalTests(unittest.TestCase):
         buys = [c.get('name') for c in commands.values() if c.get('action') == 'buy']
         self.assertNotIn('AcientTablet', buys)
         self.assertFalse(any(isinstance(name, str) and name.endswith('SummonOrder') for name in buys))
-        self.assertFalse(any(isinstance(name, str) and name.startswith('StationUpgrade') for name in buys))
 
     def test_no_offense_when_base_is_in_danger_or_budget_low(self):
         for health, gold in ((500, 400), (1500, 110)):

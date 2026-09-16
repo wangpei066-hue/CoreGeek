@@ -21,12 +21,15 @@ WEAPON_EVENT_CODES = {
     "weapon_upgrade_job_waiting_funds", "weapon_upgrade_job_transferred",
     "upgrade_job_preempted", "no_free_weapon", "weapon_cooldown", "no_target_in_range",
     "pioneer_voucher_job", "pioneer_voucher_wait_gold", "pioneer_buys_voucher",
+    "station_voucher_hold_for_attack", "station_upgrade_wait_cooldown",
 }
 PIONEER_EVENT_CODES = {
     "pioneer_task", "task_yields_to_defense", "task_yields_to_voucher",
     "task_not_enough_time", "no_pioneer_action", "pioneer_task_active_at_night",
     "treasure_buy_deferred", "treasure_wait_window", "treasure_wait_open_day",
     "treasure_decoded", "legend_appended",
+    "task_reservation_cleared", "task_reservation_interrupted",
+    "accept_overwritten", "shop_stall_reassess",
 }
 ECONOMY_EVENT_CODES = {
     "income_mine", "cashout_priority", "sale_unreachable", "sale_too_late",

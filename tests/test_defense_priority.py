@@ -224,14 +224,14 @@ class DefensePriorityTests(unittest.TestCase):
         for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
             state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1000, level=1))
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
-        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
-        pioneer.pos = Pos(8, 9)
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        worker.pos = Pos(8, 9)
         commands = self.decide(state)
         buys = [c for c in commands.values() if c.get('action') == 'buy']
-        self.assertEqual([c['name'] for c in buys if 'WeaponUpgrade' in c.get('name', '')], ['WeaponUpgradeVoucher2'])
-        self.assertFalse(any(c.get('name', '').endswith('SummonOrder') or c.get('name', '').startswith('Station')
-                             for c in buys))
-        self.assertNotEqual(commands.get(pioneer.id, {}).get('name'), 'WeaponUpgradeVoucher2')
+        self.assertEqual([c['name'] for c in buys if 'StationUpgrade' in c.get('name', '')],
+                         ['StationUpgradeVoucher1'])
+        self.assertFalse(any('WeaponUpgradeVoucher2' in c.get('name', '') for c in buys))
+        self.assertFalse(any(c.get('name', '').endswith('SummonOrder') for c in buys))
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):
         from src.agent.brain import maybe_start_shop_item_job

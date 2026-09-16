@@ -17,8 +17,13 @@ class PioneerTaskTests(unittest.TestCase):
         data = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text(encoding='utf-8'))
         data['roundNo'] = round_no
         data['phaseTask'] = ''
-        data['teamOur']['roles'] = [r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer']
-        data['teamOur']['roles'][0]['pos'] = {'x': 13, 'y': 13}
+        keep = {'pioneer', 'station', 'gatling', 'railgun', 'rocket'}
+        data['teamOur']['roles'] = [r for r in data['teamOur']['roles'] if r['roleType'] in keep]
+        pioneer = next(r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer')
+        pioneer['pos'] = {'x': 13, 'y': 13}
+        data['robot'] = {'roles': []}
+        for task in data['teamOur']['playerTasks']:
+            task.setdefault('timeoutRounds', 15)
         return data
 
     def decide(self, data):
@@ -32,7 +37,8 @@ class PioneerTaskTests(unittest.TestCase):
 
     def test_moves_to_task(self):
         data = self.payload()
-        data['teamOur']['roles'][0]['pos'] = {'x': 9, 'y': 9}
+        pioneer = next(r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer')
+        pioneer['pos'] = {'x': 9, 'y': 9}
         self.assertEqual(self.decide(data)[10011]['action'], 'move')
 
     def test_unavailable_tasks_are_not_accepted(self):
@@ -48,15 +54,20 @@ class PioneerTaskTests(unittest.TestCase):
             task['timeoutRounds'] = 2
         self.assertNotEqual(self.decide(data).get(10011, {}).get('action'), 'acceptTask')
 
-    def test_active_task_stays_day_and_night_even_after_restart(self):
-        for round_no in (10, 80):
-            data = self.payload(round_no)
-            data['phaseTask'] = '任务原文'
-            self.assertNotIn(10011, self.decide(data))
+    def test_active_task_holds_by_day_and_does_not_shop_at_night(self):
+        data = self.payload(10)
+        data['phaseTask'] = '任务原文'
+        self.assertNotIn(10011, self.decide(data))
+        data = self.payload(80)
+        data['phaseTask'] = '任务原文'
+        action = self.decide(data).get(10011, {}).get('action')
+        self.assertNotEqual(action, 'acceptTask')
+        self.assertNotEqual(action, 'buy')
 
     def test_dead_pioneer_does_not_accept(self):
         data = self.payload()
-        data['teamOur']['roles'][0]['health'] = 0
+        pioneer = next(r for r in data['teamOur']['roles'] if r['roleType'] == 'pioneer')
+        pioneer['health'] = 0
         self.assertNotIn(10011, self.decide(data))
 
     @unittest.skipUnless(shutil.which('sh'), '需要 POSIX sh 执行平台沙盒命令')

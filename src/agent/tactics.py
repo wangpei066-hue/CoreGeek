@@ -22,6 +22,8 @@ def begin_round(state):
     state.bombed_robots = set()
     from .world_intel import ingest_news
     ingest_news(state)
+    from .opening import clear_opening_commit_after_first_night
+    clear_opening_commit_after_first_night(state)
     from .brain import is_day_round, own_station
     if is_day_round(state.round_no):
         state.policy_memory.pop('night_saw_threat', None)
@@ -110,12 +112,17 @@ def pressure(state):
 
 
 def _note_respawns(state):
-    """阵亡后次日复活：清掉该角色旧建造目标、商店任务和炮位记忆，避免沿用上一世分配。"""
+    """阵亡/复活都要清掉旧建造目标、商店任务和炮位记忆，避免占着位置不用又没人能顶上。
+
+    阵亡这一侧尤其关键：worker_item_jobs/mine_targets 里死者的条目如果留着，
+    _pending_item_job_targets、claimed_mines 会一直把对应的武器/矿位当成"已经有人在办"，
+    没人会去释放死者自己的任务（因为角色循环只处理存活角色），队友因此永远排不上号。"""
     from .economy import clear_mine_target
     prev = state.policy_memory.get('role_alive') or {}
     alive = {}
     assignment = dict(state.policy_memory.get('weapon_assignment') or {})
     wall_targets = dict(state.policy_memory.get('opening_wall_targets') or {})
+    selling = list(state.policy_memory.get('selling_roles') or [])
     for role in state.team_our.roles:
         if role.role_type not in ('worker', 'pioneer'):
             continue
@@ -128,7 +135,17 @@ def _note_respawns(state):
             wall_targets.pop(key, None)
             clear_mine_target(state, role.id)
             trace(state, role.id, 'role_respawned', '角色复活，清除旧炮位与建造目标后重新分配')
+        elif prev.get(key) is True and role.health <= 0:
+            state.worker_build_targets.pop(role.id, None)
+            state.worker_item_jobs.pop(role.id, None)
+            assignment.pop(key, None)
+            wall_targets.pop(key, None)
+            clear_mine_target(state, role.id)
+            if role.id in selling:
+                selling.remove(role.id)
+            trace(state, role.id, 'role_died', '角色阵亡，释放其道具任务/占矿/炮位，避免卡住队友')
     state.policy_memory['role_alive'] = alive
+    state.policy_memory['selling_roles'] = selling
     state.policy_memory['weapon_assignment'] = assignment
     if wall_targets:
         state.policy_memory['opening_wall_targets'] = wall_targets
@@ -136,14 +153,15 @@ def _note_respawns(state):
         state.policy_memory.pop('opening_wall_targets', None)
 
 
-def threat_eta_to_base(state):
-    """安全截止时间：min(入夜剩余, 可见敌人首次贴近关键目标的切比雪夫下界)。
-    切比雪夫不是官方移动耗时，也未计入射程；找不到可见威胁时白天用入夜剩余，夜间为未知。"""
-    from .brain import WEAPON_TYPES, own_station, is_day_round
-    cycle = (state.round_no or 0) % 130
+def threat_eta_to_base(state, role=None):
+    """安全截止剩余回合：min(该角色夜防到位点剩余, 可见敌人切比雪夫下界)。
+    切比雪夫不是官方移动耗时，也未计入射程。找不到可见威胁且已过到位点时为未知。"""
+    from .brain import WEAPON_TYPES, own_station
+    from .opening import defense_rounds_remaining
     etas = []
-    if is_day_round(state.round_no):
-        etas.append(max(0, 70 - cycle))
+    remaining = defense_rounds_remaining(state, role)
+    if remaining > 0:
+        etas.append(remaining)
     robots = threat_robots(state)
     if robots:
         spots = []
@@ -151,19 +169,18 @@ def threat_eta_to_base(state):
         if base:
             spots.append(base.pos)
         weapons = []
-        for role in (state.team_our.roles if state.team_our else []):
-            if role.health <= 0:
+        for item in (state.team_our.roles if state.team_our else []):
+            if item.health <= 0:
                 continue
-            if role.role_type in (*WEAPON_TYPES, 'wall'):
-                spots.append(role.pos)
-                if role.role_type in WEAPON_TYPES:
-                    weapons.append(role)
-        # 只把已经在院内/炮旁的人当成关键目标，远处采矿的人不会把全局截止时间压成贴身威胁。
+            if item.role_type in (*WEAPON_TYPES, 'wall'):
+                spots.append(item.pos)
+                if item.role_type in WEAPON_TYPES:
+                    weapons.append(item)
         if base:
-            for role in (state.team_our.roles if state.team_our else []):
-                if role.health > 0 and role.role_type in ('worker', 'pioneer'):
-                    if chebyshev(role.pos, base.pos) <= 3 or any(chebyshev(role.pos, w.pos) <= 1 for w in weapons):
-                        spots.append(role.pos)
+            for item in (state.team_our.roles if state.team_our else []):
+                if item.health > 0 and item.role_type in ('worker', 'pioneer'):
+                    if chebyshev(item.pos, base.pos) <= 3 or any(chebyshev(item.pos, w.pos) <= 1 for w in weapons):
+                        spots.append(item.pos)
         if spots:
             etas.append(min(chebyshev(spot, robot.pos) for robot in robots for spot in spots))
     if not etas:
