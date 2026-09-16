@@ -17,7 +17,7 @@
 | `BUILD_WALL` | 每回合 | 一层/二层进度、缺口、本回合砌墙或采石 |
 | `PIONEER_TASK` | 每回合总览；接取/解题时另有 solver 行 | `event=round` 看本回合接取/提交；`accept_requested` / `task_active` 看解题细节 |
 | `ECONOMY` | **仅采矿/卖矿有动作或相关事件时** | 本回合采集/出售 |
-| `NEWS_INFER` | **有新闻事件或当前计划 JSON 时** | `official_plan` / `folk_plan` 决策 JSON（仅记录，不指挥角色）；LLM 的 `promptText` / `parsedJson` |
+| `NEWS_INFER` | **有新闻事件或当前计划 JSON 时** | `official_plan` / `folk_plan`；字段与取用见 [`news.md`](news.md) |
 
 完整分支原因、背包明细、路径事件仍在本地 `logs/decision_NNNNNN.json`。
 
@@ -67,6 +67,8 @@
 
 ## NEWS_INFER（官方消息 / 民间传闻 两条线）
 
+字段含义、当天三数组、以及代码里如何读取 `plan`，见 [`news.md`](news.md)。
+
 任务书把世界新闻分成两类，日志也按两类搜：
 
 | event | 存哪 | 看什么 |
@@ -79,7 +81,7 @@
 | `llm_output` | LLM | `parsedJson` + 落地后的 `plan` |
 | `llm_empty` | LLM | 等待中的响应为空 |
 
-处理顺序：官方消息先启发式写入 `officialPlan`，再申请矿价 LLM 覆盖同一份 JSON；民间传闻只累积原文并申请宝藏 LLM，**不做正则启发式**。两份 JSON 只落盘并打日志，不改工人采矿/卖矿，也不改开拓者买物/召唤。
+处理顺序：官方启发式命中则不送矿价 LLM；未命中当天最多送 1 次且优先于传闻。传闻只走宝藏 LLM，每天至少预留 1 次送推。两份 JSON 只落盘并打日志，默认不改工人/开拓者动作。详情见 [`news.md`](news.md)。
 
 每回合有日程时，`emit_console_report` 会再打一行当前 `official_plan` / `folk_plan`，平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"` 即可。
 

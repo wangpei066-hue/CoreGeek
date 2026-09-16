@@ -157,7 +157,7 @@ python -m unittest discover -s tests -v
 - `BUILD_WALL`：一层/二层进度与本回合砌墙、采石。
 - `PIONEER_TASK`：每回合自进化动作；接取/解题时另有 solver 细节。空闲不刷屏。
 - `ECONOMY`：仅采矿/卖矿有活动时。
-- `NEWS_INFER`：`official_plan` / `folk_plan` 决策 JSON（存 `officialPlan`/`folkPlan`，不指挥角色）；以及分线 LLM 的 `promptText` / `parsedJson`。
+- `NEWS_INFER`：`official_plan` / `folk_plan`（说明见 [`docs/news.md`](docs/news.md)）。
 
 平台只显示控制台时，按 marker 搜索即可。完整快照仍在容器 `decision_*.json`。这些日志不参与比赛响应。
 
