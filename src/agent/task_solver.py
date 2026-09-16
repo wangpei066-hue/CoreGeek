@@ -1984,8 +1984,13 @@ class PioneerTaskSolver:
                     s['stage'] = 'wait_llm'
                 else:
                     s['stage'] = 'exhausted'
-            elif s['stage'] == 'submit':
-                if pioneer and pioneer.id not in commands:
+            elif s['stage'] in ('submit', 'wait_submit'):
+                # phaseTask can rotate away immediately after the first
+                # submitAnswer.  When this session is restored, wait_submit
+                # must remain an active resend state until the platform sends
+                # a definitive result; otherwise the answer is silently lost.
+                if (pioneer and s.get('answer') and s.get('submitStatus') != 'accepted'
+                        and pioneer.id not in commands):
                     submission[pioneer.id] = {'action': 'submitAnswer', 'taskAnswer': s['answer']}
                     commands.update(submission)
                     s['pioneer'] = pioneer.id
