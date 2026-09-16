@@ -7,7 +7,6 @@ import json
 
 
 from .log_format import command_text, emit_stderr
-from .news_logging import log_folk_plan, log_official_plan
 
 CONSOLE_MARKER = "STRATEGY_DECISION"
 WEAPON_BUILD_NAMES = ("gatling", "railgun", "rocket")
@@ -22,6 +21,9 @@ WEAPON_EVENT_CODES = {
     "upgrade_job_preempted", "no_free_weapon", "weapon_cooldown", "no_target_in_range",
     "pioneer_voucher_job", "pioneer_voucher_wait_gold", "pioneer_buys_voucher",
     "station_voucher_hold_for_attack", "station_upgrade_wait_cooldown",
+    "voucher_buyer_status", "voucher_buyer_pick",
+    "worker_wall_stage_voucher_attempt", "worker_wall_stage_voucher_wait",
+    "opening_muster_no_weapon", "opening_muster_unreachable",
 }
 PIONEER_EVENT_CODES = {
     "pioneer_task", "task_yields_to_defense", "task_yields_to_voucher",
@@ -30,10 +32,12 @@ PIONEER_EVENT_CODES = {
     "treasure_decoded", "legend_appended",
     "task_reservation_cleared", "task_reservation_interrupted",
     "accept_overwritten", "shop_stall_reassess",
+    "pioneer_stay_clear_no_station", "pioneer_stay_clear_no_weapon",
 }
 ECONOMY_EVENT_CODES = {
     "income_mine", "cashout_priority", "sale_unreachable", "sale_too_late",
     "backpack_full", "no_reachable_mine", "sell_threshold",
+    "worker_day_no_command",
 }
 
 
@@ -84,13 +88,15 @@ def emit_console_report(report):
             for role in roles
         ],
     )
-    news_plans = report.get("newsPlans") or {}
-    official = news_plans.get("official") or {}
-    folk = news_plans.get("folk") or {}
-    if official.get("oreEffects"):
-        log_official_plan(round_no, official)
-    if folk:
-        log_folk_plan(round_no, folk)
+    # official_plan / folk_plan 只在 ingest（官方原文变化）和 LLM 落地时打，
+    # 不在每回合结束重复打印。
+    # news_plans = report.get("newsPlans") or {}
+    # official = news_plans.get("official") or {}
+    # folk = news_plans.get("folk") or {}
+    # if official.get("oreEffects"):
+    #     log_official_plan(round_no, official)
+    # if folk:
+    #     log_folk_plan(round_no, folk)
 
     weapon_actions, wall_actions, pioneer_actions, economy_actions = [], [], [], []
     for role in roles:
@@ -148,7 +154,6 @@ def emit_console_report(report):
     )
 
     primary = diag.get("primary") or {}
-    outer = diag.get("outer") or {}
     missing_n = len(primary.get("missing") or [])
     wall_round = "、".join(a["text"] for a in wall_actions) or "无砌墙/采石"
     planned = primary.get("planned")
@@ -160,11 +165,6 @@ def emit_console_report(report):
             "planned": primary.get("planned"), "built": primary.get("built"),
             "missing": (primary.get("missing") or [])[:20],
             "missingCount": missing_n,
-        },
-        outer={
-            "planned": outer.get("planned"), "built": outer.get("built"),
-            "missingCount": len(outer.get("missing") or []),
-            "unlocked": diag.get("outer_unlocked"),
         },
         thisRound=wall_actions,
         events=_events_with_codes(events, WALL_EVENT_CODES),
@@ -203,6 +203,28 @@ def emit_console_report(report):
             events=eco_ev,
         )
 
+
+
+def log_judge_feedback(state):
+    """把官方判题反馈（errorCode/description + 上一条指令是否合法）集中打一行 stderr，
+    debug 时不用再翻 decision_*.json 去对照。只读不改状态，不参与决策。"""
+    errors = [{"errorCode": e.error_code, "description": e.description} for e in (state.errors or [])]
+    previous = state.last_sent_command or {}
+    results = state.last_round_role_action_results or {}
+    per_actor = []
+    for key in sorted(set(previous) | set(results), key=lambda k: str(k)):
+        per_actor.append({
+            "actorId": key,
+            "command": previous.get(key),
+            "legal": results.get(key),
+        })
+    if not errors and not per_actor:
+        return
+    emit_stderr(
+        "JUDGE_FEEDBACK", "round", state.round_no,
+        title=f"【判决反馈】错误{len(errors)}条 | 角色回执{len(per_actor)}条",
+        errors=errors, perActor=per_actor,
+    )
 
 
 def trace(state, role_id, code, message, **details):
@@ -293,6 +315,9 @@ def build_report(state, commands, previous_commands, before, previous_snapshot, 
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "diagnostics": metrics,
         "phase": phase, "phase_basis": "策略按roundNo从0起算；官方起点尚待核验",
+        # phaseTask 是 pioneer 接取任务后由系统返回的任务原文；写入决策日志，
+        # 使接取动作与后续收到的任务内容可以在同一日志序列中关联。
+        "phase_task": state.phase_task,
         "decision_ms": round(elapsed_ms, 3),
         "summary": {"gold": before["gold"], "weapons": sum(counts[t] for t in ("gatling", "railgun", "rocket")),
                     "walls": counts["wall"], "bases": [asdict(r) for r in roles if r.role_type == "station"],
@@ -317,7 +342,7 @@ def render_text(report):
     diagnostic = report.get('diagnostics', {})
     for alert in diagnostic.get('alerts', []):
         lines.append('【重点】' + json.dumps(alert, ensure_ascii=False))
-    for key in ('primary', 'outer', 'outer_unlocked', 'gold_delta', 'actors', 'weapons', 'newsPlans'):
+    for key in ('primary', 'gold_delta', 'actors', 'weapons', 'newsPlans'):
         if key in diagnostic or key in report:
             payload = diagnostic.get(key) if key in diagnostic else report.get(key)
             if payload:
@@ -348,3 +373,38 @@ def write_report(log_dir, report):
                          (".txt", render_text(report))):
         with (log_dir / (stem + suffix)).open("x", encoding="utf-8") as stream:
             stream.write(text)
+
+
+# 旧版：整包 STRATEGY_DECISION JSON。与上方按类分行版本同名，会盖掉前者。
+# def emit_console_report(report):
+#     """向判题平台可见的 stderr 输出一行可检索的完整决策摘要。
+#
+#     本地 JSON 保存完整事件；控制台仅保留每个角色的最终动作和原因，避免把
+#     任务原文、背包明细或重复路径事件刷满平台输出。
+#     """
+#     role_reports = []
+#     for role in report["roles"]:
+#         reasons = [{k: v for k, v in event.items() if k not in ('role_id', 'command')}
+#                    for event in role["events"]]
+#         role_reports.append({
+#             "id": role["role_id"], "type": role["role_type"],
+#             "pos": role["position"], "status": role["status"],
+#             "health": role["health"], "backpackCounts": role["backpack"],
+#             "commandKey": role["command_key"], "command": role["command"],
+#             "reasons": reasons, "pendingBuild": role["pending_build"],
+#             "itemJob": role["item_job"],
+#         })
+#     record = {
+#         "marker": CONSOLE_MARKER, "sequence": report["sequence"],
+#         "roundNo": report["round"], "phase": report["phase"],
+#         "summary": report["summary"], "roles": role_reports,
+#         "globalEvents": [event for event in report["events"] if event["role_id"] is None],
+#         "previousFeedback": report["previous_feedback"],
+#         "systemErrors": report["system_errors"],
+#         "observedChanges": report["observed_changes"],
+#         "decisionMs": report["decision_ms"],
+#         "schemaVersion": report['schema_version'],
+#         "timestampUtc": report['timestamp_utc'],
+#         "diagnostics": report.get('diagnostics', {}),
+#     }
+#     print(json.dumps(record, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)

@@ -190,12 +190,13 @@ def defense_snapshot(role, state, blocked):
 
 
 def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
-    from .opening import MUSTER_BUFFER, adjacent_path, station_return_detail
+    from .opening import MUSTER_BUFFER, adjacent_path, pioneer_free_at_night, station_return_detail
     from .brain import is_day_round
     from .tactics import night_wave_cleared, threat_eta_to_base
     solve, solve_source = estimated_solve_rounds(state)
     eta = threat_eta_to_base(state, pioneer)
-    wave = night_wave_cleared(state)
+    # 夜里工人能守住全部炮位时，开拓者不受回防时间约束，可以接新任务。
+    wave = night_wave_cleared(state) or pioneer_free_at_night(state, pioneer, blocked)
     obstacles = blocked if reserved is None else (blocked | reserved)
     rows = []
     tasks = []
@@ -242,7 +243,11 @@ def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
             row['rejected'] = 'solve_exceeds_platform_timeout'
             rows.append(row)
             continue
-        route = adjacent_path(pioneer, task.task_position, obstacles, state)
+        if is_day_round(state.round_no):
+            route = adjacent_path(pioneer, task.task_position, obstacles, state)
+        else:
+            from .opening import night_safe_path
+            route = night_safe_path(pioneer, task.task_position, obstacles, state)
         if route is None:
             row['rejected'] = 'no_route'
             rows.append(row)
@@ -492,8 +497,15 @@ def apply_task_choice(pioneer, state, blocked, reserved, row):
         reset_shop_progress(state)
         return True, selected_cmd(state, pioneer.id, cmd, '已在领取范围且无更高优先阻塞，当轮接取')
     save_reservation(state, pioneer, row, stage='approaching')
-    step = move_towards(pioneer.pos, target, blocked | reserved,
-                        state.map_info.width, state.map_info.height)
+    from .brain import is_day_round
+    if is_day_round(state.round_no):
+        step = move_towards(pioneer.pos, target, blocked | reserved,
+                            state.map_info.width, state.map_info.height)
+    else:
+        # 夜里从基地后方绕去任务点，避开正面和机器人。
+        from .opening import night_safe_path
+        path = night_safe_path(pioneer, target, blocked | reserved, state)
+        step = path[0] if path else None
     if step:
         reserved.add((step.x, step.y))
         cmd = {'action': 'move', 'targetPos': [{'x': step.x, 'y': step.y}]}

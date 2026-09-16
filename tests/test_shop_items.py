@@ -59,6 +59,45 @@ class VoucherCostTests(unittest.TestCase):
 
 
 class MaybeStartJobPriorityTests(unittest.TestCase):
+    def setUp(self):
+        # 这些用例只验证道具任务优先级；“先建新墙”的闸门单独测试。
+        from unittest import mock
+        patcher = mock.patch('src.agent.brain.walls_still_to_build', return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_buys_all_level_one_weapon_vouchers_when_gold_and_space_allow(self):
+        state = minimal_state(gold_num=300)
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=1),
+            make_role(22, 12, 8, "rocket", level=1),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 20, 20, "worker", back_pack_capability=10)
+        state.team_our.roles.append(worker)
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher1", "num": 3})
+
+    def test_after_three_level_two_weapons_buys_station_before_level_three_batch(self):
+        state = minimal_state(gold_num=450)
+        station = state.team_our.roles[0]
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=2),
+        ]
+        worker = make_role(1, 20, 20, "worker", back_pack_capability=10)
+        state.team_our.roles.append(worker)
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "StationUpgradeVoucher1", "num": 1})
+        state.worker_item_jobs.clear()
+        station.level = 2
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "WeaponUpgradeVoucher2", "num": 3})
+
     def test_weapon_then_wall_then_station(self):
         state = minimal_state(gold_num=1000)
         weapon = make_role(20, 12, 10, "gatling", health=1000, level=1)
@@ -69,14 +108,12 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(state.worker_item_jobs[1]["kind"], "weapon")
         state.worker_item_jobs.clear()
         weapon.level = 3
+        wall.health = 400  # 低于半血才升级
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["kind"], "wall")
         state.worker_item_jobs.clear()
         wall.level = 3
         wall.health = 2000
-        maybe_start_shop_item_job(worker, state)
-        self.assertNotIn(1, state.worker_item_jobs)
-        state.round_no = 400
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]["kind"], "station")
 
@@ -93,7 +130,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
     def test_moderate_damage_does_not_buy_wall_fixer(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
-        wall = make_role(40000, 11, 10, "wall", health=500, level=1)
+        wall = make_role(40000, 11, 10, "wall", health=450, level=1)
         state.team_our.roles.append(wall)
         worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
         maybe_start_shop_item_job(worker, state)
@@ -133,7 +170,17 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
         self.assertEqual(job["kind"], "weapon")
 
-    def test_weapon_upgrade_picks_frontmost_lowest_level(self):
+    def test_weapon_upgrade_picks_rocket_before_frontmost_railgun(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        railgun = make_role(21, 12, 8, "railgun", level=1)
+        rocket = make_role(22, 10, 8, "rocket", level=1)
+        state.team_our.roles += [railgun, rocket]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]["target"], (10, 8))
+
+    def test_weapon_upgrade_picks_frontmost_within_same_weapon_type(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
         rear = make_role(21, 10, 8, "rocket", level=1)
@@ -189,6 +236,39 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         job = state.worker_item_jobs[1]
         self.assertEqual(job["kind"], "station")
         self.assertEqual(job["item"], "StationUpgradeVoucher1")
+
+    def test_day2_low_base_station_before_third_level2_weapon(self):
+        state = minimal_state(gold_num=200)
+        state.round_no = 140
+        state.team_our.roles[0].level = 1
+        state.team_our.roles[0].health = 700
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        self.assertEqual(job["kind"], "station")
+        self.assertEqual(job["item"], "StationUpgradeVoucher1")
+
+    def test_day2_healthy_base_third_weapon_before_station(self):
+        state = minimal_state(gold_num=200)
+        state.round_no = 140
+        state.team_our.roles[0].level = 1
+        state.team_our.roles[0].health = 1500
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=2),
+            make_role(22, 12, 8, "rocket", level=2),
+            make_role(23, 12, 12, "railgun", level=1),
+        ]
+        worker = make_role(1, 5, 5, "worker", back_pack_capability=100)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        self.assertEqual(job["kind"], "weapon")
+        self.assertEqual(job["target"], (12, 12))
+        self.assertEqual(job["item"], "WeaponUpgradeVoucher1")
 
     def test_station_voucher_held_during_day_when_base_unhurt(self):
         from src.agent.grid import build_blocked_set
@@ -293,16 +373,39 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
         self.assertEqual(job["item"], "WeaponUpgradeVoucher2")
         self.assertEqual(job["kind"], "weapon")
 
-    def test_wall_upgrade_as_lowest_priority(self):
+    def test_healthy_wall_is_not_upgraded(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 3
-        wall = make_role(40000, 11, 10, "wall", health=1000, level=1)  # 满血，不需要维修
+        wall = make_role(40000, 11, 10, "wall", health=1000, level=1)  # 满血，不需要升级
         state.team_our.roles.append(wall)
         worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
         maybe_start_shop_item_job(worker, state)
-        job = state.worker_item_jobs[10010]
-        self.assertEqual(job["item"], "WallUpgradeVoucher1")
-        self.assertEqual(job["kind"], "wall")
+        self.assertNotIn(10010, state.worker_item_jobs)
+
+    def test_wall_voucher_batch_counts_only_damaged_walls(self):
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        state.team_our.roles += [
+            make_role(40000, 11, 10, "wall", health=300, level=1),
+            make_role(40001, 11, 11, "wall", health=400, level=1),
+            make_role(40002, 11, 12, "wall", health=1000, level=1),
+            make_role(40003, 11, 13, "wall", health=900, level=1),
+        ]
+        worker = make_role(10010, 20, 21, "worker", back_pack_capability=100)
+        state.team_our.roles.append(worker)
+        maybe_start_shop_item_job(worker, state)
+        cmd = decide_shop_item_job(worker, state, set(), set())
+        self.assertEqual(cmd, {"action": "buy", "name": "WallUpgradeVoucher1", "num": 2})
+
+    def test_no_wall_upgrade_while_new_walls_remain_to_build(self):
+        from unittest import mock
+        state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
+        state.team_our.roles.append(make_role(40000, 11, 10, "wall", health=100, level=1))
+        worker = make_role(10010, 5, 5, "worker", back_pack_capability=100)
+        with mock.patch('src.agent.brain.walls_still_to_build', return_value=True):
+            maybe_start_shop_item_job(worker, state)
+        self.assertNotIn(10010, state.worker_item_jobs)
 
     def test_day3_keeper_repairs_front_wall_even_with_new_wall_backlog(self):
         from src.agent.grid import build_blocked_set
@@ -425,7 +528,7 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
         self.assertIn(10011, commands)
-        self.assertIn(commands[10011]["action"], ("move", "buy", "use"))
+        self.assertEqual(commands[10011]["action"], "move")
 
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):

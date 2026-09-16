@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+.local_deps/
 venv/
 
 # IDE

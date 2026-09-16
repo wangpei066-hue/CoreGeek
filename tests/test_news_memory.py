@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 
 from src.agent.news_memory import (
-    NewsMemory, game_day, heuristic_ore_effect, vendor_prices,
+    NewsMemory, game_day, heuristic_ore_effect, heuristic_ore_effects, vendor_prices,
+    legend_mentions_open_time, merge_ore_effect, is_resume_official,
 )
-from src.agent.prompt_router import PromptRouter, parse_json_object
+from src.agent.prompt_router import PromptRouter, parse_json_object, make_treasure_prompt
 from src.agent.protocol import MatchState, MapInfo, TeamOur, WorldNews, ShopItem, Zone, Pos, Role
 from src.agent.brain import best_ore_to_sell, nearest_mine
 
@@ -48,17 +49,101 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(effect["mineBannedDays"], [2, 3])
         self.assertEqual(effect["priceUpDays"], [2, 3])
 
+    def test_heuristic_reads_duration_and_immediate_start(self):
+        three = heuristic_ore_effect("铜矿区即日起停产，预计需要3天恢复开采。", 2)
+        self.assertEqual(three["affectedOre"], "copper")
+        self.assertEqual(three["mineBannedDays"], [2, 3, 4])
+        two_cn = heuristic_ore_effect("石矿明日全面停工，修复需要两天左右。", 1)
+        self.assertEqual(two_cn["affectedOre"], "stone")
+        self.assertEqual(two_cn["mineBannedDays"], [2, 3])
+
+    def test_heuristic_price_only_and_collapse_without_停工(self):
+        priced = heuristic_ore_effect("小贩通报：铜资源回收价上调，市场紧缺。", 1)
+        self.assertEqual(priced["affectedOre"], "copper")
+        self.assertEqual(priced["mineBannedDays"], [])
+        self.assertEqual(priced["priceUpDays"], [2, 3])
+        collapse = heuristic_ore_effect("北部铁矿区昨夜发生严重矿井塌方，主巷道受损。", 1)
+        self.assertEqual(collapse["mineBannedDays"], [2, 3])
+
+    def test_heuristic_skips_negation_and_blank(self):
+        self.assertIsNone(heuristic_ore_effect("今日无重大新闻", 1))
+        self.assertIsNone(heuristic_ore_effect("铁矿区评估后确认未停工，暂不涨价。", 1))
+        self.assertIsNone(heuristic_ore_effect("安全监察部门表示不会全面停工。", 1))
+        self.assertEqual(heuristic_ore_effects("无重大新闻", 1), [])
+
+    def test_heuristic_multiple_ores(self):
+        effects = heuristic_ore_effects("铁矿与铜矿明日同时禁采，停工2天。", 1)
+        ores = {row["affectedOre"]: row["mineBannedDays"] for row in effects}
+        self.assertEqual(ores["iron"], [2, 3])
+        self.assertEqual(ores["copper"], [2, 3])
+
+    def test_merge_ore_effect_keeps_prior_window_on_status_update(self):
+        previous = {
+            "affectedOre": "iron",
+            "mineBannedDays": [3, 4],
+            "priceUpDays": [3, 4],
+            "source": "llm",
+            "publishedDay": 2,
+        }
+        incoming = {
+            "affectedOre": "iron",
+            "mineBannedDays": [3],
+            "priceUpDays": [3],
+            "notes": "仍在修复",
+            "source": "llm",
+            "publishedDay": 3,
+        }
+        merged = merge_ore_effect(previous, incoming, resume=False)
+        self.assertEqual(merged["mineBannedDays"], [3, 4])
+        self.assertEqual(merged["priceUpDays"], [3, 4])
+        cleared = merge_ore_effect(previous, {
+            "affectedOre": "iron", "mineBannedDays": [], "priceUpDays": [],
+            "notes": "恢复", "source": "llm", "publishedDay": 5,
+        }, resume=True)
+        self.assertEqual(cleared["mineBannedDays"], [])
+        self.assertTrue(is_resume_official("铁矿区修复工程完成，即日起恢复开采。"))
+
+    def test_status_update_llm_merges_with_memory(self):
+        state = self._state(131, official=IRON_COLLAPSE)
+        self.memory.ingest(state)
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [3, 4],
+            "priceUpDays": [3, 4],
+            "notes": "明日停工2天",
+        }, published_day=2)
+        self.assertEqual(self.memory.banned_ores(3), {"iron"})
+        self.assertEqual(self.memory.banned_ores(4), {"iron"})
+
+        state = self._state(261, official="铁矿区修复工程仍在进行中，修复过程中无法采集铁矿")
+        self.memory.ingest(state)
+        self.assertEqual(len(self.memory.data["officialHistory"]), 2)
+        # pending plan 仍应带着旧窗，不能清空记忆
+        plan = self.memory.store_official_plan(261)
+        self.assertEqual(plan["oreEffects"][0]["mineBannedDays"], [3, 4])
+        self.assertEqual(plan["bannedOres"], ["iron"])
+
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [3],
+            "priceUpDays": [3],
+            "notes": "只写了今天",
+        }, published_day=3)
+        effect = self.memory.data["oreEffects"][0]
+        self.assertEqual(effect["mineBannedDays"], [3, 4])
+        self.assertEqual(self.memory.banned_ores(4), {"iron"})
+
     def test_ingest_official_and_legend(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")
         self.memory.ingest(state)
         self.assertTrue(self.memory.data["needOreParse"])
         self.assertTrue(self.memory.data["needTreasureDecode"])
-        self.assertEqual(self.memory.banned_ores(2), {"iron"})
+        self.assertEqual(self.memory.banned_ores(2), set())
         self.assertEqual(self.memory.data["legends"][-1]["text"], "西部有一石门")
         plan = self.memory.worker_json(0)
-        self.assertEqual(plan["oreEffects"][0]["affectedOre"], "iron")
-        self.assertEqual(plan["stockpileOres"], ["iron"])
-        self.assertEqual(self.memory.data["officialPlan"]["stockpileOres"], ["iron"])
+        self.assertEqual(plan["oreEffects"], [])
+        self.assertEqual(plan["stockpileOres"], [])
+        self.assertEqual(self.memory.data["officialPlan"]["oreEffects"], [])
         self.assertIsNone(self.memory.data.get("treasureHypothesis"))
         self.assertEqual(self.memory.data.get("folkPlan") or {}, {})
         # 同文不重复追加
@@ -70,13 +155,12 @@ class NewsMemoryTests(unittest.TestCase):
         self.memory.ingest(state)
         router = PromptRouter(self.memory)
         p1 = router.request_prompt(state)
-        self.assertIn("民间传闻", p1)
+        self.assertIn("官方消息", p1)
         self.assertEqual(self.memory.data["llmUsed"], 1)
-        self.memory.data["needTreasureDecode"] = False
         self.memory.clear_pending()
-        self.memory.data["needOreParse"] = True
+        self.memory.data["needTreasureDecode"] = True
         p2 = router.request_prompt(state)
-        self.assertIn("官方消息", p2)
+        self.assertIn("民间传闻", p2)
         self.assertEqual(self.memory.data["llmUsed"], 2)
         self.memory.clear_pending()
         # 耗尽
@@ -89,6 +173,56 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(self.memory.data["llmUsed"], 0)
         self.assertTrue(self.memory.can_spend())
 
+    def test_official_change_always_sends_ore_llm_before_folk(self):
+        state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门")
+        self.memory.ingest(state)
+        self.assertTrue(self.memory.data["needOreParse"])
+        router = PromptRouter(self.memory)
+        prompt = router.request_prompt(state)
+        self.assertIn("官方消息解析器", prompt)
+        self.assertIn("previousOreEffects", prompt)
+        self.assertTrue(self.memory.data["orePromptSent"])
+        self.assertFalse(self.memory.data["treasurePromptSent"])
+
+    def test_official_llm_before_folk_on_any_meaningful_news(self):
+        state = self._state(0, official="安全委员会发布例行通报，请各队关注后续安排。", folk="西部有一石门")
+        self.memory.ingest(state)
+        self.assertTrue(self.memory.data["needOreParse"])
+        router = PromptRouter(self.memory)
+        first = router.request_prompt(state)
+        self.assertIn("官方消息", first)
+        self.assertTrue(self.memory.data["orePromptSent"])
+        self.memory.clear_pending()
+        state.round_no = 1
+        second = router.request_prompt(state)
+        self.assertIn("民间传闻", second)
+        self.assertTrue(self.memory.data["treasurePromptSent"])
+
+    def test_official_llm_at_most_once_per_day_folk_gets_remaining(self):
+        state = self._state(0, official="安全委员会发布例行通报。", folk="西部有一石门")
+        self.memory.ingest(state)
+        router = PromptRouter(self.memory)
+        router.request_prompt(state)
+        self.assertEqual(self.memory.data["pendingConsumer"], "ore")
+        self.memory.clear_pending()
+        # 同天再设 needOreParse，但 orePromptSent 已 true，应改送传闻
+        self.memory.data["needOreParse"] = True
+        state.round_no = 1
+        again = router.request_prompt(state)
+        self.assertIn("民间传闻", again)
+        self.assertEqual(self.memory.data["llmUsed"], 2)
+
+        self.memory.clear_pending()
+        self.memory.data["llmUsed"] = 2
+        self.memory.data["treasurePromptSent"] = False
+        self.memory.data["needTreasureDecode"] = True
+        self.memory.data["needOreParse"] = True
+        self.memory.data["orePromptSent"] = False
+        state.round_no = 2
+        # 还剩 1 次额度且官方仍需：官方优先占用这 1 次
+        last = router.request_prompt(state)
+        self.assertIn("官方消息", last)
+        self.assertTrue(self.memory.data["orePromptSent"])
     def test_phase_task_blocks_news_prompt(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="情报")
         self.memory.ingest(state)
@@ -100,22 +234,38 @@ class NewsMemoryTests(unittest.TestCase):
         self.memory.ingest(state)
         router = PromptRouter(self.memory)
         router.request_prompt(state)
-        self.assertEqual(self.memory.data["pendingConsumer"], "treasure")
+        self.assertEqual(self.memory.data["pendingConsumer"], "ore")
         state.round_no = 1
         state.phase_task = "做题"
         state.llm_resp = '{"action":"submit","taskAnswer":"2"}'
         router.consume_llm_resp(state)
         self.assertIsNone(self.memory.data["pendingConsumer"])
-        hyp = self.memory.data.get("treasureHypothesis") or {}
-        self.assertFalse(hyp.get("ready"))
+        self.assertEqual(self.memory.data.get("oreEffects") or [], [])
 
     def test_consume_ore_and_treasure_llm(self):
         state = self._state(5, official=IRON_COLLAPSE, folk="石门需三钥")
         self.memory.ingest(state)
         router = PromptRouter(self.memory)
         router.request_prompt(state)
-        self.assertEqual(self.memory.data["pendingConsumer"], "treasure")
+        self.assertEqual(self.memory.data["pendingConsumer"], "ore")
         state.round_no = 6
+        state.llm_resp = json.dumps({
+            "affectedOre": "iron",
+            "mineBannedDays": [2, 3],
+            "priceUpDays": [2, 3],
+            "notes": "ok",
+        })
+        state.decision_events = []
+        router.consume_llm_resp(state)
+        self.assertIn("iron", self.memory.banned_ores(2))
+        self.assertIsNone(self.memory.data["pendingConsumer"])
+
+        self.memory.data["needTreasureDecode"] = True
+        state.llm_resp = ""
+        state.round_no = 7
+        router.request_prompt(state)
+        self.assertEqual(self.memory.data["pendingConsumer"], "treasure")
+        state.round_no = 8
         state.llm_resp = json.dumps({
             "ready": True,
             "altarPos": {"x": 12, "y": 8},
@@ -130,32 +280,22 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertTrue(hyp["ready"])
         self.assertEqual(hyp["confidence"], 0.9)
         self.assertEqual(hyp["altarPos"], {"x": 12, "y": 8})
-        self.assertIsNone(self.memory.data["pendingConsumer"])
-
-        self.memory.data["needOreParse"] = True
-        state.llm_resp = ""
-        state.round_no = 7
-        router.request_prompt(state)
-        state.round_no = 8
-        state.llm_resp = '{"affectedOre":"iron","mineBannedDays":[2,3],"priceUpDays":[2,3],"notes":"ok"}'
-        state.decision_events = []
-        router.consume_llm_resp(state)
-        self.assertIn("iron", self.memory.banned_ores(2))
-
-    def test_low_confidence_treasure_json_is_not_ready_and_retries(self):
+    def test_low_confidence_treasure_json_is_not_ready_and_waits_for_new_legend(self):
         state = self._state(0, folk="西部有一石门")
         self.memory.ingest(state)
         router = PromptRouter(self.memory)
         prompt = router.request_prompt(state)
         self.assertIn("置信度", prompt)
         self.assertIn("allowedTaskItems", prompt)
+        self.assertIn("heardOnDay", prompt)
+        self.assertIn("禁止用 now、heardOnDay", prompt)
         state.round_no = 1
         state.llm_resp = json.dumps({
             "ready": True,
             "altarPos": {"x": 1, "y": 2},
             "items": ["AcientTablet"],
-            "openFromRound": None,
-            "openToRound": None,
+            "openFromRound": 260,
+            "openToRound": 389,
             "confidence": 0.4,
             "notes": "只有石门，没有坐标原文",
         })
@@ -163,7 +303,46 @@ class NewsMemoryTests(unittest.TestCase):
         hyp = self.memory.data["treasureHypothesis"]
         self.assertEqual(hyp["confidence"], 0.4)
         self.assertFalse(hyp["ready"])
+        self.assertIsNone(hyp["openFromRound"])
+        self.assertIsNone(hyp["openToRound"])
+        self.assertFalse(self.memory.data["needTreasureDecode"])
+        state.round_no = 131
+        state.world_news.folk_legends = "武器店有铭文石板"
+        self.memory.ingest(state)
         self.assertTrue(self.memory.data["needTreasureDecode"])
+
+    def test_open_window_kept_when_legend_names_day(self):
+        state = self._state(0, folk="祭坛第4天开启，坐标(12,8)，需铭文石板")
+        self.memory.ingest(state)
+        self.assertTrue(legend_mentions_open_time(state.world_news.folk_legends))
+        self.memory.apply_treasure_llm({
+            "ready": True,
+            "altarPos": {"x": 12, "y": 8},
+            "items": ["AcientTablet"],
+            "openFromRound": 390,
+            "openToRound": 519,
+            "confidence": 0.9,
+        })
+        hyp = self.memory.data["treasureHypothesis"]
+        self.assertEqual(hyp["openFromRound"], 390)
+        self.assertEqual(hyp["openToRound"], 519)
+
+    def test_treasure_prompt_strips_guessed_window_from_previous(self):
+        state = self._state(262, folk="西部有一石门，门需三钥")
+        self.memory.ingest(state)
+        self.memory.data["treasureHypothesis"] = {
+            "ready": False, "altarPos": None,
+            "items": ["AcientTablet"],
+            "openFromRound": 260, "openToRound": 389,
+            "confidence": 0.6, "source": "llm",
+        }
+        prompt = make_treasure_prompt(state, self.memory)
+        payload = json.loads(prompt.split("输入：", 1)[1])
+        self.assertEqual(payload["now"]["gameDay"], 3)
+        self.assertEqual(payload["legends"][0]["heardOnDay"], 3)
+        self.assertNotIn("day", payload["legends"][0])
+        self.assertIsNone(payload["previousHypothesis"]["openFromRound"])
+        self.assertIsNone(payload["previousHypothesis"]["openToRound"])
 
     def test_parse_fenced_json(self):
         self.assertEqual(parse_json_object('```json\n{"a":1}\n```'), {"a": 1})
@@ -173,7 +352,8 @@ class NewsMemoryTests(unittest.TestCase):
         self.memory.ingest(state)
         again = NewsMemory(Path(self.temp.name))
         self.assertEqual(again.data["legends"][-1]["text"], "门需三钥")
-        self.assertEqual(again.banned_ores(3), {"iron"})
+        self.assertTrue(again.data["needOreParse"])
+        self.assertEqual(again.banned_ores(3), set())
 
     def test_context_change_resets(self):
         self.memory.ingest(self._state(0, official=IRON_COLLAPSE, folk="a", team_id="t1"))
@@ -190,8 +370,24 @@ class NewsMemoryTests(unittest.TestCase):
             self.memory.ingest(state)
             router = PromptRouter(self.memory)
             prompt = router.request_prompt(state)
-            self.assertIn("民间传闻", prompt)
+            self.assertIn("官方消息", prompt)
+            self.assertIn("previousOreEffects", prompt)
+            self.assertIn("officialHistory", prompt)
             state.round_no = 1
+            state.llm_resp = json.dumps({
+                "affectedOre": "iron",
+                "mineBannedDays": [2, 3],
+                "priceUpDays": [2, 3],
+                "notes": "ok",
+            })
+            router.consume_llm_resp(state)
+            self.memory.clear_pending()
+            self.memory.data["needTreasureDecode"] = True
+            state.round_no = 2
+            state.llm_resp = ""
+            treasure_prompt = router.request_prompt(state)
+            self.assertIn("民间传闻", treasure_prompt)
+            state.round_no = 3
             state.llm_resp = json.dumps({
                 "ready": True,
                 "altarPos": {"x": 1, "y": 2},
@@ -206,27 +402,23 @@ class NewsMemoryTests(unittest.TestCase):
         official = next(row for row in news if row["event"] == "official_ingested")
         self.assertIn("铁矿", official["officialNews"])
         self.assertIn("【新闻】", official["title"])
-        official_plan = next(row for row in news if row["event"] == "official_plan")
-        self.assertEqual(official_plan["plan"]["oreEffects"][0]["affectedOre"], "iron")
-        self.assertEqual(official_plan["plan"]["stockpileOres"], ["iron"])
+        pending_plan = next(
+            row for row in news
+            if row["event"] == "official_plan" and (row.get("plan") or {}).get("oreEffects") == []
+        )
+        self.assertEqual(pending_plan["plan"]["stockpileOres"], [])
+        ore_out = next(row for row in news if row["event"] == "llm_output" and row.get("consumer") == "ore")
+        self.assertTrue(ore_out["parseOk"])
+        self.assertEqual(ore_out["parsedJson"]["affectedOre"], "iron")
         folk = next(row for row in news if row["event"] == "folk_ingested")
         self.assertEqual(folk["newLegend"], "西部石门需三钥")
-        self.assertTrue(all(
-            (row.get("plan") or {}).get("source") == "llm"
-            for row in news if row["event"] == "folk_plan"
-        ))
-        sent = next(row for row in news if row["event"] == "prompt_sent")
-        self.assertEqual(sent["consumer"], "treasure")
-        self.assertIn("民间传闻", sent["promptText"])
-        out = next(row for row in news if row["event"] == "llm_output")
-        self.assertTrue(out["parseOk"])
-        self.assertEqual(out["parsedJson"]["altarPos"], {"x": 1, "y": 2})
-        self.assertIn("民间传闻", out["promptText"])
+        sent_ore = next(row for row in news if row["event"] == "prompt_sent" and row.get("consumer") == "ore")
+        self.assertIn("官方消息", sent_ore["promptText"])
         folk_plans = [row for row in news if row["event"] == "folk_plan"]
         self.assertEqual(folk_plans[-1]["plan"]["altarPos"], {"x": 1, "y": 2})
         self.assertEqual(folk_plans[-1]["plan"]["source"], "llm")
         self.assertEqual(self.memory.data["folkPlan"]["altarPos"], {"x": 1, "y": 2})
-
+        self.assertEqual(self.memory.banned_ores(2), {"iron"})
 
 class OrePricingTests(unittest.TestCase):
     def test_sell_highest_price(self):

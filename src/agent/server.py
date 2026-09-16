@@ -9,13 +9,14 @@ from threading import Lock
 from flask import Flask, jsonify, request
 
 from .protocol import MatchState
-from .task_logging import task_diagnostics
+from .task_logging import task_diagnostics, log_task_exchange
 from .news_logging import news_diagnostics
 from .task_solver import PioneerTaskSolver, WAITING_STAGES
 from .news_memory import NewsMemory
 from .prompt_router import PromptRouter
 from .brain import V1Strategy, BasicActionValidator, is_day_round
 from .decision_log import snapshot, build_report, write_report, emit_console_report
+from .log_format import log_commit_banner
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -102,6 +103,7 @@ class GameServer:
         self.prompt_router = PromptRouter(self.news_memory)
         self.app = Flask(__name__)
         self._setup_routes()
+        log_commit_banner()
 
     def _setup_routes(self):
         @self.app.route("/", methods=["POST"])
@@ -128,7 +130,9 @@ class GameServer:
             return jsonify({"error": "invalid JSON object"}), 400
         try:
             self.prepare_directories()
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            # LLM原文仅由任务诊断输出到stderr，不写入本地请求日志。
+            payload = json.dumps({k: v for k, v in data.items() if k != 'llmResp'},
+                                 ensure_ascii=False, indent=2)
             while True:
                 seq = next(self.request_sequence)
                 log_path = self.log_dir / f"request_{seq:06d}.json"
@@ -139,7 +143,9 @@ class GameServer:
                 except FileExistsError:
                     continue
 
-            # 策略决策
+            # 若启动时 stderr 未被平台收集，首回合补打一次；已打过则跳过。
+            log_commit_banner(data.get("roundNo"))
+            log_task_exchange('request', seq, data, self.task_solver.session, data.get('roundNo'))
             self.load_build_memory()
             self.match_state.update(data)
             if self.match_state.memory_reset:
@@ -194,6 +200,8 @@ class GameServer:
             self.save_build_memory()
 
             command = {"roleCommandMap": role_command_map, "prompt": prompt, "executeCmd": execute_cmd}
+            log_task_exchange('response', seq, command, self.task_solver.session,
+                              self.match_state.round_no)
 
             response_path = self.log_dir / f"response_{seq:06d}.json"
             try:

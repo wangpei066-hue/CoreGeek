@@ -1,0 +1,17 @@
+{
+  "max_rounds": 14,
+  "iteration_0_escalated": {
+    "success_count": 2,
+    "total": 6,
+    "tasks": {
+      "task_1_alpha.md": {"success": true, "rounds": 9},
+      "task_1_beijing.md": {"success": true, "rounds": 8},
+      "remaining": {"success": false, "reason": "API任务未在14轮内完成"}
+    }
+  },
+  "iteration_1": {
+    "status": "partial",
+    "reason": "API调用阶段超时，需单任务复跑",
+    "source_compile": true
+  }
+}

@@ -37,6 +37,8 @@ def begin_round(state):
             state.policy_memory['night_empty_streak'] = int(state.policy_memory.get('night_empty_streak') or 0) + 1
         from .opening import update_wall_time_overrun
         update_wall_time_overrun(state)
+        from .economy import note_night_contact
+        note_night_contact(state)
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)
     if base:
@@ -186,41 +188,6 @@ def threat_eta_to_base(state, role=None):
     if not etas:
         return None
     return min(etas)
-
-
-def two_guns_can_hold(state):
-    """两门炮能否守住当前可见波次。看不见敌人时，不能从「三炮二级」推出可少一人。"""
-    from .brain import WEAPON_TYPES, own_station, max_health, is_day_round
-    if is_day_round(state.round_no):
-        return False
-    if pressure(state) or front_breached(state):
-        return False
-    if not state.team_our:
-        return False
-    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
-    gunners = [r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0]
-    if len(weapons) < 2 or len(gunners) < 2:
-        return False
-    from .opening import assign_weapons
-    assignments = assign_weapons(state)
-    manning = sum(1 for g in gunners if assignments.get(g.id)
-                  and chebyshev(g.pos, assignments[g.id].pos) <= 1
-                  and (assignments[g.id].attack_range or 0) > 0)
-    if manning < 2:
-        return False
-    robots = threat_robots(state)
-    if not robots:
-        return False
-    base = own_station(state)
-    if base is None:
-        return False
-    eta = threat_eta_to_base(state)
-    if eta is not None and eta <= 8:
-        return False
-    if any(r.role_type == 'bossRobot' for r in robots) or len(robots) >= 2:
-        return False
-    healthy = [w for w in weapons if w.health >= max_health(w) * 0.5]
-    return len(healthy) >= 2
 
 
 def bomb_target(state):

@@ -22,21 +22,20 @@ def diagnostics(state, commands, previous, comparable, previous_commands):
     if not state.team_our or not state.map_info:
         return {'alerts': [], 'note': '缺少队伍或地图，无法计算诊断指标'}
     from .brain import own_station, max_health, WEAPON_TYPES
-    from .opening import primary_wall_plan, wall_ring, outer_wall_ready, assign_weapons, station_path, adjacent_path, movement_avoid
+    from .opening import primary_wall_plan, assign_weapons, station_path, adjacent_path
     from .grid import build_blocked_set, chebyshev
     from .tactics import threat_robots
     roles = state.team_our.roles
     base = own_station(state)
     walls = {(r.pos.x, r.pos.y): r for r in roles if r.role_type == 'wall' and r.health > 0}
     primary = primary_wall_plan(state, base) if base else []
-    outer = sorted(set(wall_ring(state, base))-set(primary)) if base else []
     def wall_status(points):
         return {'planned': len(points), 'built': sum(p in walls for p in points),
                 'missing': [list(p) for p in points if p not in walls],
                 'needs_upgrade': [list(p) for p in points if p in walls and (walls[p].level or 1) < 2],
                 'needs_repair': [list(p) for p in points if p in walls and walls[p].health < max_health(walls[p])*0.8]}
     prices = {i.name: i.price for i in state.vendor_shop_list}
-    blocked = build_blocked_set(state) | movement_avoid(state)
+    blocked = build_blocked_set(state)
     assignments = assign_weapons(state)
     cycle = (state.round_no or 0) % 130
     alerts, actors, weapons = [], [], []
@@ -109,7 +108,7 @@ def diagnostics(state, commands, previous, comparable, previous_commands):
             'rounds_to_night': max(0, 70-cycle), 'score': state.team_our.total_score,
             'gold_delta': state.team_our.gold_num-previous['gold'] if comparable and previous['gold'] is not None else None,
             'delta_note': '净变化可能包含交易、任务及其他来源，不能直接归因于某次卖矿。',
-            'primary': primary_status, 'outer': wall_status(outer), 'outer_unlocked': outer_wall_ready(state),
+            'primary': primary_status,
             'weapon_upgrade_deadline': upgrade_deadline,
             'actors': actors, 'weapons': weapons, 'robots_by_type': dict(Counter(r.role_type for r in robots)),
             'robots_near_base': sum(chebyshev(base.pos, r.pos) <= 7 for r in robots) if base else None,
