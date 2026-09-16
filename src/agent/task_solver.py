@@ -67,6 +67,11 @@ HTTP/shell 成功不等于业务成功。code 非 200 时停止分页和统计�
 查询成功不等于全量读取已验证。按 pagination 分页，检测重复页面、重复ID、总量不一致及无进展。
 世界遗产用 protected_level 精确匹配任务要求。oldest_era 提交遗产名称且必须有年代比较依据，模糊年代不能用第一条记录占位。
 '''
+PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每次只返回一个JSON：
+{"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
+只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
+PROMPT_DEPLOY = '''部署SOP：read任务文档→read唯一spec.md→下一次execute一次完成修复、CRLF处理和check→从成功输出提取真实TOKEN并submit。配置按物理行用awk写临时文件再mv；CRLF用tr -d '\\r'。不要继续ls/cat探查，不要修改check，不要重复失败命令。'''
+PROMPT_API = '''API SOP：read任务文档；需要时read API_DOCS.md；一次execute用curl -G完成分页、校验和统计；立即submit。接口是GET /api/v1/heritage/search，Authorization: Bearer heritage-api-key-2024，参数location/offset/limit，响应code/data.records/data.pagination。文档中的X-API-Key、city、page过时。必须查全；protected_level精确统计世界遗产，按era_order找oldest_era；数字保持数字。'''
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
@@ -1875,11 +1880,11 @@ class PioneerTaskSolver:
 
     def make_prompt(self, state):
         kind = self.session.get('taskKind', 'unknown')
-        parts = [BASE_PROMPT, CLASSIFICATION_RULES]
+        parts = [PROMPT_CORE]
         if kind == 'workspace':
-            parts.append(DEPLOYMENT_SOP)
+            parts.append(PROMPT_DEPLOY)
         elif kind == 'api':
-            parts.append(API_SOP)
+            parts.append(PROMPT_API)
         budget, remaining = self._budget(self.session, state)
         metrics = self.session.get('metrics') or {}
         payload = {
