@@ -82,7 +82,7 @@
 | `llm_output` | LLM | `parsedJson` + 落地后的 `plan` |
 | `llm_empty` | LLM | 等待中的响应为空 |
 
-处理顺序：官方启发式命中则不送矿价 LLM；未命中当天最多送 1 次且优先于传闻。传闻只走宝藏 LLM，每天至少预留 1 次送推。两份 JSON 只落盘并打日志，默认不改工人/开拓者动作。详情见 [`news.md`](news.md)。
+处理顺序：官方原文变化当天固定 1 次矿价 LLM（优先）；剩余额度给传闻。启发式暂时关闭。两份 JSON 只落盘并打日志。详情见 [`news.md`](news.md)。
 
 `official_plan` / `folk_plan` 只在官方原文变化（ingest）或对应 LLM 落地时打，不每回合重打。平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"`。
 

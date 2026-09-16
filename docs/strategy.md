@@ -319,14 +319,14 @@ $$
 
 每天白天首回合的官方消息、民间传闻写入跨回合记忆。
 
-**矿石新闻（启发式，不是官方合法表）**
+**矿石新闻（LLM，启发式暂时关闭）**
 
-- 官方消息出现停工/塌方等，并点到石/铁/铜：启发式写入 `officialPlan`（当天还能采、随后禁采/涨价），矿价 LLM 可覆盖。经济逻辑会据此调整：`stockpileOres` 当天优先抢收且暂不低价卖，`bannedOres` 不再采，`priceUpOres` 当天优先出售囤货。
+- 官方消息原文变化后申请矿价 LLM（每天至多 1 次），写入 `officialPlan`。经济逻辑会据此调整：`stockpileOres` 当天优先抢收且暂不低价卖，`bannedOres` 不再采，`priceUpOres` 当天优先出售囤货。
 
 **宝藏**
 
 - 民间传闻只累积原文，直接走宝藏 LLM，写入 `folkPlan`；不做正则启发式。当前不指挥开拓者买物/`summonTreasure`。
-- 自进化没占用 `prompt` 时，每天最多 3 次 LLM。官方消息与传闻分线申请。
+- 自进化没占用 `prompt` 时，每天最多 3 次 LLM。官方变化占 1 次，传闻用剩余额度。
 - `phaseTask` 非空时：传闻不申请 `prompt`；若仍有未消费的新闻 pending，直接丢弃，避免把解题 JSON 当成传闻解码。等待解题工具/LLM 时，诊断日志走 stderr，不额外占用 `executeCmd`。
 
 ---

@@ -51,12 +51,20 @@ def make_ore_prompt(state: MatchState, memory: NewsMemory) -> str:
         '"priceUpDays":[int,...],"notes":"简短说明"}'
     )
     return (
-        "你是《未来战争》官方消息解析器。只根据本条官方消息推断矿价，不要使用民间传闻。"
-        "游戏日从1起算；当天通常仍可采集，停工多从次日开始。"
+        "你是《未来战争》官方消息解析器。只根据本条官方消息推断矿价/禁采日程，不要使用民间传闻。"
+        "游戏日从1起算；首发停工通知里「今天还能抢采、明日停工」时，禁采从次日开始。"
         f"当前第{day}天（roundNo={state.round_no}，每天{DAY_NIGHT_CYCLE}回合）。"
+        "规则："
+        "- 明确写停工/禁采/塌方及工期时：写出完整 mineBannedDays（游戏日整数列表），priceUpDays 通常与禁采日相同。"
+        "- 「修复仍在进行/无法采集」是进度确认：把当前日列入禁采，并保留 previousOreEffects 里尚未结束的合理日程；不要把禁采窗无故整体后移。"
+        "- 「恢复开采/修复完成/即日起恢复」：对该矿返回空的 mineBannedDays 与 priceUpDays，用于清除旧禁采。"
+        "- 没有明确矿种或停工/涨价/恢复措辞时：选最相关矿种，两个数组都为空，notes 说明依据不足。"
         f"只返回一个JSON对象，不要Markdown：{schema}。"
-        "没有明确矿种或停工/涨价措辞时：选最相关矿种，mineBannedDays 与 priceUpDays 用空数组，notes 说明依据不足。"
-        "\n输入：" + json.dumps({"currentDay": day, "officialNews": news}, ensure_ascii=False)
+        "\n输入：" + json.dumps({
+            "currentDay": day,
+            "officialNews": news,
+            "previousOreEffects": memory.data.get("oreEffects") or [],
+        }, ensure_ascii=False)
     )
 
 
@@ -127,7 +135,8 @@ def make_treasure_prompt(state: MatchState, memory: NewsMemory) -> str:
 
 
 class PromptRouter:
-    """消费 llmResp；无自进化时申请日额度 prompt（官方未命中优先且每天至多 1 次，传闻保底 1 次）。"""
+    """消费 llmResp；无自进化时申请日额度 prompt。
+    官方原文变化：当天固定至多 1 次矿价 LLM；其余额度给传闻（最多约 2 次）。"""
 
     def __init__(self, memory: NewsMemory):
         self.memory = memory
@@ -200,8 +209,8 @@ class PromptRouter:
         self.memory.clear_pending()
 
     def request_prompt(self, state: MatchState) -> str:
-        """无自进化时每回合至多 1 条。启发式未命中的官方消息优先，但每天最多送 1 次；
-        民间传闻若仍待解码，至少预留 1 次成功送推。"""
+        """无自进化时每回合至多 1 条。
+        官方原文变化 → 当天固定 1 次矿价 LLM（优先）；剩余额度给传闻。"""
         if state.phase_task:
             return ""
         if (self.memory.data.get("pendingConsumer")
@@ -211,11 +220,8 @@ class PromptRouter:
         if not self.memory.can_spend():
             return ""
 
-        folk_needed = self.memory.folk_needs_prompt()
-        official_needed = self.memory.official_needs_prompt()
-        folk_unsent = folk_needed and not self.memory.data.get("treasurePromptSent")
-        # 最后 1 次额度留给尚未送出的传闻，避免官方占满后传闻当天一次都没有。
-        if official_needed and (self.memory.budget_remaining() > 1 or not folk_unsent):
+        # 官方每天最多 1 次；占 1 额后传闻最多还能用 2 次。
+        if self.memory.official_needs_prompt():
             prompt = make_ore_prompt(state, self.memory)
             self.memory.mark_pending("ore", state.round_no, prompt)
             self.memory.data["needOreParse"] = False
@@ -229,7 +235,7 @@ class PromptRouter:
             )
             return prompt
 
-        if folk_needed:
+        if self.memory.folk_needs_prompt():
             prompt = make_treasure_prompt(state, self.memory)
             self.memory.mark_pending("treasure", state.round_no, prompt)
             trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])

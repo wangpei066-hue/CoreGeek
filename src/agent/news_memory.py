@@ -309,22 +309,23 @@ class NewsMemory:
             self.data["officialDay"] = day
             meaningful = official.strip() and "无重大新闻" not in official
             if meaningful:
-                effects = heuristic_ore_effects(official, day)
-                for weak in effects:
-                    self._upsert_ore_effect(weak)
-                # 机制命中则不申请矿价 LLM；只有匹配失败才送一次。
-                self.data["needOreParse"] = not bool(effects)
-                if effects and getattr(state, "decision_events", None) is not None:
-                    trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
-                          effects=effects)
-                weak = effects[0] if effects else None
+                # 暂时不用启发式：官方原文变化后固定走矿价 LLM（每天至多 1 次）。
+                # effects = heuristic_ore_effects(official, day)
+                # for weak in effects:
+                #     self._upsert_ore_effect(weak)
+                # self.data["needOreParse"] = not bool(effects)
+                # if effects and getattr(state, "decision_events", None) is not None:
+                #     trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
+                #           effects=effects)
+                # weak = effects[0] if effects else None
+                self.data["needOreParse"] = True
                 log_news_event(
                     event="official_ingested", roundNo=state.round_no,
                     title=f"【新闻】官方消息 | {headline(official)}",
-                    officialNews=official, oreEffect=weak, oreEffects=effects,
+                    officialNews=official, oreEffect=None, oreEffects=[],
                 )
                 log_official_plan(state.round_no, self.store_official_plan(state.round_no),
-                                  source=(weak or {}).get("source") or "pending_llm")
+                                  source="pending_llm")
 
         if folk and folk.strip():
             legends = self.data.setdefault("legends", [])
@@ -474,7 +475,7 @@ class NewsMemory:
         return bool(self.data.get("needTreasureDecode") and not self.data.get("treasureEmpty"))
 
     def official_needs_prompt(self) -> bool:
-        """启发式未命中、且当天还没送过矿价 LLM。"""
+        """官方原文有变化待解，且当天还没送过矿价 LLM。"""
         return bool(self.data.get("needOreParse") and not self.data.get("orePromptSent"))
 
     def mark_pending(self, consumer: str, round_no: int, prompt: str) -> None:
