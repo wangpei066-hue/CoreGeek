@@ -1,6 +1,7 @@
 """平台自进化任务状态机：读沙盒文档 → 平台LLM → 沙盒交互/提交答案。"""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -312,6 +313,19 @@ def is_plain_int(value):
 
 def normalize_target(value):
     return ' '.join(str(value or '').replace('\\', '/').split())
+
+
+def same_document_path(left, right):
+    """Compare document paths across local macOS /var symlink aliases."""
+    a, b = normalize_target(left), normalize_target(right)
+    if a == b:
+        return True
+    if a.startswith('/') and b.startswith('/'):
+        try:
+            return os.path.realpath(a) == os.path.realpath(b)
+        except (OSError, ValueError):
+            pass
+    return False
 
 
 def failure_fingerprint(action, target, workspace, error_class):
@@ -1758,9 +1772,8 @@ class PioneerTaskSolver:
                 if answer['action'] == 'read':
                     path = answer['path']
                     env = s.get('documentDir') or s.get('workspace')
-                    normalized_path = normalize_target(path)
                     already_read = any(
-                        normalize_target(item.get('path')) == normalized_path
+                        same_document_path(item.get('path'), path)
                         and not item.get('error')
                         for item in s.get('documents') or []
                         if isinstance(item, dict))
