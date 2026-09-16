@@ -14,12 +14,17 @@ import unittest
 
 from src.agent import GameServer
 from src.agent.task_solver import (
-    MARKER, extract_md_paths, parse_llm, sandbox_command, task_context,
+    MARKER, clean_url, extract_md_paths, parse_llm, sandbox_command, task_context,
     task_fingerprint, READ_SCRIPT, EXEC_SCRIPT, PioneerTaskSolver,
 )
 
 
 class TaskSolverHelperTests(unittest.TestCase):
+    def test_clean_url_removes_markdown_and_chinese_trailing_punctuation(self):
+        self.assertEqual(clean_url('http://localhost:8899`）'), 'http://localhost:8899')
+        self.assertEqual(clean_url('http://localhost:8899/api/v1/search。'),
+                         'http://localhost:8899/api/v1/search')
+
     def test_extract_paths(self):
         self.assertEqual(extract_md_paths('阅读`/app/API Guide.md`，再查看 docs/query.md 和「天气说明.md」。'),
                          ['/app/API Guide.md', 'docs/query.md', '天气说明.md'])

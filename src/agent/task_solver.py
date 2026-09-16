@@ -18,7 +18,15 @@ PROMPT_VERSION = '20260916-solver5'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
 TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
-URL_RE = re.compile(r'https?://[^\s\'"\\]+')
+# URLs in task documents are commonly enclosed in Markdown backticks and
+# followed by Chinese punctuation.  Keep extraction permissive, then normalize
+# each match before passing it to urlparse/curl.
+URL_RE = re.compile(r'https?://[^\s\'"\\`<>，。；：、（）()\[\]{}]+')
+URL_TRAILING_CHARS = '`\u2019\u201d\u3001\u3002\uff0c\uff1b\uff1a\uff09\uff3d\uff5d\u3011.,;:)]}>'
+
+
+def clean_url(url):
+    return (url or '').strip().rstrip(URL_TRAILING_CHARS)
 CITY_RE = re.compile(r'(北京|南京|成都|上海|广州|深圳|杭州|武汉|西安|重庆|天津|苏州|长沙|郑州|青岛|合肥|福州|厦门|昆明|哈尔滨|沈阳|济南|南昌|南宁|太原|石家庄)')
 CITY_LATIN = {
     '北京': 'beijing', '南京': 'nanjing', '成都': 'chengdu', '上海': 'shanghai',
@@ -389,7 +397,7 @@ def service_hint(path, url, task):
 def matching_api_experience(experience, task):
     items = [item for item in ((experience or {}).get('api') or [])
              if item.get('path') and not item.get('invalidReason')]
-    urls = URL_RE.findall(task or '')
+    urls = [clean_url(url) for url in URL_RE.findall(task or '')]
     task_hint = service_hint('', urls[0] if urls else '', task)
     city = extract_city(task)
     for item in reversed(items):
@@ -420,7 +428,7 @@ def matching_api_experience(experience, task):
 
 def harvest_api_call(command, output, task):
     """仅在业务 code=200 时保存调用经验；不含密钥；不把查询成功标成全量已验证。"""
-    urls = URL_RE.findall(command or '')
+    urls = [clean_url(url) for url in URL_RE.findall(command or '')]
     if not urls:
         return None
     payload = None
@@ -1001,7 +1009,7 @@ def default_heritage_experience(task, documents):
     task's host/path when one is provided.
     """
     blob = '\n'.join(str(item.get('content') or '') for item in documents or [])
-    urls = URL_RE.findall(blob + '\n' + (task or ''))
+    urls = [clean_url(url) for url in URL_RE.findall(blob + '\n' + (task or ''))]
     parsed = urlparse(urls[0]) if urls else urlparse('http://localhost:8899/api/v1/heritage/search')
     path = parsed.path or '/api/v1/heritage/search'
     if 'heritage' not in path.lower() and '遗产' not in blob:
