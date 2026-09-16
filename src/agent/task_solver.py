@@ -1177,6 +1177,18 @@ class PioneerTaskSolver:
                     and item.get('requestId') == request_id
                     and item.get('event') in ('read_document', 'execute_tool', 'deploy_probe', 'api_fetch')):
                 return item
+        # Some real task runners return the raw stdout of a command instead
+        # of the PIONEER_TASK wrapper.  In particular, ./check may return
+        # ``[ OK ] ... TOKEN: ...`` directly.  Do not discard that result while
+        # waiting for an execute_tool response: it is the authoritative
+        # completion evidence for deployment tasks.
+        if self.session.get('stage') == 'wait_tool':
+            match = re.match(r'^\[exitCode:(-?\d+)\]\n?(.*)$',
+                             state.last_cmd_result or '', flags=re.DOTALL)
+            if match:
+                return dict(marker=MARKER, requestId=request_id,
+                            event='execute_tool', exitCode=int(match.group(1)),
+                            output=match.group(2), outputTail=match.group(2))
         status, payload, raw = parse_curl_output(state.last_cmd_result)
         if payload is not None and ('code' in payload or 'data' in payload):
             return dict(
