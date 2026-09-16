@@ -202,21 +202,33 @@ def opening_worker_mode(state, role):
 
 
 def economist_should_help_wall(state, remaining, role):
-    """压力窗口或施工工不可用时，经济工接管最低墙，避免分工变成硬锁死。"""
+    """经济工只在有限、可完成的条件下接管墙，完成后自动回到升级闭环，不会变成长期石工。"""
     if role.role_type != 'worker':
         return False
+    from .opening import MUSTER_BUFFER, movement_avoid, survival_wall_missing
+    from . import work_orders as wo
     roles = opening_worker_roles(state)
     builder = next((r for r in (state.team_our.roles if state.team_our else [])
                     if r.id == roles.get('builder') and r.health > 0), None)
     if builder is None or builder.id == role.id:
+        return True  # 建造工阵亡或不可用：工作单交接，墙任务不能消失。
+    blocked = build_blocked_set(state) | movement_avoid(state)
+    orders = wo.compute_work_orders(state, blocked)
+    if orders['emergency_defense']['active']:
         return True
-    from .opening import MUSTER_BUFFER, survival_wall_missing
     missing = survival_wall_missing(state)
     if not missing:
         return False
-    if day1_wall_floor_met(state):
-        return False
-    if remaining <= MUSTER_BUFFER + 12:
+    # 经济工已经拿着石头，直接补关键缺口比跑回去采铜铁划算。
+    if wo.stone_count(role) > 0:
+        return True
+    program = orders['wall_program']
+    # 只看最低墙线的余量：普通扩墙没修完不是把经济工变成石工的理由。
+    slack = program.get('minimum_slack')
+    if slack is not None and slack < MUSTER_BUFFER:
+        trace(state, role.id, 'economist_helps_wall', '最低墙线时间余量不足，经济工临时接管一个批次',
+              minimum_slack=slack, minimum_finish_eta=program.get('minimum_finish_eta'),
+              wall_deadline=program.get('wall_deadline'))
         return True
     return False
 
@@ -556,51 +568,106 @@ def opening_muster(role, state, blocked, reserved, assignments, stage):
                         'muster', 'weapon', 'muster', stage)
 
 
+def planned_stone_batch(state, role, blocked, slots, critical):
+    """这趟该备多少石头。批次大小由剩余墙位、背包空位和夜前工时共同决定，不用固定常数。"""
+    from . import work_orders as wo
+    free = wo.free_slots(role)
+    stones = wo.stone_count(role)
+    rounds = wo.rounds_before_return(state, role, blocked)
+    per_wall = wo.ROUNDS_PER_WALL + wo.ROUNDS_PER_STONE
+    buildable = max(0, rounds) // per_wall
+    if not slots:
+        # 已经没有墙位可建：把背包装满，石头留作第二天的城墙材料。
+        return stones + (free if free is not None else 0)
+    if critical:
+        first_batch = min(wo.FIRST_BATCH_WALLS, len(critical), max(1, buildable))
+    else:
+        first_batch = max(1, min(len(slots), buildable))
+    batch = min(wo.stone_needed_for(first_batch), wo.stone_needed_for(len(slots)))
+    if free is not None:
+        batch = min(batch, stones + free)
+    return max(1, batch)
+
+
 def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
-    """首日生存墙优先：先攒够一趟墙材再集中施工，临近入夜才提前补缺口。"""
+    """建造工城墙状态机：成批采石 → 成批建墙 → 夜前剩余价值最大化。
+
+    不再"采一块修一段"；也不因为"这批当天修不完"就提前回防空转——
+    唯一的硬约束是 return_deadline，石头当天用不掉就带到第二天。
+    """
     from .opening import (
-        MUSTER_BUFFER, STONE_BATCH, assign_weapons, claim_opening_wall, day_rounds_remaining,
+        MUSTER_BUFFER, assign_weapons, claim_opening_wall, day_rounds_remaining,
         survival_wall_missing,
     )
-    missing = survival_wall_missing(state)
-    stones = (role.backpack or []).count('stone')
-    cap = role.back_pack_capability or 0
-    pack_full = bool(cap and len(role.backpack or []) >= cap)
-    # 只备够这名工人这趟真正用得上的量：不超过 STONE_BATCH/背包容量/剩余缺口。
-    batch_cap = cap or STONE_BATCH
-    batch_target = min(STONE_BATCH, batch_cap, len(missing)) if missing else 0
+    from . import work_orders as wo
+
+    orders = wo.compute_work_orders(state, blocked)
+    program = orders['wall_program']
+    emergency = orders['emergency_defense']['active']
+    critical = survival_wall_missing(state)
+    slots = [tuple(p) for p in program['target_wall_slots']] or wo.remaining_wall_slots(state)
+    if emergency and critical:
+        slots = critical
+    stones = wo.stone_count(role)
+    pack_full = wo.backpack_full(role)
+    free = wo.free_slots(role)
     remaining = day_rounds_remaining(state.round_no)
-    urgent_ready = stones > 0 and remaining <= MUSTER_BUFFER + 6
-    batch_ready = stones >= batch_target if batch_target else stones > 0
     wall_assignments = assignments or assign_weapons(state)
-    mine_exhausted = False
-    if missing and stones > 0 and not pack_full and not batch_ready and not urgent_ready:
-        mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
-        if mine is not None:
-            target = (mine.pos.x, mine.pos.y)
-            if path:
-                return opening_move(state, role, path, reserved, target, '前往最近可达石矿继续囤石',
-                                    'mine', 'stone', 'batch_not_ready', STAGE_WALL)
-            cmd = selected(state, role.id, {
-                'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
-            }, '继续采集石头，攒够一批再建墙')
-            return _tick(state, role, STAGE_WALL, 'mine', 'stone', target, 0, 'collect',
-                         'batch_not_ready', cmd)
-        mine_exhausted = True
-        trace(state, role.id, 'stone_mine_unreachable', '石矿不可达，带着手上的石头去建墙')
-    if stones > 0 and missing and (pack_full or batch_ready or urgent_ready or mine_exhausted):
-        cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, wall_assignments)
+    previous = wo.builder_state(state, role.id)
+    mine_exhausted = wo.collect_failed_last_round(state, role)
+
+    batch = planned_stone_batch(state, role, blocked, slots, critical)
+    batch_ready = stones >= batch if batch else stones > 0
+    urgent_ready = stones > 0 and remaining <= MUSTER_BUFFER + 6
+
+    # 首批关键墙完成后：比较候选计划，决定这一趟是纯采石、采石加建墙还是先清库存。
+    choice = None
+    if not critical and slots is not None:
+        candidates, choice = wo.plan_candidates(state, role, blocked, reserved)
+        trace(state, role.id, 'wall_plan_candidates',
+              '首批关键墙已完成，按夜前收益比较候选计划',
+              candidate_A=next((c for c in candidates if c['candidate'] == 'GATHER_ONLY'), None),
+              candidate_B=next((c for c in candidates if c['candidate'] == 'GATHER_AND_BUILD'), None),
+              candidate_C=next((c for c in candidates if c['candidate'] == 'BUILD_FROM_INVENTORY'), None),
+              selected_candidate=None if choice is None else choice['candidate'],
+              extra_walls_built=None if choice is None else choice['extra_walls_built'],
+              stone_carried_to_day2=None if choice is None else choice['stone_carried_to_day2'])
+
+    # BUILD_WALL_BATCH：手上有石、还有墙位就连续修，中途不跳回普通采矿/卖矿/等待。
+    prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY'
+    build_now = bool(
+        stones > 0 and slots and not prefer_gather
+        and (pack_full or batch_ready or urgent_ready or mine_exhausted
+             or previous == 'BUILD_WALL_BATCH')
+    )
+    if build_now:
+        cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
         if cmd:
             target = None
             if cmd.get('action') in ('build', 'move'):
                 tp = cmd.get('targetPos') or [{}]
                 target = (tp[0].get('x'), tp[0].get('y'))
-            if urgent_ready and not (pack_full or batch_ready):
+            if pack_full:
+                switch = 'backpack_full'
+            elif urgent_ready:
                 switch = 'urgent_wall'
+            elif batch_ready:
+                switch = 'batch_ready'
+            elif mine_exhausted:
+                switch = 'mine_exhausted'
             else:
-                switch = 'batch_ready' if batch_ready else ('backpack_full' if pack_full else 'mine_exhausted')
-            return _tick(state, role, STAGE_WALL, 'wall', 'wall', target, 0 if cmd.get('action') == 'build' else 1,
+                switch = 'build_batch'
+            wo.builder_state(state, role.id,
+                             'BUILD_WALL_BATCH' if cmd.get('action') == 'build' else 'GO_WALL_LINE')
+            trace(state, role.id, 'builder_state', '建造工连续施工中',
+                  builder_state='BUILD_WALL_BATCH', builder_target=list(target) if target else None,
+                  stone_carried=stones, stone_batch_target=batch,
+                  inventory_capacity=wo.inventory_capacity(role),
+                  inventory_used=wo.inventory_used(role), free_slots=free)
+            return _tick(state, role, STAGE_WALL, 'wall', 'wall', target,
+                         0 if cmd.get('action') == 'build' else 1,
                          cmd.get('action'), switch, cmd)
+
     if _metal_count(role):
         # 修墙阶段用不上铜铁了（第一天不做第二门升级），背包里有多少都该卖掉换金币，
         # 不能等到背包塞满才想起来卖，不然会一直闲置到入夜白白浪费。
@@ -612,23 +679,55 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                 cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '丢弃铜铁以便采石')
                 return _tick(state, role, STAGE_WALL, 'wall', 'drop', None, 0, 'drop',
                              'wall_stage_metal_unused', cmd)
-    if missing and not pack_full and (not batch_ready or stones == 0):
+
+    # GATHER_STONE_BATCH：背包没满就继续采，当天建不完也把石头带到第二天，不提前回防空转。
+    if not pack_full and not mine_exhausted:
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
         if mine is not None:
             target = (mine.pos.x, mine.pos.y)
+            if slots and not batch_ready:
+                switch = 'batch_not_ready'
+            elif not slots:
+                switch = 'stock_for_day2'
+            else:
+                switch = reason
+            wo.builder_state(state, role.id, 'GO_STONE' if path else 'GATHER_STONE_BATCH')
+            trace(state, role.id, 'builder_state', '建造工成批采石',
+                  builder_state='GATHER_STONE_BATCH', builder_target=list(target),
+                  stone_carried=stones, stone_batch_target=batch,
+                  inventory_capacity=wo.inventory_capacity(role),
+                  inventory_used=wo.inventory_used(role), free_slots=free,
+                  stock_for_day2=not slots)
             if path:
-                return opening_move(state, role, path, reserved, target, '前往最近可达石矿',
-                                    'mine', 'stone', reason, STAGE_WALL)
+                return opening_move(state, role, path, reserved, target, '前往最近可达石矿继续囤石',
+                                    'mine', 'stone', switch, STAGE_WALL)
             cmd = selected(state, role.id, {
                 'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
-            }, '采集石头')
-            return _tick(state, role, STAGE_WALL, 'mine', 'stone', target, 0, 'collect', reason, cmd)
+            }, '成批采集石头：当天建不完的留作第二天城墙材料')
+            return _tick(state, role, STAGE_WALL, 'mine', 'stone', target, 0, 'collect', switch, cmd)
         trace(state, role.id, 'stone_mine_unreachable', '石矿不可达')
+
+    # 还有石头但刚才没能建成：再试一次墙线，避免抱着石头空转。
+    if stones > 0 and slots:
+        cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
+        if cmd:
+            wo.builder_state(state, role.id, 'BUILD_WALL_BATCH')
+            return _tick(state, role, STAGE_WALL, 'wall', 'wall', None, 1, cmd.get('action'),
+                         'build_batch_retry', cmd)
+
+    wo.builder_state(state, role.id, 'PLAN_NEXT_ACTION')
     from .opening import opening_yard_wait
     wait = opening_yard_wait(role, state, blocked, reserved)
+    wait_reason = ('backpack_full_no_buildable_slot' if pack_full else
+                   'stone_mine_exhausted' if mine_exhausted else 'no_reachable_work')
+    trace(state, role.id, 'builder_wait', '建造工本回合没有有收益的合法动作',
+          wait_reason=wait_reason, builder_state='PLAN_NEXT_ACTION',
+          stone_carried=stones, stone_batch_target=batch, walls_missing=len(slots),
+          inventory_capacity=wo.inventory_capacity(role),
+          inventory_used=wo.inventory_used(role), free_slots=free)
     if wait:
-        return _tick(state, role, STAGE_WALL, 'wall', 'yard', None, 0, 'move', 'wait_in_yard', wait)
-    return _tick(state, role, STAGE_WALL, 'wall', 'yard', None, 0, 'hold', 'wait_in_yard', None)
+        return _tick(state, role, STAGE_WALL, 'wall', 'yard', None, 0, 'move', wait_reason, wait)
+    return _tick(state, role, STAGE_WALL, 'wall', 'yard', None, 0, 'hold', wait_reason, None)
 
 
 def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments,
@@ -842,6 +941,23 @@ def plan_opening_fsm(state):
         stage, gold, cost, opening_has_voucher(state),
         cutoff=past_first_upgrade_cutoff(state, remaining),
     )
+    from . import work_orders as wo
+    orders = wo.compute_work_orders(state, blocked, force=True)
+    wo.log_work_orders(state, orders)
+    for fighter in fighters:
+        deadline = wo.return_deadline(state, fighter, blocked)
+        trace(state, fighter.id, 'role_deadlines', '本角色统一截止时间',
+              return_deadline=deadline,
+              wall_deadline=wo.wall_deadline(state, fighter, blocked),
+              upgrade_deadline=wo.upgrade_deadline(state, fighter, blocked),
+              task_deadline=(wo.task_deadline(state, fighter, blocked)
+                             if fighter.role_type == 'pioneer' else None),
+              rounds_before_return=wo.rounds_before_return(state, fighter, blocked),
+              builder_state=wo.builder_state(state, fighter.id),
+              inventory_capacity=wo.inventory_capacity(fighter),
+              inventory_used=wo.inventory_used(fighter),
+              free_slots=wo.free_slots(fighter),
+              stone_carried=wo.stone_count(fighter))
     if stage == STAGE_BUILD_WEAPONS:
         trace(state, None, 'opening_rockets_first', '三座火箭未齐，工人先建炮')
     trace(state, None, 'opening_phase', '第一天状态机', phase=flags['opening_phase'], cycle=opening_cycle(state),
