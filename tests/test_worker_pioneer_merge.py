@@ -264,7 +264,8 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         economist.backpack = []
         commands = self.decide(state)
         cmd = commands.get(1, {})
-        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+        self.assertIn(cmd.get('action'), ('move', 'collect'), cmd)
+        self.assertNotEqual(cmd.get('action'), 'build')
 
     def _day2_guns(self, state):
         state.round_no = 140

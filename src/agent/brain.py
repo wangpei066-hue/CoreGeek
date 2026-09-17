@@ -1710,9 +1710,14 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         return item_job_cmd
 
     if not cashout:
-        build_cmd = try_build(worker, state, blocked, reserved)
-        if build_cmd:
-            return build_cmd
+        from .opening import should_gather_wall_stone
+        # 凑石批次只拦砌墙；已经领了的武器建造任务照常建。
+        pending = (state.worker_build_targets or {}).get(worker.id)
+        pending_weapon = bool(pending and pending[2] != 'wall')
+        if pending_weapon or not should_gather_wall_stone(worker, state):
+            build_cmd = try_build(worker, state, blocked, reserved)
+            if build_cmd:
+                return build_cmd
 
     final_cmd = profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
     if not final_cmd:

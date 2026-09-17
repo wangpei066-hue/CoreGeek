@@ -101,6 +101,31 @@ class StoneBatchTests(unittest.TestCase):
         self.assertEqual(tick.get('goal_type'), 'stone')
         self.assertEqual(tick.get('switch_reason'), 'batch_not_ready')
 
+    def test_one_stone_beside_gap_still_gathers(self):
+        """贴着墙缺口但这一趟没采够，继续采石，不能砌一段再跑回矿上。"""
+        state = scene()
+        role = builder(state)
+        role.pos = Pos(12, 10)
+        role.backpack = ['stone']
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone')]
+        state.decision_events = []
+        opening_wall_work(role, state, blocked_of(state), set(), set(), {})
+        tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(tick.get('goal_type'), 'stone')
+        self.assertEqual(tick.get('switch_reason'), 'batch_not_ready')
+
+    def test_started_batch_finishes_remaining_stones(self):
+        """已经开工砌这一趟时，剩下的 1 块也要砌完，不要跑回矿上。"""
+        state = scene()
+        role = builder(state)
+        role.pos = Pos(12, 10)
+        role.backpack = ['stone']
+        wo.builder_state(state, role.id, 'BUILD_WALL_BATCH')
+        state.decision_events = []
+        opening_wall_work(role, state, blocked_of(state), set(), set(), {})
+        tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
+        self.assertEqual(tick.get('goal_type'), 'wall')
+
     def test_batch_never_exceeds_free_backpack_slots(self):
         """背包容量只能来自快照；批量不得超过剩余格数。"""
         state = scene()

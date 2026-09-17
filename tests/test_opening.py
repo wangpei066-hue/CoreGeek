@@ -675,7 +675,7 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].pos = Pos(12, 7)
         state.team_our.roles[1].backpack = ['stone'] * 2
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(commands[1]['action'], ('move', 'buy', 'build'))
+        self.assertIn(commands[1]['action'], ('move', 'collect', 'build'))
         self.assertNotEqual(commands[1].get('action'), 'buy')
         ore = (state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore')
         if commands[1]['action'] != 'build':
@@ -1225,7 +1225,7 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         state.team_our.roles[1].backpack = ['stone'] * 4
         state.team_our.roles[2].backpack = []
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(commands[1]['action'], ('move', 'build'))
+        self.assertIn(commands[1]['action'], ('move', 'collect'))
         self.assertIn(commands[2]['action'], ('move', 'collect', 'build'))
         if commands[1]['action'] == 'build' and commands[2]['action'] == 'build':
             self.assertNotEqual(commands[1]['targetPos'], commands[2]['targetPos'])
@@ -1274,9 +1274,8 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         worker.backpack = ['stone'] * 4
         state.policy_memory['weapon_assignment'] = {'1': 20, '2': 21, '3': 22}
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(commands[1]['action'], ('move', 'build'))
-        if commands[1]['action'] == 'build':
-            self.assertEqual(commands[1]['name'], 'wall')
+        self.assertIn(commands[1]['action'], ('move', 'collect'))
+        self.assertNotEqual(commands.get(1), None)
 
     def test_unreachable_claim_releases_and_picks_another(self):
         from src.agent.opening import claim_opening_wall, assign_weapons
@@ -1320,7 +1319,7 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         self.assertIn(commands[1]['action'], ('move', 'sell'))
         self.assertNotEqual(commands.get(1), None)
 
-    def test_stone_in_pack_builds_or_moves_to_gap(self):
+    def test_stone_in_pack_keeps_gathering_until_batch(self):
         state = opening_state()
         state.round_no = 20
         state.team_our.gold_num = 0
@@ -1329,7 +1328,8 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         worker = state.team_our.roles[1]
         worker.backpack = ['stone'] * 3
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertIn(commands[1]['action'], ('move', 'build'))
+        self.assertIn(commands[1]['action'], ('move', 'collect'))
+        self.assertNotEqual(commands[1]['action'], 'build')
 
     def test_empty_pack_goes_to_stone(self):
         state = opening_state()
