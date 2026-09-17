@@ -38,11 +38,12 @@ class EconomyTests(unittest.TestCase):
         from src.agent.brain import maybe_start_shop_item_job, decide_shop_item_job
         state, role = defended_state(gold=0)
         role.backpack = ['WeaponUpgradeVoucher1']
-        role.pos = Pos(9, 7)
+        role.pos = Pos(11, 7)  # 挨着升级链上的第一门火箭 (11, 8)
         maybe_start_shop_item_job(role, state)
         command = decide_shop_item_job(role, state, build_blocked_set(state), set())
         self.assertEqual(command['action'], 'use')
         self.assertEqual(command['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(command['targetPos'], [{'x': 11, 'y': 8}])
 
     def test_later_day_returns_to_weapon_instead_of_collecting_at_dusk(self):
         state, role = defended_state()

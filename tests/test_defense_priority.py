@@ -22,8 +22,8 @@ class DefensePriorityTests(unittest.TestCase):
     def decide(self, state):
         return V1Strategy(BasicActionValidator()).decide(state)
 
-    def test_task_pioneer_returns_when_cannot_submit_before_nearby_threat(self):
-        """三炮二级不能单独推出少一人防守：近敌且答案未就绪时开拓者回炮，不能空转在任务点。"""
+    def test_task_pioneer_holds_active_task_with_nearby_threat(self):
+        """离开任务点任务就失败：近敌且答案未就绪也留在任务点，由工人守炮。"""
         state = defended()
         state.round_no = 200
         state.phase_task = '仍在解题'
@@ -33,7 +33,11 @@ class DefensePriorityTests(unittest.TestCase):
             role.pos = pos
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        self.assertIn('3', {c['controllerId'] for c in commands.values() if c['action'] == 'attack'})
+        controllers = {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'}
+        self.assertNotIn('3', controllers)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'move')
+        self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
+                             for e in state.decision_events))
 
     def test_day_three_worker_upgrades_front_wall_below_half_health(self):
         state = defended()
@@ -65,14 +69,14 @@ class DefensePriorityTests(unittest.TestCase):
         keeper, economist = workers[0], workers[1]
         self.assertEqual(commands[keeper.id]['name'], 'WallUpgradeVoucher1')
         self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
-        self.assertNotIn(economist.id, state.worker_item_jobs)
+        self.assertNotEqual(state.worker_item_jobs.get(economist.id, {}).get('kind'), 'wall')
 
-    def test_keeper_builds_new_walls_before_upgrading_early_in_day(self):
+    def test_keeper_repairs_low_front_walls_before_new_wall_backlog(self):
         state, workers = self._day_three_low_front_walls(2, round_no=270)
         commands = self.decide(state)
         keeper = workers[0]
-        self.assertNotEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
-        self.assertNotIn(keeper.id, state.worker_item_jobs)
+        self.assertEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+        self.assertEqual(state.worker_item_jobs[keeper.id]['kind'], 'wall')
 
     def test_front_wall_does_not_override_held_weapon_voucher(self):
         state, workers = self._day_three_low_front_walls(1, gold=100)
@@ -156,8 +160,8 @@ class DefensePriorityTests(unittest.TestCase):
             self.assertEqual(commands[3], {'action': 'submitAnswer', 'taskAnswer': '42'})
             self.assertEqual(solver.session.get('answer'), '42')
 
-    def test_solver_keeps_answer_when_pioneer_returns_to_guns(self):
-        """回防不清解题会话：开拓者去操炮时不提交，但已得到的答案仍保留。"""
+    def test_task_pioneer_stays_when_answer_ready_and_threat_near(self):
+        """答案已就绪、敌人靠近：开拓者照样留在任务点，不去操炮。"""
         state = defended()
         state.round_no = 200
         state.phase_task = '仍在解题'
@@ -167,20 +171,14 @@ class DefensePriorityTests(unittest.TestCase):
             role.pos = pos
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        with tempfile.TemporaryDirectory() as root:
-            solver = PioneerTaskSolver(Path(root))
-            solver.session = {
-                'key': [state.team_our.team_id, state.team_our.type, state.phase_task],
-                'stage': 'submit', 'answer': '保留答案', 'paths': [], 'documents': [],
-                'history': [], 'index': 0, 'offset': 0, 'calls': 0, 'retries': 0, 'round': 199,
-            }
-            self.assertEqual(solver.step(state, commands), ('', ''))
-            self.assertEqual(solver.session.get('answer'), '保留答案')
-            self.assertEqual(solver.session.get('stage'), 'submit')
-            self.assertNotIn(3, commands)
+        controllers = {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'}
+        self.assertNotIn('3', controllers)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'move')
+        self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
+                             for e in state.decision_events))
 
-    def test_dusk_task_pioneer_returns_when_answer_not_ready(self):
-        """白天回防窗口里，没有现成答案则回炮，不再仅因武器已升级而留在任务点。"""
+    def test_dusk_task_pioneer_stays_when_answer_not_ready(self):
+        """白天回防窗口里答案还没出：开拓者也不离开任务点。"""
         state = defended()
         state.round_no = 198
         state.phase_task = '仍在解题'
@@ -188,24 +186,29 @@ class DefensePriorityTests(unittest.TestCase):
             weapon.level = 2
         state.team_our.roles[3].pos = Pos(16, 10)
         commands = self.decide(state)
-        self.assertTrue(any(e['code'] in ('income_muster', 'task_yields_to_defense') and e.get('role_id') == 3
-                            for e in state.decision_events))
-        if 3 in commands:
-            self.assertEqual(commands[3]['action'], 'move')
+        controllers = {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'}
+        self.assertNotIn('3', controllers)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'move')
+        self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
+                             for e in state.decision_events))
 
-    def test_task_pioneer_yields_when_weapons_not_yet_upgraded(self):
-        """门控的另一半：武器还没全部升级到二级时，哪怕在前两夜窗口内，防守也优先于任务（方案A）。"""
-        state = defended()  # defended() 里武器固定是 level=1，武器条件不满足
+    def test_task_pioneer_holds_even_when_weapons_not_yet_upgraded(self):
+        """武器还没升级也不放下进行中的任务。"""
+        state = defended()
         state.round_no = 200
         state.phase_task = '仍在解题'
         for role, pos in zip(state.team_our.roles[1:4], (Pos(8, 8), Pos(10, 7), Pos(12, 8))):
             role.pos = pos
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        self.assertIn('3', {c['controllerId'] for c in commands.values() if c['action'] == 'attack'})
+        controllers = {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'}
+        self.assertNotIn('3', controllers)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'move')
+        self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
+                             for e in state.decision_events))
 
-    def test_task_pioneer_yields_after_third_night_even_if_weapons_upgraded(self):
-        """门控的第三条：第三夜（round>=330）起，不管武器状态，生存永远优先于任务。"""
+    def test_task_pioneer_holds_on_third_night(self):
+        """第三夜起也不放下进行中的任务。"""
         state = defended()
         state.round_no = 340
         state.phase_task = '仍在解题'
@@ -215,7 +218,11 @@ class DefensePriorityTests(unittest.TestCase):
             role.pos = pos
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
-        self.assertIn('3', {c['controllerId'] for c in commands.values() if c['action'] == 'attack'})
+        controllers = {c.get('controllerId') for c in commands.values() if c.get('action') == 'attack'}
+        self.assertNotIn('3', controllers)
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'move')
+        self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
+                             for e in state.decision_events))
 
     def test_second_day_missing_outer_walls_generates_stone_task(self):
         state = defended()
@@ -237,21 +244,19 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapons_occupy_rear_rank_and_one_forward_flank(self):
+    def test_weapon_layout_front_flanks_and_rear_rocket_pair(self):
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            first = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(50, first[0], first[1], 'rocket'))
-            second = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(51, second[0], second[1], 'rocket'))
-            third = weapon_candidates(state, base, 'rocket')[0]
-            self.assertEqual(first[0], second[0])
-            self.assertEqual(third[0], first[0] + direction)
-            self.assertGreater(abs(second[1] - 10), abs(first[1] - 10) - 4)
-            self.assertNotEqual(first[1], second[1])
-            state.team_our.roles.pop()
+            front_rocket = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(50, front_rocket[0], front_rocket[1], 'rocket'))
+            rear_rocket = weapon_candidates(state, base, 'rocket')[0]
+            railgun = weapon_candidates(state, base, 'railgun')[0]
+            self.assertEqual(rear_rocket[0], front_rocket[0] - direction)
+            self.assertEqual(rear_rocket[1], front_rocket[1])
+            self.assertEqual(railgun[0], front_rocket[0])
+            self.assertNotEqual(railgun[1], front_rocket[1])
             state.team_our.roles.pop()
 
     def test_rebuild_missing_wall_beats_third_tier_upgrade(self):
@@ -322,9 +327,9 @@ class DefensePriorityTests(unittest.TestCase):
         worker.pos = Pos(8, 9)
         commands = self.decide(state)
         buys = [c for c in commands.values() if c.get('action') == 'buy']
-        self.assertEqual([c['name'] for c in buys if 'StationUpgrade' in c.get('name', '')],
-                         ['StationUpgradeVoucher1'])
-        self.assertFalse(any('WeaponUpgradeVoucher2' in c.get('name', '') for c in buys))
+        self.assertEqual([c['name'] for c in buys if 'WeaponUpgradeVoucher2' in c.get('name', '')],
+                         ['WeaponUpgradeVoucher2'])
+        self.assertFalse(any('StationUpgrade' in c.get('name', '') for c in buys))
         self.assertFalse(any(c.get('name', '').endswith('SummonOrder') for c in buys))
 
     def test_unbought_wall_upgrade_job_yields_to_level_one_weapon(self):

@@ -38,10 +38,10 @@ def economist(state):
 
 
 class WallTargetTests(unittest.TestCase):
-    def test_first_two_weapon_slots_share_a_controller_stand(self):
+    def test_two_rocket_slots_share_a_controller_stand(self):
         state = scene()
         base = next(r for r in state.team_our.roles if r.role_type == 'station')
-        first, second = weapon_slots(state, base)[:2]
+        first, _railgun, second = weapon_slots(state, base)[:3]
         common = {
             (x, y)
             for x in range(max(0, min(first[0], second[0]) - 1), min(state.map_info.width, max(first[0], second[0]) + 2))

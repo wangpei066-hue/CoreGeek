@@ -66,16 +66,45 @@ def night_danger_cells(state, include_front=True):
     width, height = state.map_info.width, state.map_info.height
     cells = set()
     r = NIGHT_ROBOT_AVOID_RADIUS
+    base = own_station(state)
+    yard = courtyard_cells(state, base) if base is not None else set()
     for robot in threat_robots(state):
         cells.update((x, y) for x in range(robot.pos.x - r, robot.pos.x + r + 1)
                      for y in range(robot.pos.y - r, robot.pos.y + r + 1))
-    base = own_station(state)
+        if base is not None:
+            # 机器人朝基地推进的路线（每步 x、y 各向基地靠一格），两侧各留一格，院子里不算。
+            x, y = robot.pos.x, robot.pos.y
+            for _ in range(width + height):
+                cells.update((cx, cy) for cx in (x - 1, x, x + 1) for cy in (y - 1, y, y + 1)
+                             if (cx, cy) not in yard)
+                if chebyshev(Pos(x, y), base.pos) <= 1:
+                    break
+                x += (base.pos.x > x) - (base.pos.x < x)
+                y += (base.pos.y > y) - (base.pos.y < y)
     if include_front and base is not None:
         left, right, _, _ = defense_bounds(state, base)
         direction = attack_direction(state, base)
         front = right if direction == 1 else left
         cells.update((x, y) for x in range(width) for y in range(height) if (x - front) * direction > 0)
     return cells
+
+
+def night_strict_path(role, target, blocked, state):
+    """夜里完全避开正面和机器人的路径；没有就返回 None，不退化。"""
+    here = {(role.pos.x, role.pos.y)}
+    return adjacent_path(role, target, set(blocked) | (night_danger_cells(state) - here), state)
+
+
+def courtyard_path(role, target, blocked, state):
+    """只在院子里走到目标邻格（夜里在家修墙用）；人不在院子里或够不着返回 None。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return None
+    allowed = courtyard_cells(state, base) | {(role.pos.x, role.pos.y)}
+    width, height = state.map_info.width, state.map_info.height
+    outside = {(x, y) for x in range(width) for y in range(height)} - allowed
+    return adjacent_path(role, target, set(blocked) | outside, state)
 
 
 def night_safe_path(role, target, blocked, state):
@@ -169,42 +198,41 @@ def wall_priority(state, base, point):
     return 0 if point[0] == front else 2
 
 
-def rear_weapon_x(state, base):
-    """最后一排：院子里远离进攻方向的那一列，给修墙留出前线通道。"""
-    left, right, _, _ = defense_bounds(state, base)
-    return left + 1 if attack_direction(state, base) == 1 else right - 1
-
-
-def weapon_slots(state, base):
-    """前两门火箭围绕同一个操炮站位，便于冷却间隔内单人切炮。"""
+def weapon_slot_plan(state, base):
+    """武器编位：前排两侧一火箭一电磁，火箭侧后方再补一门火箭。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
-    rear_x = rear_weapon_x(state, base)
-    forward_x = rear_x + direction
-    y_mid = (bottom + top) // 2
-    y_low = max(bottom + 1, y_mid - 1)
-    y_high = min(top - 1, y_mid + 1)
+    front_x = (right if direction == 1 else left) - direction
+    rear_x = front_x - direction
+    y_low, y_high = bottom + 1, top - 1
     width, height = state.map_info.width, state.map_info.height
-    slots = [(rear_x, y_low), (rear_x, y_high), (forward_x, y_low)]
+    slots = [
+        ('rocket', (front_x, y_low)),
+        ('railgun', (front_x, y_high)),
+        ('rocket', (rear_x, y_low)),
+    ]
     station = {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
     cleaned = []
-    for x, y in slots:
+    for name, (x, y) in slots:
         if not (0 <= x < width and 0 <= y < height) or (x, y) in station:
             continue
-        cleaned.append((x, y))
+        cleaned.append((name, (x, y)))
     return cleaned
 
 
+def weapon_slots(state, base):
+    return [point for _name, point in weapon_slot_plan(state, base)]
+
+
 def wall_ring(state, base):
-    """单层防线：迎敌正面一整列，加两侧翼到最后一排武器为止，后方开放。"""
+    """单层防线：迎敌正面一整列，两翼一直延伸到院子后沿，后方竖边开放。
+    顺序：正面 → 两翼从靠前往后交替展开，后面的墙最后修。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front = right if direction == 1 else left
-    protected_rear = rear_weapon_x(state, base)
     cells = {(front, y) for y in range(bottom, top + 1)}
-    cells.update((x, y) for x in range(left, right + 1) for y in (bottom, top)
-                 if (x - protected_rear) * direction >= 0)
-    return sorted(cells, key=lambda p: (wall_priority(state, base, p), p))
+    cells.update((x, y) for x in range(left, right + 1) for y in (bottom, top))
+    return sorted(cells, key=lambda p: (wall_priority(state, base, p), abs(p[0] - front), p[1]))
 
 
 def primary_wall_plan(state, base):
@@ -695,11 +723,11 @@ def survival_wall_plan(state, base):
         return (cover_base, cover_weapon, cover_gunner, abs(y - base.pos.y), y)
 
     ordered = sorted(front, key=front_key)
-    if flanks:
-        by_y = sorted(flanks, key=lambda p: (p[1], p[0]))
-        for point in (by_y[0], by_y[-1]) if len(by_y) > 1 else by_y:
-            if point not in ordered:
-                ordered.append(point)
+    # 两翼各取紧挨正面的那一格（flanks 已按由前往后排序），不取后沿。
+    for row in sorted({p[1] for p in flanks}):
+        point = next(p for p in flanks if p[1] == row)
+        if point not in ordered:
+            ordered.append(point)
     if len(ordered) < SURVIVAL_WALL_FLOOR:
         for point in inner:
             if point not in ordered:
@@ -1036,7 +1064,10 @@ def assign_weapons(state, excluded_ids=(), persist=False):
     weapons = sorted((r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0), key=lambda r: r.id)
     if not fighters or not weapons:
         return {}
-    static = build_blocked_set(state)
+    # 被排除的人（做任务/夜间外出）会离开，他们此刻站的格子不算障碍。
+    static = build_blocked_set(state) - {
+        (r.pos.x, r.pos.y) for r in state.team_our.roles if r.id in excluded_ids
+    }
     distances = {}
     for fighter in fighters:
         others = {(r.pos.x, r.pos.y) for r in fighters if r.id != fighter.id}
@@ -1181,7 +1212,7 @@ def dual_rocket_path(role, weapon, blocked, state):
     return path_to_any(role.pos, stands, blocked, state.map_info.width, state.map_info.height)
 
 
-def guns_covered_without(state, excluded_ids, blocked):
+def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
     """两人三炮规则：排除指定角色后，剩下的人（一人站双火箭共同邻格轮流开火）能否及时覆盖全部武器。"""
     weapons = {r.id for r in state.team_our.roles
                if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0}
@@ -1191,11 +1222,18 @@ def guns_covered_without(state, excluded_ids, blocked):
     from .tactics import threat_robots
     robots = threat_robots(state)
     fighters = {r.id: r for r in state.team_our.roles}
+    # 被排除的人会离开，他此刻站的格子不算障碍。
+    blocked = set(blocked) - {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.id in excluded_ids}
     for fid, weapon in assignment.items():
         fighter = fighters.get(fid)
         path = weapon_approach_path(fighter, weapon, blocked, set(), state) if fighter else None
         if path is None:
             return False
+        if max_travel is not None:
+            # 有压力时大家都在家：守炮的人必须已经在炮位旁（最多再走 max_travel 步）。
+            if len(path) > max_travel:
+                return False
+            continue
         # 敌人已在路上时，接替的人必须先于敌人到炮位。
         if robots and len(path) + MUSTER_BUFFER >= min(
                 chebyshev(robot.pos, weapon.pos) for robot in robots):
@@ -1209,10 +1247,12 @@ def guns_covered_without(state, excluded_ids, blocked):
 
 
 def crew_covers_without(state, excluded_ids, blocked):
-    """没有压力且其余两人能守住三门炮时，被排除的那个人可以去做任务或采矿。"""
-    from .tactics import front_breached, pressure
-    if pressure(state) or front_breached(state):
-        return False
+    """其余两人能守住三门炮时，被排除的那个人可以去做任务或采矿。"""
+    from .brain import structure_priority_day
+    if structure_priority_day(state):
+        from .tactics import front_breached, pressure
+        if pressure(state) or front_breached(state):
+            return False
     return guns_covered_without(state, excluded_ids, blocked)
 
 
@@ -1238,12 +1278,13 @@ def weapon_approach_path(role, weapon, blocked, reserved, state):
 
 
 def weapon_candidates(state, base, name, extra_names=(), extra_positions=()):
-    """按编制空位补齐：先最后一排两门，再另一侧靠前一格。extra_names 仅兼容调用方。"""
+    """按编制空位补齐：火箭侧两门、另一侧电磁；类型和位置绑定。"""
     occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles
                 if r.health > 0 and r.role_type in ('gatling', 'railgun', 'rocket', 'wall', 'station')}
     occupied.update((p[0], p[1]) for p in extra_positions)
     occupied.update((base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1))
-    slots = [p for p in weapon_slots(state, base) if p not in occupied]
+    slots = [p for slot_name, p in weapon_slot_plan(state, base)
+             if slot_name == name and p not in occupied]
     if slots:
         return slots
     left, right, bottom, top = defense_bounds(state, base)
@@ -1369,6 +1410,41 @@ def pioneer_day_support(role, state, blocked, reserved, assignments):
     return pioneer_stay_clear(role, state, blocked, reserved, assignments)
 
 
+STONE_BUILD_ROUNDS = 2  # 每块石头回家后大约要 移动+建造 两回合。
+
+
+def keep_collecting_stone(role, state, blocked, reserved, base):
+    """人在石矿边、石头还不够补完整条防线时继续采，攒够一批再回家，不采一块跑一趟。
+    背包满、离天黑不够“回家 + 建完手上石头”、或矿已采空时才停。"""
+    from .brain import is_day_round
+    if not is_day_round(state.round_no) or not state.map_info:
+        return None
+    stones = role.backpack.count('stone')
+    if stones <= 0:
+        return None  # 没石头交给原流程去找矿
+    cap = role.back_pack_capability or 0
+    if cap and len(role.backpack) >= cap:
+        return None
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    need = len(set(primary_wall_plan(state, base)) - existing)
+    carried = sum(r.backpack.count('stone') for r in state.team_our.roles
+                  if r.role_type == 'worker' and r.health > 0 and r.id != role.id)
+    if stones + carried >= need:
+        return None
+    mines = [z for z in state.map_info.zones
+             if z.neutral_type == 'stone' and chebyshev(role.pos, z.pos) <= 1]
+    if not mines:
+        return None  # 已经离开矿点：先把手上的石头建完，剩下的慢慢补
+    home = chebyshev(role.pos, base.pos)
+    if day_rounds_remaining(state.round_no) <= 1 + home + STONE_BUILD_ROUNDS * (stones + 1) + MUSTER_BUFFER:
+        return None
+    mine = min(mines, key=lambda z: (z.pos.x, z.pos.y))
+    trace(state, role.id, 'stone_batch_collect', '石头还不够补完防线，继续在矿点采集，攒够再回家',
+          stones=stones, need=need, carried_by_others=carried)
+    return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]},
+                    '攒够一批石头再回家修墙')
+
+
 def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_build=True):
     """缺墙就是持续施工任务，缺石主动找石矿，不转去采铜铁。仅工人：开拓者不能 collect/build。"""
     from .brain import own_station, try_build
@@ -1388,6 +1464,9 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         return False, None
     trace(state, role.id, 'persistent_wall_plan', '按阶段补墙，缺石就采石', missing=sorted(missing),
           wall_goal=len(staged))
+    batch = keep_collecting_stone(role, state, blocked, reserved, base)
+    if batch:
+        return True, batch
     if 'stone' in role.backpack:
         from .economy import clear_mine_target
         clear_mine_target(state, role.id)

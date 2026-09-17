@@ -523,26 +523,8 @@ def solver_ready_to_submit(state) -> bool:
 
 
 def pioneer_should_hold_task(pioneer, state) -> bool:
-    """回防窗里「本回合能提交且敌人还来不及打到」，或「两名工人能守住三门炮」时留在任务点；否则回炮，解题会话本身不清。"""
-    if pioneer is None or pioneer.health <= 0 or not state.phase_task:
-        return False
-    from .tactics import pressure, threat_eta_to_base
-    if pressure(state):
-        return False
-    eta = threat_eta_to_base(state, pioneer)
-    from .grid import build_blocked_set
-    from .opening import MUSTER_BUFFER, station_return_steps
-    blocked = build_blocked_set(state)
-    if solver_ready_to_submit(state):
-        back = station_return_steps(pioneer, state, blocked)
-        if back is None:
-            return False
-        need = 1 + back + MUSTER_BUFFER
-        if eta is None or eta > need:
-            return True
-        return False
-    from .opening import crew_covers_without
-    return crew_covers_without(state, {pioneer.id}, blocked)
+    """任务开始后离开任务点就直接失败：有进行中的任务就一直留在任务点，直到做完或超时。"""
+    return bool(pioneer is not None and pioneer.health > 0 and state.phase_task)
 
 
 def muster_for_night(role, state, blocked, reserved):
@@ -607,8 +589,13 @@ def _vendor_choices(role, state, blocked, reserved):
     if not state.map_info:
         return []
     choices = []
+    from .brain import is_day_round
+    from .opening import night_safe_path
     for vendor in (z for z in state.map_info.zones if z.neutral_type == 'vendor'):
-        path = adjacent_path(role, vendor.pos, blocked | reserved, state)
+        if is_day_round(state.round_no):
+            path = adjacent_path(role, vendor.pos, blocked | reserved, state)
+        else:
+            path = night_safe_path(role, vendor.pos, blocked | reserved, state)
         if path is not None:
             choices.append((len(path), vendor.pos.x, vendor.pos.y, vendor, path))
     return choices
@@ -1007,19 +994,21 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
     """一人一矿：能沿用粘性目标就继续；筹资买券时按 vendorShopList 选总回合最短的铜铁。
     夜里只采防线后方、离机器人远的矿，并按离基地最近选，避免绕路或挨打。"""
     from .brain import is_day_round, own_station
-    from .opening import adjacent_path, night_danger_cells, night_safe_path
+    from .opening import adjacent_path, night_danger_cells, night_strict_path
     want = set(want_ores)
     if not want or state.map_info is None:
         return None
     night = not is_day_round(state.round_no)
     danger = night_danger_cells(state) if night else set()
-    base = own_station(state) if night else None
+    base = own_station(state) if (night or purpose == 'stone') else None
 
     def route_to(mine):
         if night:
             if (mine.pos.x, mine.pos.y) in danger:
                 return None
-            return night_safe_path(role, mine.pos, blocked | reserved, state)
+            # 采矿不是回防等紧急移动，夜里不允许寻路降级后穿越正面或机器人
+            # 危险区；没有严格安全路线就留守。
+            return night_strict_path(role, mine.pos, blocked | reserved, state)
         return adjacent_path(role, mine.pos, blocked | reserved, state)
 
     def home_distance(mine):
@@ -1087,8 +1076,8 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
             continue
         score, batch, path_len, return_len, plan = ranked
         claimed = (mine.pos.x, mine.pos.y) in occupied
-        if night:
-            # 夜里只看来回距离：走过去 + 离基地多远，越近越好。
+        if night or purpose == 'stone':
+            # 夜里、以及施工工采石：只看往返距离（走过去 + 矿离基地多远），越近越好。
             candidates.append((1 if claimed else 0, path_len + home_distance(mine), path_len,
                                mine, path, batch, return_len, score))
         elif purpose == 'voucher':
