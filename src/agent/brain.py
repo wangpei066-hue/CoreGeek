@@ -10,6 +10,7 @@ from .protocol import (
 from .decision_log import trace, selected, log_judge_feedback
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
+from .targeting import DamageLedger, TargetContext, plan_attack
 from .pioneer_schedule import (
     SCHEDULER_VERSION, SHOP_STALL_ROUNDS, add_branch, apply_task_choice, begin_schedule,
     bump_streak, emit_scheduler_log, ensure_schedule_buckets, interrupt_reservation,
@@ -62,8 +63,8 @@ HEAL_HP_RATIO = 0.5
 EMERGENCY_HP_RATIO = 0.15
 EMERGENCY_HP_ABS = 30
 MEDICINE_GOLD_COST = 10
+TARGETING_REASON = "按有效伤害×价值+击杀奖励选落点；火箭先算，电磁炮补刀"
 
-_ROBOT_PRIORITY = {"bossRobot": 4, "largeRobot": 3, "middleRobot": 2, "smallRobot": 1}
 
 
 def is_day_round(round_no) -> bool:
@@ -564,7 +565,7 @@ def self_evolution_work_open(state: "MatchState") -> bool:
     return any(
         getattr(t, "is_valid", False)
         and getattr(t, "task_type", None) in ("自进化类1", "自进化类2")
-        and getattr(t, "cooldown", 0) == 0
+        and (getattr(t, "cold_down_rounds", 0) or 0) == 0
         for t in (state.team_our.player_tasks or [])
     )
 
@@ -1593,7 +1594,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
 def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
     """进行中的任务一直待到做完（离开任务点即失败）。
-    未开始的任务受 defense_due 约束（夜里工人守得住三炮时除外）；普通买券不抢占可行任务。"""
+    未开始的任务受 defense_due 约束；普通买券不抢占可行任务。"""
     from .economy import defense_due
     add_branch(state, 'decide_pioneer_task')
     if pioneer.health <= 0:
@@ -1602,8 +1603,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     ctx = getattr(state, '_pioneer_sched', None)
     if not isinstance(ctx, dict) or 'candidates' not in ctx:
         ctx = begin_schedule(state, pioneer, blocked, reserved)
-    from .opening import pioneer_free_at_night
-    night_free = pioneer_free_at_night(state, pioneer, blocked)
     if state.phase_task:
         add_branch(state, 'active_phase_task')
         # 规则：任务开始后离开任务点一格外就直接失败，所以一旦开始就待到做完或超时。
@@ -1614,7 +1613,7 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     reservation = reservation_of(state)
     if reservation and reservation.get('stage') == 'accept_pending':
         add_branch(state, 'accept_pending')
-        if defense_due(pioneer, state, blocked) and not night_free:
+        if defense_due(pioneer, state, blocked):
             add_branch(state, 'accept_pending_yield_defense')
             mark_outcome(state, 'task_yields_to_defense', None, 'yield_pending_to_defense')
             trace(state, pioneer.id, 'task_yields_to_defense',
@@ -1630,7 +1629,7 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     if row and (not reservation or reservation.get('stage') == 'approaching'):
         from .pioneer_schedule import save_reservation
         save_reservation(state, pioneer, row, stage='approaching')
-    if defense_due(pioneer, state, blocked) and not night_free:
+    if defense_due(pioneer, state, blocked):
         add_branch(state, 'new_task_defense_gate')
         mark_outcome(state, 'task_yields_to_defense', None, 'defense_blocks_new_task')
         trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务',
@@ -1868,7 +1867,7 @@ def try_station_upgrade_during_cooldown(role: Role, state: "MatchState", blocked
     from .tactics import threat_robots
     if weapon is not None:
         ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-        if ready and pick_attack_target(weapon, threat_robots(state)):
+        if ready and plan_attack(weapon, threat_robots(state), state):
             return None
         cooldown = 99 if weapon.role_type != "rocket" else (weapon.cooldown or 0)
     else:
@@ -1896,23 +1895,10 @@ def try_station_upgrade_during_cooldown(role: Role, state: "MatchState", blocked
     return move_on_path(state, role, path, reserved, "火箭冷却，前往基地使用升级券")
 
 
-def pick_attack_target(weapon: Role, robots: list):
-    in_range = [r for r in robots if chebyshev(weapon.pos, r.pos) <= weapon.attack_range]
-    if not in_range:
-        return None
-    in_range.sort(key=lambda r: (-_ROBOT_PRIORITY.get(r.role_type, 0), r.health))
-    return in_range[0]
-
-
-def target_positions_for_weapon(weapon: Role, target):
-    """加特林/火箭的目标位置数须等于武器等级（接口文档2.2）。"""
-    count = (weapon.level or 1) if weapon.role_type in ("gatling", "rocket") else 1
-    return [{"x": target.pos.x, "y": target.pos.y}] * count
-
-
 def adjacent_ready_rocket(fighter: Role, assigned: Optional[Role], state: "MatchState", robots: list,
-                          commands: dict):
-    """火箭冷却时，同一操作者可切到相邻且已冷却的另一门火箭炮。"""
+                          commands: dict, ledger: Optional[DamageLedger] = None,
+                          ctx: Optional[TargetContext] = None):
+    """火箭冷却时，同一操作者可切到相邻且已冷却的另一门火箭炮；返回 (武器, (落点, 伤害表))。"""
     from .opening import dual_rocket_partner
     used_weapons = set(commands)
     partner = None
@@ -1931,13 +1917,13 @@ def adjacent_ready_rocket(fighter: Role, assigned: Optional[Role], state: "Match
             continue
         if weapon.cooldown or 0:
             continue
-        target = pick_attack_target(weapon, robots)
-        if target:
-            candidates.append((weapon.level or 1, -weapon.id, weapon, target))
+        plan = plan_attack(weapon, robots, state, ledger, ctx)
+        if plan:
+            candidates.append((weapon.level or 1, -weapon.id, weapon, plan))
     if not candidates:
         return None, None
-    _, _, weapon, target = max(candidates)
-    return weapon, target
+    _, _, weapon, plan = max(candidates, key=lambda c: c[:2])
+    return weapon, plan
 
 
 def plan_pioneer_tasks(state, blocked, reserved):
@@ -1956,22 +1942,21 @@ def plan_pioneer_tasks(state, blocked, reserved):
     return commands, handled_ids
 
 
-def _night_worker_release(state, blocked, reserved, task_pioneers):
-    """两人三炮下第三个人的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
-    - 开拓者在做任务：他就是第三个人，不再放工人。
-    - 前两夜：放经济工去采矿，施工工和开拓者守三炮。
+def _night_worker_release(state, blocked, reserved):
+    """两人三炮下第三个人（一名工人）的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
+    不看任务点是否可接：未清波时开拓者不接新任务、留在守炮名单。
+    开拓者在做天黑前已开始的任务时由 plan_night 直接不调用本函数。
+    - 前两夜：放经济工去后院采矿，施工工和开拓者守三炮。
     - 第三夜起：放施工工，经济工一人守双火箭、开拓者开另一门。
       有防守压力时施工工留在家里用升级券/修墙包给残墙回血（夜里不能建造），没有可修的墙就回炮；
       没有压力时去采矿，但必须在敌人到达前赶得回来。"""
-    if self_evolution_work_open(state) or task_pioneers:
-        return None, None
+    later_night = structure_priority_day(state)
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
         return None, None
     from .opening import MUSTER_BUFFER, guns_covered_without, station_return_steps
     from .opening_schedule import opening_worker_mode
     from .tactics import front_breached, pressure, threat_eta_to_base
-    later_night = structure_priority_day(state)
     wanted = "builder" if later_night else "economist"
     released = max(workers, key=lambda w: (opening_worker_mode(state, w) == wanted,
                                           len(w.backpack or []), w.id))
@@ -2060,20 +2045,19 @@ def plan_night(state: "MatchState") -> dict:
                     state.team_our.gold_num -= cost
                 commands[role.id] = cmd
         return commands
-    # 前两夜固定执行“两人三炮”：经济工外出采后方安全矿，施工工和
-    # 开拓者留守。不能让任务点是否恰好位于机器人另一侧改变开拓者分工。
-    # 清波分支在上面已经提前返回，因此机器人清完后开拓者仍会立刻恢复任务。
-    early_night = not structure_priority_day(state)
-    if early_night and not state.phase_task:
-        commands, task_pioneers = {}, set()
-        trace(state, None, "early_night_fixed_defense",
-              "前两夜固定两人三炮：开拓者不接任务，施工工与开拓者留守，经济工采后方安全矿")
-    else:
-        # 已经进入任务阶段时离开任务点会直接失败，只能保留；固定编组通过
-        # 前两夜不再新接任务来保证，而不是中途抛弃已开始的任务。
+    # 机器人未清完前固定"两人三炮 + 一名工人去后院采矿"：开拓者不接新任务，留在守炮名单。
+    # 唯一例外：天黑前已开始的任务（离开任务点即失败）做完再回炮，这期间两名工人守炮、不放人。
+    # 机器人清完后走上面的清波分支，开拓者才恢复接任务。
+    commands, task_pioneers = {}, set()
+    if state.phase_task:
         commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
+        trace(state, None, "night_hold_active_task",
+              "开拓者做完已开始的任务再回炮；两名工人守三炮，暂不放人采矿")
+    else:
+        trace(state, None, "night_fixed_defense",
+              "未清波：两人三炮，一名工人去后院采矿；开拓者留守不接任务")
     urgent = pressure(state) or front_breached(state)
-    released_worker, released_cmd = _night_worker_release(state, blocked, reserved, task_pioneers)
+    released_worker, released_cmd = (None, None) if task_pioneers else _night_worker_release(state, blocked, reserved)
     excluded = set(task_pioneers)
     if released_worker is not None:
         excluded.add(released_worker.id)
@@ -2081,10 +2065,13 @@ def plan_night(state: "MatchState") -> dict:
     assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
     fighters = [r for r in state.team_our.roles
                 if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]
+    # 已在炮位的先决策；其中火箭先算，电磁炮读同一份伤害表补刀。
     fighters.sort(key=lambda r: (
         0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
+        0 if (assignments.get(r.id) and assignments[r.id].role_type == "rocket") else 1,
         _fighter_layer(state, r),
     ))
+    target_ctx, ledger = TargetContext(state, robots), DamageLedger()
     for fighter in fighters:
         heal = decide_emergency_heal(fighter, state)
         if heal:
@@ -2103,30 +2090,32 @@ def plan_night(state: "MatchState") -> dict:
         weapon = assignments.get(fighter.id)
         if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-            target = pick_attack_target(weapon, robots) if ready else None
-            upgrade = night_voucher_use(fighter, state, target)
+            plan = plan_attack(weapon, robots, state, ledger, target_ctx) if ready else None
+            upgrade = night_voucher_use(fighter, state, plan)
             if upgrade:
                 commands[fighter.id] = upgrade
                 continue
-            if target is None and weapon.role_type == "rocket":
-                alternate, alt_target = adjacent_ready_rocket(fighter, weapon, state, robots, commands)
+            if plan is None and weapon.role_type == "rocket":
+                alternate, alt_plan = adjacent_ready_rocket(fighter, weapon, state, robots, commands,
+                                                            ledger, target_ctx)
                 if alternate is not None:
                     trace(state, fighter.id, "weapon_assignment",
                           "分配火箭冷却，切到相邻已冷却火箭炮开火", weapon_id=alternate.id,
                           assigned_weapon_id=weapon.id)
-                    trace(state, fighter.id, "selected",
-                          "优先BOSS、大型、中型、小型；同等级优先低血量",
-                          weapon_id=alternate.id, target_robot_id=alt_target.id)
+                    trace(state, fighter.id, "selected", TARGETING_REASON,
+                          weapon_id=alternate.id, target_pos=alt_plan[0], expected_damage=alt_plan[1])
+                    ledger.add(alt_plan[1])
                     commands[alternate.id] = {
-                        "action": "attack", "controllerId": str(fighter.id),
-                        "targetPos": target_positions_for_weapon(alternate, alt_target),
+                        "action": "attack", "controllerId": str(fighter.id), "targetPos": alt_plan[0],
                     }
                     continue
-            if target:
+            if plan:
                 trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
+                trace(state, fighter.id, "selected", TARGETING_REASON,
+                      weapon_id=weapon.id, target_pos=plan[0], expected_damage=plan[1])
+                ledger.add(plan[1])
                 commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
-                                       "targetPos": target_positions_for_weapon(weapon, target)}
+                                       "targetPos": plan[0]}
                 continue
             heal_cmd = try_station_upgrade_during_cooldown(fighter, state, blocked, reserved, weapon)
             if heal_cmd:
@@ -2230,6 +2219,95 @@ def command_actor_id(key, command):
     return key
 
 
+VOUCHER_DEADLINE_MARGIN = 6  # 走到武器旁的步数之外再留这么多回合，保证入夜前把券用掉
+
+
+def _voucher_level(name: str) -> int:
+    return 1 if name.endswith("1") else 2
+
+
+def deadline_voucher_target(role: Role, state: "MatchState", taken: set):
+    """兜底选武器：优先升级顺序给出的目标；顺序用不上时，任意同级存活武器（火箭优先、近者优先）。
+    taken 是本回合已被别人兜底占用的 (坐标, 等级)。返回 (券名, 武器) 或 None。"""
+    held = sorted({item for item in (role.backpack or [])
+                   if item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")})
+    if not held:
+        return None
+    ordered = held_weapon_voucher_target(role, state, {pos for pos, _level in taken})
+    if ordered and ((ordered[1].pos.x, ordered[1].pos.y), _voucher_level(ordered[0])) not in taken:
+        return ordered
+    options = []
+    for name in held:
+        level = _voucher_level(name)
+        for weapon in state.team_our.roles:
+            if (weapon.role_type in WEAPON_TYPES and weapon.health > 0 and (weapon.level or 1) == level
+                    and ((weapon.pos.x, weapon.pos.y), level) not in taken):
+                options.append((level, _WEAPON_UPGRADE_ORDER.get(weapon.role_type, 99),
+                                chebyshev(role.pos, weapon.pos), weapon.id, name, weapon))
+    if not options:
+        return None
+    best = min(options, key=lambda o: o[:4])
+    return best[4], best[5]
+
+
+def enforce_voucher_deadline(state: "MatchState", commands: dict) -> dict:
+    """备用逻辑：白天手里还有武器升级券的人，到了"走过去 + 余量 ≥ 距入夜回合"就接管，
+    不论之前的升级顺序、施工/经济分支如何，入夜前必须把券用到同级武器上。"""
+    if not state.team_our or not state.map_info or not is_day_round(state.round_no):
+        return commands
+    from .opening import adjacent_path, day_rounds_remaining, move_on_path
+    remaining = day_rounds_remaining(state.round_no)
+    blocked = build_blocked_set(state)
+    taken = set()
+    for role in state.team_our.roles:
+        if role.role_type not in ("worker", "pioneer") or role.health <= 0:
+            continue
+        if role.role_type == "pioneer" and state.phase_task:
+            continue  # 任务进行中离开任务点即失败
+        current = commands.get(role.id) or {}
+        if current.get("action") == "use" and current.get("name") == "Medicine":
+            continue
+        pick = deadline_voucher_target(role, state, taken)
+        if pick is None:
+            continue
+        name, weapon = pick
+        target = (weapon.pos.x, weapon.pos.y)
+        if chebyshev(role.pos, weapon.pos) <= 1:
+            travel = 0
+            path = []
+        else:
+            reserved = {(c["targetPos"][0]["x"], c["targetPos"][0]["y"])
+                        for rid, c in commands.items()
+                        if rid != role.id and c.get("action") == "move" and c.get("targetPos")}
+            path = adjacent_path(role, weapon.pos, (blocked | reserved) - {(role.pos.x, role.pos.y)}, state)
+            if path is None:
+                trace(state, role.id, "voucher_deadline_unreachable", "持券兜底：目标武器不可达",
+                      item=name, weapon_id=weapon.id)
+                continue
+            travel = len(path)
+        if remaining > travel + VOUCHER_DEADLINE_MARGIN:
+            continue
+        if current.get("action") == "use" and current.get("name") == name:
+            taken.add((target, _voucher_level(name)))
+            continue
+        taken.add((target, _voucher_level(name)))
+        state.worker_item_jobs[role.id] = {"item": name, "target": target, "kind": "weapon"}
+        if travel == 0:
+            cmd = {"action": "use", "name": name, "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]}
+            state.worker_item_jobs[role.id]["awaiting_use"] = True
+            cmd = selected(state, role.id, cmd, "入夜前兜底：手里的武器券必须用掉")
+        else:
+            cmd = move_on_path(state, role, path, set(), "入夜前兜底：走去同级武器旁用券")
+        if not cmd:
+            continue
+        trace(state, role.id, "voucher_deadline_use",
+              "按升级顺序没用掉的武器券，入夜前兜底用到同级武器上",
+              item=name, weapon_id=weapon.id, weapon_level=weapon.level or 1,
+              rounds_to_night=remaining, travel=travel, overridden=current or None)
+        commands[role.id] = cmd
+    return commands
+
+
 def resolve_actor_conflicts(commands: dict, state: "MatchState") -> dict:
     """同一执行角色只能有一条指令：紧急治疗覆盖其操炮及其它动作。计划阶段的预算副本会丢弃，不改活状态金币。"""
     if not commands or not state.team_our:
@@ -2286,6 +2364,7 @@ class V1Strategy(Strategy):
             commands = plan_day(state)
         else:
             commands = plan_night(state)
+        commands = enforce_voucher_deadline(state, commands)
         # 最低优先级兜底，不能同时占用正在操炮的角色。
         if state.team_our:
             controllers = {str(c.get('controllerId')) for c in commands.values()}
