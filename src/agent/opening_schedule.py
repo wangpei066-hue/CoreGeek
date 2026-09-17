@@ -638,8 +638,8 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     emergency = orders['emergency_defense']['active']
     critical = survival_wall_missing(state)
     slots = [tuple(p) for p in program['target_wall_slots']] or wo.remaining_wall_slots(state)
-    if emergency and critical:
-        slots = critical
+    if critical:
+        slots = [tuple(p) for p in critical]
     stones = wo.stone_count(role)
     pack_full = wo.backpack_full(role)
     free = wo.free_slots(role)
@@ -654,7 +654,7 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
 
     # 首批关键墙完成后：比较候选计划，决定这一趟是纯采石、采石加建墙还是先清库存。
     choice = None
-    if not critical and slots is not None:
+    if not critical and not emergency and slots is not None:
         candidates, choice = wo.plan_candidates(state, role, blocked, reserved)
         trace(state, role.id, 'wall_plan_candidates',
               '首批关键墙已完成，按夜前收益比较候选计划',
@@ -668,14 +668,21 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     # BUILD_WALL_BATCH：手上有石、还有墙位就连续修，中途不跳回普通采矿/卖矿/等待。
     # 人已经贴着缺口时不要为了凑批次再跑去矿上绕路。
     at_gap = any(chebyshev(role.pos, Pos(*p)) == 1 for p in slots)
+    from .opening import in_courtyard
+    station = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    home_with_stone = bool(stones >= 2 and station and in_courtyard(state, station, role.pos))
     prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY' and stones <= 0
     build_now = bool(
         stones > 0 and slots and not prefer_gather
         and (pack_full or batch_ready or urgent_ready or mine_exhausted
-             or previous == 'BUILD_WALL_BATCH' or at_gap)
+             or previous == 'BUILD_WALL_BATCH' or at_gap or home_with_stone)
     )
     if build_now:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
+        if not cmd and critical:
+            extra = [tuple(p) for p in (program['target_wall_slots'] or []) if tuple(p) not in slots]
+            if extra:
+                cmd = claim_opening_wall(role, state, extra, blocked, reserved, claimed, wall_assignments)
         if cmd:
             target = None
             if cmd.get('action') in ('build', 'move'):
@@ -744,6 +751,10 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     # 还有石头但刚才没能建成：再试一次墙线，避免抱着石头空转。
     if stones > 0 and slots:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
+        if not cmd and critical:
+            extra = [tuple(p) for p in (program['target_wall_slots'] or []) if tuple(p) not in slots]
+            if extra:
+                cmd = claim_opening_wall(role, state, extra, blocked, reserved, claimed, wall_assignments)
         if cmd:
             wo.builder_state(state, role.id, 'BUILD_WALL_BATCH')
             return _tick(state, role, STAGE_WALL, 'wall', 'wall', None, 1, cmd.get('action'),

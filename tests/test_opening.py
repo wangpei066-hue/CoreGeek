@@ -82,6 +82,16 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(set(plan), set(wall_ring(state, base)[:8]))
         self.assertNotIn((8, 7), plan)
 
+    def test_due_walls_on_day2_are_survival_until_done(self):
+        from src.agent.opening import due_wall_gaps, survival_wall_missing
+        state = opening_state()
+        state.round_no = 140
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        due = due_wall_gaps(state, worker)
+        self.assertEqual(set(due), set(survival_wall_missing(state)))
+        self.assertNotIn((8, 7), due)
+
     def test_builder_keeps_collecting_until_batch_is_enough(self):
         from src.agent.brain import V1Strategy, BasicActionValidator
         state = opening_state()
@@ -433,6 +443,19 @@ class OpeningTests(unittest.TestCase):
         self.assertIsNotNone(path)
         hugged = [p for p in path if p.y == 10 and p.x > 13]
         self.assertLessEqual(len(hugged), 1)
+
+    def test_wall_approach_through_front_gap_does_not_retreat_rear(self):
+        """迎敌侧有正面缺口时，穿缺口进院，不要先绕到后方开口。"""
+        from src.agent.opening import wall_approach_path
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(16, 10)
+        blocked = build_blocked_set(state)
+        path = wall_approach_path(worker, Pos(13, 10), blocked, state)
+        self.assertIsNotNone(path)
+        self.assertTrue(any(p.x >= 12 for p in path), path)
+        self.assertFalse(any(p.x <= 9 for p in path), path)
 
     def test_opening_stone_skips_attack_side_mine(self):
         from src.agent.opening_schedule import choose_nearest_mine

@@ -180,8 +180,11 @@ def failed_move_cells(state, role):
     return cells
 
 
-def step_into_courtyard(role, blocked, state):
-    """人在墙线/墙外但已经贴着院子时，一步迈进院子，不要沿着墙格走。"""
+def step_into_courtyard(role, blocked, state, toward=None):
+    """人在墙线/墙外但已经贴着院子时，一步迈进院子，不要沿着墙格走。
+
+    有施工目标时迈向目标，避免总是走进坐标最小的后方格，和出院路径对着晃。
+    """
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
     if base is None or not state.map_info:
         return None
@@ -194,6 +197,8 @@ def step_into_courtyard(role, blocked, state):
                if (cell.x, cell.y) in yard and (cell.x, cell.y) not in obstacles]
     if not options:
         return None
+    if toward is not None:
+        return [min(options, key=lambda p: (chebyshev(p, toward), p.x, p.y))]
     return [min(options, key=lambda p: (p.x, p.y))]
 
 
@@ -220,10 +225,50 @@ def step_off_construction(role, state, blocked, reserved):
                     '先离开施工格再建造')
 
 
-def wall_approach_path(role, target, blocked, state, extra_avoid=()):
-    """从院子内侧接近墙。已经贴着施工格就地建造；在院内不踩墙线。
+def _path_wraps_attack_front(state, base, path):
+    """贴迎敌墙外侧横向绕行（不是直线穿缺口）。偏一格避施工点不算绕行。"""
+    if not path:
+        return False
+    outside = [p for p in path if attack_side_of_front(state, base, p)]
+    if len(outside) <= 2:
+        return False
+    ys = [p.y for p in outside]
+    return max(ys) - min(ys) >= 2
 
-    未砌的墙格不能在墙外寻路时当障碍：否则工人会被逼着贴迎敌墙外侧绕完整条墙线。
+
+def enter_courtyard_path(role, obstacles, state, toward=None):
+    """墙外进院：贴院一步迈进；未砌墙格可走；贴迎敌墙外侧横向绕行时改走后方开口。"""
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    if base is None:
+        return None
+    into = step_into_courtyard(role, obstacles, state, toward=toward)
+    if into:
+        return into
+    yard = courtyard_cells(state, base)
+    if not yard:
+        return None
+    enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
+    retreat = rear_retreat_path(role, obstacles, state)
+    if attack_side_of_front(state, base, role.pos):
+        if retreat and (enter is None or _path_wraps_attack_front(state, base, enter)):
+            return retreat
+        if enter is not None:
+            return enter
+        return retreat
+    if enter is not None:
+        return enter
+    return retreat
+
+
+def _outside_stay_blockers(stay, width, height, here):
+    return {(x, y) for x in range(width) for y in range(height) if (x, y) not in stay} - {here}
+
+
+def wall_approach_path(role, target, blocked, state, extra_avoid=()):
+    """从院子内侧接近墙。已经贴着施工格就地建造；在院内不许出院绕行。
+
+    未砌的墙格不能当障碍：否则工人会被逼着贴迎敌墙外侧绕完整条墙线。
+    也不再优先走「完全避开墙线」的远路——那会把人送到后沿再绕回来。
     """
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
     if base is None:
@@ -231,38 +276,18 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     if chebyshev(role.pos, target) == 1 and not attack_side_of_front(state, base, role.pos):
         return []
     yard = courtyard_cells(state, base)
-    obstacles = (blocked | set(extra_avoid) | failed_move_cells(state, role)) - {(role.pos.x, role.pos.y)}
-    obstacles.add((target.x, target.y))
     here = (role.pos.x, role.pos.y)
-    if yard and here in yard:
-        obstacles |= set(wall_ring(state, base)) - {here}
+    width, height = state.map_info.width, state.map_info.height
+    obstacles = (mobile_walkable(state, set(blocked) | set(extra_avoid)) | failed_move_cells(state, role)) - {here}
     if yard and here not in yard:
-        into = step_into_courtyard(role, obstacles, state)
-        if into:
-            return into
-        enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
-        ring = set(wall_ring(state, base)) - {here}
-        enter_off_ring = path_to_any(role.pos, yard, obstacles | ring, state.map_info.width, state.map_info.height)
-        if attack_side_of_front(state, base, role.pos):
-            retreat = rear_retreat_path(role, obstacles, state)
-            # 贴迎敌墙外侧走远路时改走后方开口；近处缺口（≤2步）直接穿进去。
-            if retreat and (enter is None or len(enter) > 2):
-                return retreat
-            if enter is not None and len(enter) <= 2:
-                return enter
-        if enter_off_ring is not None and (
-                enter is None or len(enter_off_ring) <= len(enter) + 2
-                or (enter and (enter[0].x, enter[0].y) in ring)):
-            return enter_off_ring
-        if enter:
+        enter = enter_courtyard_path(role, obstacles, state, toward=target)
+        if enter is not None:
             return enter
-        retreat = rear_retreat_path(role, obstacles, state)
-        if retreat:
-            return retreat
+    obstacles.add((target.x, target.y))
     direction = attack_direction(state, base)
     wall_dist = chebyshev(target, Pos(base.pos.x, base.pos.y))
     goals = set()
-    for cell in neighbors8(target, state.map_info.width, state.map_info.height):
+    for cell in neighbors8(target, width, height):
         key = (cell.x, cell.y)
         if key in obstacles and cell != role.pos:
             continue
@@ -277,7 +302,10 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
             goals.add(key)
     if not goals:
         return None
-    return path_to_any(role.pos, goals, obstacles, state.map_info.width, state.map_info.height)
+    if here in yard:
+        interior = obstacles | _outside_stay_blockers(yard | {here}, width, height, here)
+        return path_to_any(role.pos, goals, interior, width, height)
+    return path_to_any(role.pos, goals, obstacles, width, height)
 
 
 def rear_retreat_path(role, blocked, state):
@@ -834,7 +862,7 @@ def lock_survival_walls(state, reason):
 
 
 def survival_wall_plan(state, base):
-    """最低生存墙：先封正面通向基地/武器/操炮位的缺口，再补两侧端点。"""
+    """第一天主目标：正面整列 + 两侧拐角再各延伸 1 格。其余 16 段留给后面有余量再补。"""
     from .brain import WEAPON_TYPES
     inner = [p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) != 1]
     front = [p for p in inner if wall_priority(state, base, p) == 0]
@@ -871,6 +899,17 @@ def survival_wall_missing(state):
         return []
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
     return [p for p in survival_wall_plan(state, base) if p not in existing]
+
+
+def extra_wall_missing(state):
+    """生存墙以外、16 段里还缺的侧翼/后沿。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return []
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    core = set(survival_wall_plan(state, base))
+    return [p for p in primary_wall_plan(state, base) if p not in existing and p not in core]
 
 
 def opening_wall_work_list(state, survival_mode):
@@ -1102,26 +1141,10 @@ def worker_wall_muster_rounds(state, role, missing):
     return mine_travel + collect + gap_travel + share * WALL_STEP_SLACK + gun_travel + MUSTER_BUFFER + wall_overrun_margin(state)
 
 
-def defense_wall_missing(state):
-    """当前该补的墙：阶段目标没齐用阶段缺口，齐了继续补完整 16 段。
-
-    施工工按 primary 锁定修墙，若这里只用 staged，阶段一齐就会 should_build=False，
-    人被锁在防线上又不许砌、不许采矿，整段白天空转。
-    """
-    missing = staged_wall_missing(state)
-    if missing:
-        return missing
-    from .brain import own_station
-    base = own_station(state)
-    if base is None:
-        return []
-    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
-    return [p for p in primary_wall_plan(state, base) if p not in existing]
-
-
-def worker_one_wall_rounds(state, role):
-    """建完离自己最近的一段墙并回炮的估计，用来判断侧翼能不能开工。"""
-    missing = defense_wall_missing(state)
+def worker_one_wall_rounds(state, role, missing=None):
+    """建完离自己最近的一段墙并回炮的估计。missing 必须由调用方给出，避免和 due_wall_gaps 互相调用。"""
+    if missing is None:
+        missing = extra_wall_missing(state) or survival_wall_missing(state)
     if not missing:
         return 0
     if role is None:
@@ -1140,47 +1163,81 @@ def worker_one_wall_rounds(state, role):
     return worker_wall_muster_rounds(state, role, [nearest] if nearest else missing[:1])
 
 
-def full_wall_build_window(state, role=None):
-    """侧翼：回炮前至少能建完一段才开工。正面缺口不走这扇门。"""
+def can_extend_walls(state, role=None):
+    """夜前还能再建一段并回炮，才补生存墙以外的段。第一天由开局状态机管截止。"""
     from .tactics import night_wave_cleared
+    extra = extra_wall_missing(state)
+    if not extra:
+        return False
+    if night_wave_cleared(state) or (state.round_no or 0) < 70:
+        return True
+    remaining = defense_rounds_remaining(state, role)
+    if remaining <= 0:
+        return False
+    if role is not None and 'stone' in (role.backpack or []):
+        blocked = build_blocked_set(state)
+        gun = station_return_steps(role, state, blocked)
+        if gun is None:
+            gun = MUSTER_BUFFER
+        if any(chebyshev(role.pos, Pos(*point)) == 1 for point in extra):
+            return remaining > gun + 1
+    return remaining > worker_one_wall_rounds(state, role, extra)
+
+
+def due_wall_gaps(state, role=None):
+    """本回合该砌的墙：生存墙优先；齐了且夜前有余量才补其余 16 段。
+
+    施工工、选格、寻路、采石批次都只看这一份列表，避免「锁 16 段」和「只许砌正面」互相卡住。
+    """
+    core = survival_wall_missing(state)
+    if core:
+        return core
+    if can_extend_walls(state, role):
+        return extra_wall_missing(state)
+    return []
+
+
+def defense_wall_missing(state, role=None):
+    """兼容旧名：当前该补的墙。"""
+    return due_wall_gaps(state, role)
+
+
+def dusk_must_return(state, role=None):
+    """入夜窗口：回炮前只够走到炮位（贴着缺口有石仍可砌 1 格）。"""
+    remaining = defense_rounds_remaining(state, role)
+    if remaining <= 0:
+        return True
+    if role is None:
+        return remaining <= MUSTER_BUFFER
+    blocked = build_blocked_set(state)
+    gun = station_return_steps(role, state, blocked)
+    if gun is None:
+        gun = MUSTER_BUFFER
+    return remaining <= gun + 1
+
+
+def full_wall_build_window(state, role=None):
+    """侧翼/后沿：回炮前至少能建完一段才开工。生存墙不走这扇门。"""
+    return can_extend_walls(state, role)
+
+
+def worker_should_build_walls(state, role=None):
+    """有 due 缺口就砌；入夜窗口只砌贴身那一格；夜间只补正面关键缺口。"""
+    from .tactics import night_wave_cleared, night_near_work_allowed
     if night_wave_cleared(state):
         return True
     if (state.round_no or 0) < 70:
         return True
     remaining = defense_rounds_remaining(state, role)
     if remaining <= 0:
-        return False
-    missing = defense_wall_missing(state)
-    if not missing:
-        return False
-    if role is not None and "stone" in (role.backpack or []):
-        blocked = build_blocked_set(state)
-        gun = station_return_steps(role, state, blocked)
-        if gun is None:
-            gun = MUSTER_BUFFER
-        if any(chebyshev(role.pos, Pos(*point)) == 1 for point in missing):
-            return remaining > gun + 1
-    return remaining > worker_one_wall_rounds(state, role)
-
-
-def worker_should_build_walls(state, role=None):
-    """正面缺口有石就补；侧翼在回炮前能建完一段时开工。"""
-    from .tactics import night_wave_cleared, night_near_work_allowed
-    if night_wave_cleared(state):
-        return True
-    if (state.round_no or 0) < 70:
-        return True
-    if defense_rounds_remaining(state, role) <= 0:
         return bool(night_near_work_allowed(state) and critical_wall_missing(state))
-    if critical_wall_missing(state):
-        return True
-    missing = defense_wall_missing(state)
-    if not missing:
+    due = due_wall_gaps(state, role)
+    if not due:
         return False
-    if role is not None and "stone" in (role.backpack or []):
-        if any(chebyshev(role.pos, Pos(*point)) == 1 for point in missing):
-            return True
-    return full_wall_build_window(state, role)
+    if dusk_must_return(state, role):
+        return bool(role is not None and 'stone' in (role.backpack or [])
+                    and any(chebyshev(role.pos, Pos(*p)) == 1 for p in due))
+    return True
 
 
 def stones_cover_wall_plan(state):
@@ -1651,9 +1708,8 @@ def keep_collecting_stone(role, state, blocked, reserved, base):
     cap = role.back_pack_capability or 0
     if cap and len(role.backpack) >= cap:
         return None
-    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
-    need = len(set(primary_wall_plan(state, base)) - existing)
-    if stones >= min(need, STONE_BATCH):
+    need = len(due_wall_gaps(state, role))
+    if need <= 0 or stones >= min(need, STONE_BATCH):
         return None
     mines = [z for z in state.map_info.zones
              if z.neutral_type == 'stone' and chebyshev(role.pos, z.pos) <= 1]
@@ -1678,16 +1734,14 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
     if base is None:
         return False, None
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
-    staged = staged_wall_plan(state, base)
-    missing = set(staged) - existing
-    if not missing:
-        if primary_only:
-            return False, None
-        missing = set(primary_wall_plan(state, base)) - existing
+    if primary_only:
+        missing = set(critical_wall_missing(state))
+    else:
+        missing = set(due_wall_gaps(state, role))
     if not missing:
         return False, None
-    trace(state, role.id, 'persistent_wall_plan', '按阶段补墙，缺石就采石', missing=sorted(missing),
-          wall_goal=len(staged))
+    trace(state, role.id, 'persistent_wall_plan', '按当前该砌的墙补，缺石就采石', missing=sorted(missing),
+          wall_goal=len(missing | existing))
     batch = keep_collecting_stone(role, state, blocked, reserved, base)
     if batch:
         return True, batch
@@ -1731,7 +1785,7 @@ def _buildable_wall_paths(role, state, blocked, reserved):
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
     assignments = assign_weapons(state)
     ranked = []
-    for point in primary_wall_plan(state, base):
+    for point in due_wall_gaps(state, role):
         if point in existing or point in blocked | reserved:
             continue
         if (point[0], point[1], 'wall') in state.failed_build_spots:
@@ -1761,7 +1815,7 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
         ranked = _buildable_wall_paths(role, state, blocked, reserved)
         if not ranked:
             existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
-            for point in primary_wall_plan(state, base):
+            for point in due_wall_gaps(state, role):
                 if point in existing or point in blocked | reserved:
                     continue
                 if (point[0], point[1], 'wall') in state.failed_build_spots:

@@ -146,25 +146,13 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
     width, height = state.map_info.width, state.map_info.height
     if kind == "wall":
         from .opening import (
-            staged_wall_plan, primary_wall_plan, safe_wall, assign_weapons,
-            full_wall_build_window, wall_priority, defense_wall_missing,
+            safe_wall, assign_weapons, wall_priority, due_wall_gaps,
         )
         base = own_station(state)
         if base is None:
             return None
-        plan = staged_wall_plan(state, base)
+        plan = due_wall_gaps(state, worker)
         existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
-        if not set(plan) - existing:
-            plan = primary_wall_plan(state, base)
-        adjacent = []
-        if worker is not None and "stone" in (worker.backpack or []):
-            adjacent = [p for p in defense_wall_missing(state)
-                        if chebyshev(worker.pos, Pos(*p)) == 1]
-        if not full_wall_build_window(state, worker):
-            plan = [p for p in plan if wall_priority(state, base, p) == 0]
-        for p in adjacent:
-            if p not in plan:
-                plan.append(p)
         origin = worker.pos if worker is not None else base_pos
         from .opening import wall_approach_path
         ranked = []
@@ -1258,17 +1246,14 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     pending = state.worker_build_targets.get(worker.id)
     last_failed = (state.last_round_role_action_results or {}).get(worker.id) is False
     if pending and pending[2] == "wall":
-        from .opening import full_wall_build_window, primary_wall_plan, wall_priority, failed_move_cells
+        from .opening import due_wall_gaps, failed_move_cells
         if "stone" not in (worker.backpack or []):
             del state.worker_build_targets[worker.id]
             pending = None
-        elif last_failed or pending[:2] not in primary_wall_plan(state, base):
+        elif last_failed or pending[:2] not in due_wall_gaps(state, worker):
             del state.worker_build_targets[worker.id]
             pending = None
         elif (pending[0], pending[1], "wall") in state.failed_build_spots:
-            del state.worker_build_targets[worker.id]
-            pending = None
-        elif not full_wall_build_window(state, worker) and wall_priority(state, base, pending[:2]) != 0:
             del state.worker_build_targets[worker.id]
             pending = None
         elif worker is not None:
@@ -1475,7 +1460,7 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
 
 
 def builder_on_walls(state: "MatchState", worker: Role) -> bool:
-    """第一晚之后，开局定的施工工在防线（正面 + 两翼）没修完前专心修墙。只剩一名工人时不锁定。"""
+    """第一晚之后，开局定的施工工在生存墙没齐、或夜前还能补一段侧翼时专心修墙。只剩一名工人时不锁定。"""
     if worker.role_type != "worker" or not is_day_round(state.round_no):
         return False
     if sum(1 for r in state.team_our.roles if r.role_type == "worker" and r.health > 0) < 2:
@@ -1488,9 +1473,8 @@ def builder_on_walls(state: "MatchState", worker: Role) -> bool:
     base = own_station(state)
     if base is None:
         return False
-    from .opening import primary_wall_plan
-    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
-    return bool(set(primary_wall_plan(state, base)) - existing)
+    from .opening import due_wall_gaps
+    return bool(due_wall_gaps(state, worker))
 
 
 def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved: set):

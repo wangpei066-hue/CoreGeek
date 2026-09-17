@@ -321,21 +321,17 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             rockets = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'rocket'}
             self.assertNotIn(dest, rockets)
 
-    def test_builder_still_builds_after_staged_plan_is_done(self):
-        """阶段墙齐了但 16 段还缺：施工工必须继续砌，不能 should_build=False 原地空转。"""
+    def test_builder_extends_extra_walls_when_day_has_spare_rounds(self):
+        """生存墙齐了、白天还早：施工工可以补其余 16 段，不能原地空转。"""
         from src.agent.opening import (
-            courtyard_cells, primary_wall_plan, staged_wall_plan, worker_should_build_walls,
+            courtyard_cells, extra_wall_missing, survival_wall_plan, worker_should_build_walls,
         )
         state = self._day2_guns(opening_state())
         base = next(r for r in state.team_our.roles if r.role_type == 'station')
-        primary = primary_wall_plan(state, base)
-        staged = set(staged_wall_plan(state, base))
-        extra = [p for p in primary if p not in staged]
-        if not extra:
-            extra = [primary[-1]]
-            staged = set(primary[:-1])
-        for i, p in enumerate(staged):
+        for i, p in enumerate(survival_wall_plan(state, base)):
             state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        extra = extra_wall_missing(state)
+        self.assertTrue(extra)
         gap = extra[0]
         yard = courtyard_cells(state, base)
         stand = next((Pos(x, y) for x, y in (
@@ -352,6 +348,29 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertTrue(worker_should_build_walls(state, builder), (stand, gap, extra))
         cmd = self.decide(state).get(1, {})
         self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
+    def test_builder_does_not_chase_extra_walls_at_dusk(self):
+        """生存墙齐了、入夜窗口：不再追后沿，去回炮或采矿。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan, worker_should_build_walls
+        state = self._day2_guns(opening_state())
+        state.round_no = 198
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(11, 10)
+        builder.backpack = ['stone'] * 4
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(1, {})
+        if cmd.get('action') == 'build':
+            self.fail('入夜窗口不该去砌侧翼/后沿: %s' % cmd)
+
+    def test_builder_still_builds_after_staged_plan_is_done(self):
+        self.test_builder_extends_extra_walls_when_day_has_spare_rounds()
 
     def test_night_pioneer_never_takes_new_task_and_one_worker_goes_out(self):
         """未清波的夜里开拓者不接新任务、留在守炮名单；是否放工人与任务点可不可接无关。"""
