@@ -1251,7 +1251,13 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     last_failed = (state.last_round_role_action_results or {}).get(worker.id) is False
     if pending and pending[2] == "wall":
         from .opening import full_wall_build_window, primary_wall_plan, wall_priority, failed_move_cells
-        if last_failed or pending[:2] not in primary_wall_plan(state, base):
+        if "stone" not in (worker.backpack or []):
+            del state.worker_build_targets[worker.id]
+            pending = None
+        elif last_failed or pending[:2] not in primary_wall_plan(state, base):
+            del state.worker_build_targets[worker.id]
+            pending = None
+        elif (pending[0], pending[1], "wall") in state.failed_build_spots:
             del state.worker_build_targets[worker.id]
             pending = None
         elif not full_wall_build_window(state, worker) and wall_priority(state, base, pending[:2]) != 0:
@@ -1279,16 +1285,16 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             target = Pos(x, y)
             dist = chebyshev(worker.pos, target)
             if dist == 0:
-                from .grid import neighbors8
-                for step in neighbors8(worker.pos, state.map_info.width, state.map_info.height):
-                    if (step.x, step.y) not in blocked | reserved:
-                        reserved.add((step.x, step.y))
-                        return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '先离开施工格再建造')
+                from .opening import step_off_construction
+                cmd = step_off_construction(worker, state, blocked, reserved)
+                if cmd:
+                    return cmd
                 return None
             if dist == 1:
                 if kind == "wall":
                     from .opening import worker_should_build_walls
                     if not worker_should_build_walls(state, worker):
+                        del state.worker_build_targets[worker.id]
                         return None
                 del state.worker_build_targets[worker.id]
                 if kind == "weapon":
@@ -1499,11 +1505,13 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                             for i in (worker.backpack or []))
         if not (at_shop or holds_voucher):
             allow_weapon = False  # 施工工防线没修完不专程去买券；人在商店边顺手买、手里有券照常用
-    # 第三天起经济工只在正面出现关键缺口时帮墙，其余时间留给采卖矿和武器券。
-    economist = day3_worker_duty(state, worker) == 'economist'
+    from .opening_schedule import opening_worker_mode
+    eco_mode = opening_worker_mode(state, worker) == 'economist'
+    # 第三天起经济工清包买券；第一晚后经济工就不接普通补墙，只在正面关键缺口时帮一把。
+    economist = eco_mode and structure_priority_day(state)
     guns_ready = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0) >= MAX_WEAPONS
-    # 三炮未齐时先补武器，墙循环让路；经济工第三天只在正面缺口帮墙。
-    wall_help = guns_ready and (not economist or critical_wall_missing(state))
+    # 三炮未齐时先补武器；施工工补墙，经济工只在正面缺口帮忙。
+    wall_help = guns_ready and (not eco_mode or critical_wall_missing(state))
     cashout = False if builder_focus else in_pre_night_cashout_window(worker, state, blocked, reserved)
     job = state.worker_item_jobs.get(worker.id)
     held_item = bool(job and job.get('item') in worker.backpack)
@@ -1529,9 +1537,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                   '白天回防前优先推进武器升级券，避免券带进夜里不用',
                   heldVoucher=held_weapon_voucher, jobKind=(job or {}).get('kind'))
             return cmd
-    handled, cmd = muster_for_night(worker, state, blocked, reserved)
-    if handled:
-        return cmd
+    # 施工工墙没砌完且还来得及建：白天不提前回炮，只在入夜窗口才去双火箭。
+    if not (builder_focus and allow_build):
+        handled, cmd = muster_for_night(worker, state, blocked, reserved)
+        if handled:
+            return cmd
     if builder_focus:
         # 施工工主线：采石 → 攒够回家 → 建墙，不被卖矿/买券/经济任务来回拉走。
         if allow_weapon:  # 只剩“人在商店边顺手买”或“手里有券”两种情况
@@ -1547,10 +1557,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=True)
             if cmd:
                 return cmd
-            cmd = builder_move_to_dual_rockets(
-                worker, state, blocked, reserved, '施工工本回合砌不上墙，去双火箭位待命')
-            if cmd:
-                return cmd
+            if not allow_build:
+                cmd = builder_move_to_dual_rockets(
+                    worker, state, blocked, reserved, '入夜前不够再建一段，施工工去双火箭位待命')
+                if cmd:
+                    return cmd
             heal = decide_self_heal(worker) or decide_buy_medicine(worker, state)
             if heal:
                 return heal
@@ -1646,7 +1657,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     cmd = decide_shop_item_job(worker, state, blocked, reserved)
     if cmd:
         return cmd
-    if not cashout and not economist and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
+    if not cashout and not eco_mode and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles) >= 3:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, allow_build=allow_build)
         if cmd:
             return cmd

@@ -180,6 +180,46 @@ def failed_move_cells(state, role):
     return cells
 
 
+def step_into_courtyard(role, blocked, state):
+    """人在墙线/墙外但已经贴着院子时，一步迈进院子，不要沿着墙格走。"""
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    if base is None or not state.map_info:
+        return None
+    yard = courtyard_cells(state, base)
+    here = (role.pos.x, role.pos.y)
+    if here in yard:
+        return []
+    obstacles = set(blocked) - {here}
+    options = [cell for cell in neighbors8(role.pos, state.map_info.width, state.map_info.height)
+               if (cell.x, cell.y) in yard and (cell.x, cell.y) not in obstacles]
+    if not options:
+        return None
+    return [min(options, key=lambda p: (p.x, p.y))]
+
+
+def step_off_construction(role, state, blocked, reserved):
+    """站在施工格上时优先迈进院子，避免迈到墙外再绕回来。"""
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    if not state.map_info:
+        return None
+    yard = courtyard_cells(state, base) if base else set()
+    ring = set(wall_ring(state, base)) if base else set()
+    options = []
+    for step in neighbors8(role.pos, state.map_info.width, state.map_info.height):
+        key = (step.x, step.y)
+        if key in blocked | reserved:
+            continue
+        attack = bool(base and attack_side_of_front(state, base, step))
+        rank = (0 if key in yard else 1, 1 if key in ring else 0, 1 if attack else 0, key)
+        options.append((rank, key, step))
+    if not options:
+        return None
+    _rank, key, step = min(options)
+    reserved.add(key)
+    return selected(state, role.id, {'action': 'move', 'targetPos': [{'x': step.x, 'y': step.y}]},
+                    '先离开施工格再建造')
+
+
 def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     """从院子内侧接近墙。已经贴着施工格就地建造；在院内不踩墙线。
 
@@ -197,12 +237,23 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     if yard and here in yard:
         obstacles |= set(wall_ring(state, base)) - {here}
     if yard and here not in yard:
+        into = step_into_courtyard(role, obstacles, state)
+        if into:
+            return into
         enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
+        ring = set(wall_ring(state, base)) - {here}
+        enter_off_ring = path_to_any(role.pos, yard, obstacles | ring, state.map_info.width, state.map_info.height)
         if attack_side_of_front(state, base, role.pos):
             retreat = rear_retreat_path(role, obstacles, state)
             # 贴迎敌墙外侧走远路时改走后方开口；近处缺口（≤2步）直接穿进去。
             if retreat and (enter is None or len(enter) > 2):
                 return retreat
+            if enter is not None and len(enter) <= 2:
+                return enter
+        if enter_off_ring is not None and (
+                enter is None or len(enter_off_ring) <= len(enter) + 2
+                or (enter and (enter[0].x, enter[0].y) in ring)):
+            return enter_off_ring
         if enter:
             return enter
         retreat = rear_retreat_path(role, obstacles, state)
@@ -1392,12 +1443,23 @@ def weapon_approach_path(role, weapon, blocked, reserved, state):
     obstacles = ((blocked | reserved | failed_move_cells(state, role)) - own)
     at_gun = bool(weapon and chebyshev(role.pos, weapon.pos) <= 1 and role.pos != weapon.pos)
     if base is not None and not in_courtyard(state, base, role.pos) and not at_gun:
+        into = step_into_courtyard(role, obstacles, state)
+        if into:
+            return into
         yard = courtyard_cells(state, base)
         enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
+        ring = set(wall_ring(state, base)) - {(role.pos.x, role.pos.y)}
+        enter_off_ring = path_to_any(role.pos, yard, obstacles | ring, state.map_info.width, state.map_info.height)
         if attack_side_of_front(state, base, role.pos):
             retreat = rear_retreat_path(role, obstacles, state)
             if retreat and (enter is None or len(enter) > 2):
                 return retreat
+            if enter is not None and len(enter) <= 2:
+                return enter
+        if enter_off_ring is not None and (
+                enter is None or len(enter_off_ring) <= len(enter) + 2
+                or (enter and (enter[0].x, enter[0].y) in ring)):
+            return enter_off_ring
         if enter:
             return enter
         retreat = rear_retreat_path(role, obstacles, state)
@@ -1627,9 +1689,11 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             return True, cmd
-        cmd = builder_move_to_dual_rockets(role, state, blocked, reserved,
-                                           '手里有石但本回合砌不上，先站到双火箭位避免空转')
-        return True, cmd
+        # 白天砌不上就停在缺口旁等下一回合，不要改去双火箭位来回跑。
+        trace(state, role.id, 'builder_hold_at_gap',
+              '手里有石但本回合砌不上，留在施工任务上不改去炮位',
+              stones=role.backpack.count('stone'), missing=len(missing))
+        return True, None
     cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=True)
     if cmd:
         return True, cmd
@@ -1637,8 +1701,32 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
     return True, None
 
 
+def _buildable_wall_paths(role, state, blocked, reserved):
+    """只走向能砌的缺口：跳过失败冷却和 safe_wall 拒建的格子，避免对着砌不上的墙空转。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return []
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    assignments = assign_weapons(state)
+    ranked = []
+    for point in primary_wall_plan(state, base):
+        if point in existing or point in blocked | reserved:
+            continue
+        if (point[0], point[1], 'wall') in state.failed_build_spots:
+            continue
+        if not safe_wall(state, point, blocked | reserved, assignments):
+            continue
+        path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
+        if path is None:
+            continue
+        ranked.append((len(path), point, path))
+    ranked.sort()
+    return ranked
+
+
 def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
-    """施工工缺墙却没发出建造时：丢铜铁、回院子、走向缺口或去采石，避免空转去挖铜铁。"""
+    """施工工缺墙却没发出建造时：丢铜铁、贴院迈进、走向可砌缺口或去采石。"""
     from .brain import own_station
     from .economy import go_mine, clear_mine_target
     base = own_station(state)
@@ -1647,24 +1735,38 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
     drop = drop_nonstone_for_walls(role, state)
     if drop:
         return drop
+    if "stone" in role.backpack:
+        clear_mine_target(state, role.id)
+        ranked = _buildable_wall_paths(role, state, blocked, reserved)
+        if ranked:
+            path = ranked[0][2]
+            cmd = move_on_path(state, role, path, reserved, '走向最近可砌墙缺口，避免站着空转')
+            if cmd:
+                return cmd
+        if not in_courtyard(state, base, role.pos):
+            into = step_into_courtyard(role, blocked | reserved, state)
+            if into:
+                return move_on_path(state, role, into, reserved, '贴着院子先迈进去再施工')
+            path = interior_retreat_path(role, blocked | reserved, state)
+            if path:
+                return move_on_path(state, role, path, reserved, '墙外空转，先回院子再施工')
+        return None
     if not in_courtyard(state, base, role.pos):
+        # 没石头时先去采石，不要空手走回家再出门。
+        if allow_mine and len(role.backpack) < (role.back_pack_capability or 1):
+            mined = go_mine(
+                role, state, blocked, reserved, want_ores=("stone",), purpose="stone",
+                travel_reason="防线尚未完成，专程采石",
+                collect_reason="采集下一段城墙所需石料",
+            )
+            if mined:
+                return mined
+        into = step_into_courtyard(role, blocked | reserved, state)
+        if into:
+            return move_on_path(state, role, into, reserved, '贴着院子先迈进去再施工')
         path = interior_retreat_path(role, blocked | reserved, state)
         if path:
             return move_on_path(state, role, path, reserved, '墙外空转，先回院子再施工')
-    if "stone" in role.backpack:
-        clear_mine_target(state, role.id)
-        existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
-        missing = [p for p in primary_wall_plan(state, base) if p not in existing]
-        best = None
-        for point in missing:
-            path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
-            if path is None:
-                continue
-            if best is None or len(path) < len(best):
-                best = path
-        if best:
-            return move_on_path(state, role, best, reserved, '走向最近墙缺口，避免站着空转')
-        return None
     if not allow_mine or len(role.backpack) >= (role.back_pack_capability or 0):
         return None
     return go_mine(

@@ -220,6 +220,107 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         if cmd.get('action') == 'build':
             self.assertEqual(cmd.get('name'), 'wall')
 
+    def _day2_guns(self, state):
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 8, 'rocket', level=2),
+            make_role(21, 11, 8, 'rocket', level=2),
+            make_role(22, 12, 10, 'railgun', level=2),
+        ]
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone'), Zone(Pos(4, 11), 'iron'), Zone(Pos(4, 8), 'copper')]
+        return state
+
+    def test_day2_builder_on_wall_cell_steps_into_yard(self):
+        """站在墙格上要迈进院子，不能迈到墙外再绕回同一格。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(13, 12)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertEqual(cmd.get('action'), 'move')
+        dest = cmd['targetPos'][0]
+        self.assertTrue(9 <= dest['x'] <= 12 and 8 <= dest['y'] <= 11, dest)
+
+    def test_day2_builder_does_not_loop_on_wing_cell(self):
+        """#781：施工工不能连续多回合对着同一墙格空转。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(13, 12)
+        builder.backpack = ['stone'] * 8
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        targets = []
+        built = 0
+        for turn in range(8):
+            state.round_no = 140 + turn
+            commands = self.decide(state)
+            cmd = commands.get(1, {})
+            if cmd.get('action') == 'move':
+                dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+                targets.append(dest)
+                builder.pos = Pos(*dest)
+            elif cmd.get('action') == 'build' and cmd.get('name') == 'wall':
+                pos = cmd['targetPos'][0]
+                state.team_our.roles.append(make_role(80 + turn, pos['x'], pos['y'], 'wall', health=1000, level=1))
+                builder.backpack.remove('stone')
+                built += 1
+                targets.append(('build', pos['x'], pos['y']))
+            else:
+                targets.append(cmd.get('action'))
+        self.assertTrue(built >= 1 or len(set(t for t in targets if isinstance(t, tuple) and t[0] != 'build')) >= 2, targets)
+        self.assertFalse(all(t == (13, 12) for t in targets if isinstance(t, tuple) and t[0] != 'build'), targets)
+
+    def test_day2_builder_without_stone_goes_to_mine(self):
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = []
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 8)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('move', 'collect'))
+        if cmd.get('action') == 'collect':
+            self.assertEqual(cmd['targetPos'][0], {'x': 6, 'y': 9})
+
+    def test_day2_economist_mines_instead_of_wandering_to_walls(self):
+        """经济工第一晚后不去跟施工工抢墙/双火箭，空背包就去采矿。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(2, {})
+        self.assertIn(cmd.get('action'), ('move', 'collect'))
+        if cmd.get('action') == 'collect':
+            ore = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+            self.assertIn(ore, ((4, 11), (4, 8), (6, 9)))
+
+    def test_day2_builder_with_stones_does_not_walk_to_dual_rockets(self):
+        """白天还早、手里有石、墙有缺口：施工工必须建或接近缺口，不能去双火箭空转。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'))
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
+        else:
+            dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+            rockets = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'rocket'}
+            self.assertNotIn(dest, rockets)
+
     def test_night_pioneer_never_takes_new_task_and_one_worker_goes_out(self):
         """未清波的夜里开拓者不接新任务、留在守炮名单；是否放工人与任务点可不可接无关。"""
         for round_no in (80, 210, 340):
