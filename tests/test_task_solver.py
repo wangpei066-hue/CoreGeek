@@ -15,11 +15,36 @@ import unittest
 from src.agent import GameServer
 from src.agent.task_solver import (
     MARKER, clean_url, extract_md_paths, parse_llm, sandbox_command, task_context,
-    task_fingerprint, READ_SCRIPT, EXEC_SCRIPT, PioneerTaskSolver,
+    task_fingerprint, summarize_heritage_records, READ_SCRIPT, EXEC_SCRIPT,
+    PioneerTaskSolver,
 )
 
 
 class TaskSolverHelperTests(unittest.TestCase):
+    def test_heritage_oldest_era_uses_historical_order_not_first_record(self):
+        records = [
+            {'name': '故宫', 'type': '建筑', 'era': '明清',
+             'protected_level': '世界遗产'},
+            {'name': '周口店遗址', 'type': '遗址', 'era': '旧石器时代',
+             'protected_level': '世界遗产'},
+            {'name': '潭柘寺', 'type': '宗教建筑', 'era': '晋',
+             'protected_level': '全国重点'},
+        ]
+        stats = summarize_heritage_records(records, total=3, complete=True)
+        self.assertEqual(stats['oldestEraName'], '周口店遗址')
+
+    def test_heritage_oldest_era_handles_composite_and_nanjing_eras(self):
+        records = [
+            {'name': '明孝陵', 'type': '陵墓', 'era': '明',
+             'protected_level': '世界遗产'},
+            {'name': '夫子庙', 'type': '建筑群', 'era': '宋',
+             'protected_level': '全国重点'},
+            {'name': '鸡鸣寺', 'type': '宗教建筑', 'era': '南北朝',
+             'protected_level': '全国重点'},
+        ]
+        stats = summarize_heritage_records(records, total=3, complete=True)
+        self.assertEqual(stats['oldestEraName'], '鸡鸣寺')
+
     def test_clean_url_removes_markdown_and_chinese_trailing_punctuation(self):
         self.assertEqual(clean_url('http://localhost:8899`）'), 'http://localhost:8899')
         self.assertEqual(clean_url('http://localhost:8899/api/v1/search。'),

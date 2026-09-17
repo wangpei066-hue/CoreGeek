@@ -834,9 +834,12 @@ def summarize_heritage_records(records, total=None, complete=False):
     # numeric year.  Preserve evidence-based ordering so the solver can finish
     # without spending extra LLM turns on an avoidable clarification.
     era_order = {
-        '旧石器': -100000, '新石器': -5000, '夏': -2100, '商': -1600,
-        '周': -1046, '春秋': -770, '战国': -475, '秦': -221,
-        '汉': -206, '六朝': 220, '唐': 618, '宋': 960,
+        '旧石器时代': -100000, '旧石器': -100000,
+        '新石器时代': -5000, '新石器': -5000,
+        '夏': -2100, '商': -1600, '周': -1046, '春秋': -770,
+        '战国': -475, '秦': -221, '汉': -206, '三国': 220,
+        '六朝': 220, '晋': 265, '南北朝': 420, '隋': 581,
+        '唐': 618, '五代': 907, '宋': 960, '辽': 916, '金': 1115,
         '元': 1271, '明': 1368, '清': 1644, '民国': 1912, '现代': 1949,
     }
     for rec in records or []:
@@ -864,7 +867,10 @@ def summarize_heritage_records(records, total=None, complete=False):
             oldest_year = year
             oldest_name = name
         if name and isinstance(era, str):
-            known = next((value for label, value in era_order.items() if label in era), None)
+            # 组合年代（如“商周”“辽金元明清”“明清”）必须取其中最早者；
+            # 不能依赖字典中的首个命中，更不能在无法识别时退化为第一条记录。
+            matches = [value for label, value in era_order.items() if label in era]
+            known = min(matches) if matches else None
             if known is not None and (oldest_year is None or known < oldest_year):
                 oldest_year = known
                 oldest_name = name
@@ -880,6 +886,23 @@ def summarize_heritage_records(records, total=None, complete=False):
     if fuzzy and oldest_name is None:
         stats['fuzzyEras'] = fuzzy
     return stats
+
+
+def valid_heritage_summary(summary):
+    """只接受可提交的统计摘要，避免 LLM 的半成品摘要提前结束任务。"""
+    if not isinstance(summary, dict):
+        return False
+    if not isinstance(summary.get('total_count'), int) or summary['total_count'] <= 0:
+        return False
+    if not isinstance(summary.get('world_heritage_count'), int) or summary['world_heritage_count'] < 0:
+        return False
+    types = summary.get('types')
+    if not isinstance(types, list) or not types:
+        return False
+    if any(not isinstance(item, str) or not item.strip() for item in types):
+        return False
+    oldest = summary.get('oldest_era')
+    return isinstance(oldest, str) and bool(oldest.strip())
 
 
 def ingest_api_page(collected, payload, http_status=None):
@@ -1400,7 +1423,8 @@ class PioneerTaskSolver:
                             and isinstance(item.get('world_heritage_count'), int)
                             and isinstance(item.get('types'), list)
                             and isinstance(item.get('oldest_era'), str)), None)
-            if summary and re.search(r'\blimit\s*[= ]\s*100\b', command, re.IGNORECASE):
+            if (valid_heritage_summary(summary)
+                    and re.search(r'\blimit\s*[= ]\s*100\b', command, re.IGNORECASE)):
                 stats = dict(
                     city=summary.get('city') or extract_city(task),
                     totalCount=summary['total_count'],
@@ -1414,6 +1438,9 @@ class PioneerTaskSolver:
                 self._harvest(dict(stats, event='api_fetch'), command, task, s.get('workspace'))
                 s['_apiStats'] = stats
                 return 'done'
+            if summary and is_heritage_task(task):
+                self._fact(s, 'LLM统计摘要不完整，必须依据完整 data.records 重算后再提交')
+                return 'ask'
             # The LLM may intentionally summarize JSON or print one record per
             # line.  Accept completeness only when unique record IDs collected
             # from real tool output exactly match pagination.total_count.
