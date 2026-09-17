@@ -1,4 +1,4 @@
-"""平台 LLM 日额度仲裁：自进化任务独占时让位；否则宝藏解码优先于矿价解析。"""
+"""平台 LLM 日额度仲裁：自进化任务独占时让位；否则按置信度在官方/传闻间择优。"""
 from __future__ import annotations
 
 import json
@@ -222,7 +222,7 @@ class PromptRouter:
 
     def request_prompt(self, state: MatchState) -> str:
         """无自进化时每回合至多 1 条。
-        官方原文变化 → 当天固定 1 次矿价 LLM（优先）；剩余额度给传闻。"""
+        默认官方原文变化优先占当天 1 次矿价 LLM；若上次宝藏置信度 >0.5 且传闻仍待解，则传闻优先。"""
         if state.phase_task:
             return ""
         if (self.memory.data.get("pendingConsumer")
@@ -232,30 +232,42 @@ class PromptRouter:
         if not self.memory.can_spend():
             return ""
 
-        # 官方每天最多 1 次；占 1 额后传闻最多还能用 2 次。
-        if self.memory.official_needs_prompt():
-            prompt = make_ore_prompt(state, self.memory)
-            self.memory.mark_pending("ore", state.round_no, prompt)
-            self.memory.data["needOreParse"] = False
-            self.memory.data["lastOreParseDay"] = game_day(state.round_no)
-            self.memory.save()
-            trace(state, None, "llm_request", "申请矿价新闻 LLM", used=self.memory.data["llmUsed"])
-            log_news_event(
-                event="prompt_sent", consumer="ore", roundNo=state.round_no,
-                title="【LLM】发送矿价解析 prompt",
-                promptText=prompt, used=self.memory.data["llmUsed"],
-            )
-            return prompt
+        folk_hot = self.memory.folk_priority_over_official()
+        want_ore = self.memory.official_needs_prompt()
+        want_folk = self.memory.folk_needs_prompt()
 
-        if self.memory.folk_needs_prompt():
-            prompt = make_treasure_prompt(state, self.memory)
-            self.memory.mark_pending("treasure", state.round_no, prompt)
-            trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])
-            log_news_event(
-                event="prompt_sent", consumer="treasure", roundNo=state.round_no,
-                title="【LLM】发送宝藏解码 prompt",
-                promptText=prompt, used=self.memory.data["llmUsed"],
-            )
-            return prompt
-
+        # 默认官方优先。上次宝藏置信度 >0.5 时传闻优先占一次；
+        # 当天已送过传闻且官方仍待解，则改送官方，避免饿死矿价 LLM。
+        if want_folk and folk_hot:
+            if want_ore and self.memory.data.get("treasurePromptSent"):
+                return self._send_ore_prompt(state)
+            return self._send_treasure_prompt(state)
+        if want_ore:
+            return self._send_ore_prompt(state)
+        if want_folk:
+            return self._send_treasure_prompt(state)
         return ""
+    def _send_ore_prompt(self, state: MatchState) -> str:
+        prompt = make_ore_prompt(state, self.memory)
+        self.memory.mark_pending("ore", state.round_no, prompt)
+        self.memory.data["needOreParse"] = False
+        self.memory.data["lastOreParseDay"] = game_day(state.round_no)
+        self.memory.save()
+        trace(state, None, "llm_request", "申请矿价新闻 LLM", used=self.memory.data["llmUsed"])
+        log_news_event(
+            event="prompt_sent", consumer="ore", roundNo=state.round_no,
+            title="【LLM】发送矿价解析 prompt",
+            promptText=prompt, used=self.memory.data["llmUsed"],
+        )
+        return prompt
+
+    def _send_treasure_prompt(self, state: MatchState) -> str:
+        prompt = make_treasure_prompt(state, self.memory)
+        self.memory.mark_pending("treasure", state.round_no, prompt)
+        trace(state, None, "llm_request", "申请宝藏解码 LLM", used=self.memory.data["llmUsed"])
+        log_news_event(
+            event="prompt_sent", consumer="treasure", roundNo=state.round_no,
+            title="【LLM】发送宝藏解码 prompt",
+            promptText=prompt, used=self.memory.data["llmUsed"],
+        )
+        return prompt

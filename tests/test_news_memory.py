@@ -264,10 +264,41 @@ class NewsMemoryTests(unittest.TestCase):
         self.memory.data["needOreParse"] = True
         self.memory.data["orePromptSent"] = False
         state.round_no = 2
-        # 还剩 1 次额度且官方仍需：官方优先占用这 1 次
+        # 还剩 1 次额度且官方仍需：默认官方优先占用这 1 次
         last = router.request_prompt(state)
         self.assertIn("官方消息", last)
         self.assertTrue(self.memory.data["orePromptSent"])
+
+    def test_folk_priority_when_last_confidence_above_half(self):
+        state = self._state(0, official=IRON_COLLAPSE, folk="西部有一石门需三钥")
+        self.memory.ingest(state)
+        self.memory.data["treasureHypothesis"] = {
+            "ready": False, "altarPos": {"x": 1, "y": 2}, "items": ["Key"],
+            "confidence": 0.51, "notes": "partial",
+        }
+        self.memory.data["needTreasureDecode"] = True
+        router = PromptRouter(self.memory)
+        first = router.request_prompt(state)
+        self.assertIn("民间传闻", first)
+        self.assertEqual(self.memory.data["pendingConsumer"], "treasure")
+        self.assertFalse(self.memory.data["orePromptSent"])
+        self.memory.clear_pending()
+        state.round_no = 1
+        second = router.request_prompt(state)
+        self.assertIn("官方消息", second)
+        self.assertTrue(self.memory.data["orePromptSent"])
+        self.memory.clear_pending()
+
+        # 置信度 ≤0.5 时仍官方优先
+        low = self._state(130, official="铜矿区明日停工两天。", folk="新情报补充祭坛坐标")
+        self.memory.ingest(low)
+        self.memory.data["treasureHypothesis"] = {
+            "ready": False, "confidence": 0.5, "notes": "edge",
+        }
+        self.memory.data["needTreasureDecode"] = True
+        router2 = PromptRouter(self.memory)
+        self.assertIn("官方消息", router2.request_prompt(low))
+
     def test_phase_task_blocks_news_prompt(self):
         state = self._state(0, official=IRON_COLLAPSE, folk="情报")
         self.memory.ingest(state)

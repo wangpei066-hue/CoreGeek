@@ -13,6 +13,8 @@ from .news_logging import log_folk_plan, log_news_event, log_official_plan
 
 DAY_NIGHT_CYCLE = 130
 TREASURE_ACT_CONFIDENCE = 0.7
+# 已有宝藏假设置信度超过此值时，传闻 LLM 优先于官方矿价 LLM。
+FOLK_PRIORITY_CONFIDENCE = 0.5
 _CN_DAY = r'(?:[0-9]+|[一二三四五六七八九十]+)'
 _OPEN_TIME_IN_TEXT = re.compile(
     rf'第\s*{_CN_DAY}\s*[天日].{{0,16}}(?:开|启|召唤|解开|可进|窗口)'
@@ -587,6 +589,19 @@ class NewsMemory:
 
     def folk_needs_prompt(self) -> bool:
         return bool(self.data.get("needTreasureDecode") and not self.data.get("treasureEmpty"))
+
+    def last_folk_confidence(self) -> float:
+        """上一轮（最近一次）宝藏 LLM 落地的置信度；尚无假设则为 0。"""
+        hyp = self.data.get("treasureHypothesis")
+        if not isinstance(hyp, dict):
+            hyp = self.data.get("folkPlan")
+        if not isinstance(hyp, dict):
+            return 0.0
+        return clamp_confidence(hyp.get("confidence", 0))
+
+    def folk_priority_over_official(self) -> bool:
+        """传闻待解且上次置信度已 >0.5 时，优先送推民间传闻。"""
+        return self.folk_needs_prompt() and self.last_folk_confidence() > FOLK_PRIORITY_CONFIDENCE
 
     def official_needs_prompt(self) -> bool:
         """官方原文有变化待解，且当天还没送过矿价 LLM。"""
