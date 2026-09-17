@@ -665,18 +665,16 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
               extra_walls_built=None if choice is None else choice['extra_walls_built'],
               stone_carried_to_day2=None if choice is None else choice['stone_carried_to_day2'])
 
-    # BUILD_WALL_BATCH：手上有石、还有墙位就连续修，中途不跳回普通采矿/卖矿/等待。
-    # 人已经贴着缺口时不要为了凑批次再跑去矿上绕路。
-    at_gap = any(chebyshev(role.pos, Pos(*p)) == 1 for p in slots)
-    from .opening import in_courtyard
-    station = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
-    home_with_stone = bool(stones >= 2 and station and in_courtyard(state, station, role.pos))
-    prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY' and stones <= 0
-    build_now = bool(
-        stones > 0 and slots and not prefer_gather
-        and (pack_full or batch_ready or urgent_ready or mine_exhausted
-             or previous == 'BUILD_WALL_BATCH' or at_gap or home_with_stone)
+    # BUILD_WALL_BATCH：这一趟石头凑够（或入夜/矿空）才开工；开工后把手上石头砌完。
+    # 禁止「贴着缺口/院内有 1 块石」就砌一段再跑回去采——那是在浪费往返。
+    committed = previous in ('BUILD_WALL_BATCH', 'GO_WALL_LINE') and stones > 0
+    inventory_now = bool(choice and choice['candidate'] == 'BUILD_FROM_INVENTORY' and stones > 0)
+    still_gather = (
+        not pack_full and not mine_exhausted and not urgent_ready
+        and stones < batch and not committed and not inventory_now
     )
+    prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY' and stones <= 0
+    build_now = bool(stones > 0 and slots and not prefer_gather and not still_gather)
     if build_now:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
         if not cmd and critical:
