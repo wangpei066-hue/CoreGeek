@@ -245,19 +245,21 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapon_layout_front_flanks_and_rear_rocket_pair(self):
+    def test_weapon_layout_rear_corner_rockets_and_front_railgun(self):
+        from src.agent.opening import rear_corner_layout
+        from src.agent.grid import chebyshev
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            front_rocket = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(50, front_rocket[0], front_rocket[1], 'rocket'))
-            rear_rocket = weapon_candidates(state, base, 'rocket')[0]
+            first = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(50, first[0], first[1], 'rocket'))
+            second = weapon_candidates(state, base, 'rocket')[0]
             railgun = weapon_candidates(state, base, 'railgun')[0]
-            self.assertEqual(rear_rocket[0], front_rocket[0] - direction)
-            self.assertEqual(rear_rocket[1], front_rocket[1])
-            self.assertEqual(railgun[0], front_rocket[0])
-            self.assertNotEqual(railgun[1], front_rocket[1])
+            _rear, _side, stand = rear_corner_layout(state, base)
+            self.assertEqual(chebyshev(Pos(*first), Pos(*stand)), 1)
+            self.assertEqual(chebyshev(Pos(*second), Pos(*stand)), 1)
+            self.assertNotEqual(first[0], railgun[0])
             state.team_our.roles.pop()
 
     def test_rebuild_missing_wall_beats_third_tier_upgrade(self):

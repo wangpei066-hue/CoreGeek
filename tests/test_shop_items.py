@@ -565,7 +565,7 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
     def test_pioneer_starts_and_executes_upgrade_job(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 1  # 基地 level1，会先选中它升级
-        pioneer = make_role(10011, 12, 8, "pioneer", back_pack_capability=40)  # 站在新火箭预留位上
+        pioneer = make_role(10011, 10, 11, "pioneer", back_pack_capability=40)  # 站在顶边火箭位上
         state.team_our.roles.append(pioneer)
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)

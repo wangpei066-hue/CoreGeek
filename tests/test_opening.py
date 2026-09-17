@@ -6,7 +6,7 @@ from src.agent.opening import (
     wall_ring, primary_wall_plan, assign_weapons, safe_wall, opening_time_budget,
     estimate_opening_upgrade, day_rounds_remaining, plan_opening,
 )
-from src.agent.grid import build_blocked_set
+from src.agent.grid import build_blocked_set, chebyshev
 from src.agent.protocol import Pos, Zone, RobotRole, ShopItem
 from test_shop_items import minimal_state, make_role
 
@@ -178,17 +178,84 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == 'SURVIVAL_WALL'
                             for e in state.decision_events))
 
-    def test_two_weapons_on_rear_rank_one_cell_forward(self):
-        from src.agent.opening import weapon_slot_plan, weapon_slots
+    def test_two_rockets_on_rear_corner_share_a_stand(self):
+        """两门火箭贴在背敌后角两边，角落一格同时够到两门；蓝右攻、红左攻对称。"""
+        from src.agent.opening import weapon_slot_plan, rear_corner_layout, attack_direction
+        from src.agent.grid import chebyshev
         state = opening_state()
-        plan = weapon_slot_plan(state, state.team_our.roles[0])
-        slots = weapon_slots(state, state.team_our.roles[0])
-        self.assertEqual(len(slots), 3)
-        self.assertEqual([name for name, _point in plan], ['rocket', 'railgun', 'rocket'])
-        self.assertEqual(slots[0][0], slots[1][0])
-        self.assertEqual(slots[2][0], slots[0][0] - 1)
-        self.assertEqual(slots[0][1], slots[2][1])
-        self.assertNotEqual(slots[0][1], slots[1][1])
+        for x, direction in ((10, 1), (30, -1)):
+            base = state.team_our.roles[0]
+            base.pos = Pos(x, 10)
+            self.assertEqual(attack_direction(state, base), direction)
+            plan = weapon_slot_plan(state, base)
+            rockets = [p for name, p in plan if name == 'rocket']
+            rail = next(p for name, p in plan if name == 'railgun')
+            self.assertEqual(len(rockets), 2, (x, plan))
+            _rear, _side, stand = rear_corner_layout(state, base)
+            self.assertEqual(chebyshev(Pos(*rockets[0]), Pos(*stand)), 1)
+            self.assertEqual(chebyshev(Pos(*rockets[1]), Pos(*stand)), 1)
+            self.assertNotEqual(rockets[0][0], rail[0])
+            self.assertGreater(chebyshev(Pos(*rail), Pos(*stand)), 1)
+
+    def test_wall_grows_from_existing_not_the_far_end(self):
+        """已有墙时下一格必须接上去，不能跳到对面另一头。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(10, 10)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertIsNotNone(point)
+        self.assertEqual(max(abs(point[0] - 13), abs(point[1] - 10)), 1, (point, gaps[:8]))
+
+    def test_wall_sticky_is_not_abandoned_for_a_nearer_gap(self):
+        """已经认准一格时，不因为旁边更近就换目标。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 8)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        sticky = (13, 12)
+        self.assertIn(sticky, {tuple(p) for p in gaps})
+        point, path = next_wall_gap(worker, state, gaps, blocked, sticky=sticky)
+        self.assertEqual(point, sticky)
+        self.assertIsNotNone(path)
+
+    def test_next_wall_gap_keeps_top_bottom_symmetric(self):
+        """正面已有中心上侧时，下一格补中心下侧，即使人离上侧更近。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 9), (point, gaps[:8]))
+
+    def test_next_wall_gap_picks_closer_side_of_a_symmetric_pair(self):
+        """同一圈上下都缺时，砌离人更近的那一侧，省走路。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        state.team_our.roles.append(make_role(41, 13, 9, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 11), (point, gaps[:8]))
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
         state = opening_state()
@@ -422,8 +489,13 @@ class OpeningTests(unittest.TestCase):
                 self.assertLessEqual(max(abs(role.pos.x-weapon.pos.x), abs(role.pos.y-weapon.pos.y)), 2)
         kinds = [r.role_type for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
         self.assertEqual(sorted(kinds), ['railgun', 'rocket', 'rocket'])
-        xs = [r.pos.x for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
-        self.assertEqual(len(set(xs)), 2)
+        from src.agent.opening import rear_corner_layout
+        rockets = [(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'rocket']
+        _rear, _side, stand = rear_corner_layout(state, state.team_our.roles[0])
+        self.assertEqual(chebyshev(Pos(*rockets[0]), Pos(*stand)), 1)
+        self.assertEqual(chebyshev(Pos(*rockets[1]), Pos(*stand)), 1)
+        rail = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        self.assertNotEqual(rail.pos.x, stand[0])
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
         primary = set(primary_wall_plan(state, state.team_our.roles[0]))
         self.assertTrue(walls <= primary)
@@ -1336,6 +1408,35 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         point, path = next_wall_gap(worker, state, gaps, blocked, sticky=sticky)
         self.assertEqual(point, sticky)
         self.assertIsNotNone(path)
+
+    def test_next_wall_gap_keeps_top_bottom_symmetric(self):
+        """正面已有中心上侧时，下一格补中心下侧，即使人离上侧更近。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 9), (point, gaps[:8]))
+
+    def test_next_wall_gap_picks_closer_side_of_a_symmetric_pair(self):
+        """同一圈上下都缺时，砌离人更近的那一侧，省走路。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        state.team_our.roles.append(make_role(41, 13, 9, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 11), (point, gaps[:8]))
 
     def test_full_metal_backpack_in_survival_goes_to_vendor(self):
         state = opening_state()
