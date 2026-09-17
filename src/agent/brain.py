@@ -2219,6 +2219,95 @@ def command_actor_id(key, command):
     return key
 
 
+VOUCHER_DEADLINE_MARGIN = 6  # 走到武器旁的步数之外再留这么多回合，保证入夜前把券用掉
+
+
+def _voucher_level(name: str) -> int:
+    return 1 if name.endswith("1") else 2
+
+
+def deadline_voucher_target(role: Role, state: "MatchState", taken: set):
+    """兜底选武器：优先升级顺序给出的目标；顺序用不上时，任意同级存活武器（火箭优先、近者优先）。
+    taken 是本回合已被别人兜底占用的 (坐标, 等级)。返回 (券名, 武器) 或 None。"""
+    held = sorted({item for item in (role.backpack or [])
+                   if item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")})
+    if not held:
+        return None
+    ordered = held_weapon_voucher_target(role, state, {pos for pos, _level in taken})
+    if ordered and ((ordered[1].pos.x, ordered[1].pos.y), _voucher_level(ordered[0])) not in taken:
+        return ordered
+    options = []
+    for name in held:
+        level = _voucher_level(name)
+        for weapon in state.team_our.roles:
+            if (weapon.role_type in WEAPON_TYPES and weapon.health > 0 and (weapon.level or 1) == level
+                    and ((weapon.pos.x, weapon.pos.y), level) not in taken):
+                options.append((level, _WEAPON_UPGRADE_ORDER.get(weapon.role_type, 99),
+                                chebyshev(role.pos, weapon.pos), weapon.id, name, weapon))
+    if not options:
+        return None
+    best = min(options, key=lambda o: o[:4])
+    return best[4], best[5]
+
+
+def enforce_voucher_deadline(state: "MatchState", commands: dict) -> dict:
+    """备用逻辑：白天手里还有武器升级券的人，到了"走过去 + 余量 ≥ 距入夜回合"就接管，
+    不论之前的升级顺序、施工/经济分支如何，入夜前必须把券用到同级武器上。"""
+    if not state.team_our or not state.map_info or not is_day_round(state.round_no):
+        return commands
+    from .opening import adjacent_path, day_rounds_remaining, move_on_path
+    remaining = day_rounds_remaining(state.round_no)
+    blocked = build_blocked_set(state)
+    taken = set()
+    for role in state.team_our.roles:
+        if role.role_type not in ("worker", "pioneer") or role.health <= 0:
+            continue
+        if role.role_type == "pioneer" and state.phase_task:
+            continue  # 任务进行中离开任务点即失败
+        current = commands.get(role.id) or {}
+        if current.get("action") == "use" and current.get("name") == "Medicine":
+            continue
+        pick = deadline_voucher_target(role, state, taken)
+        if pick is None:
+            continue
+        name, weapon = pick
+        target = (weapon.pos.x, weapon.pos.y)
+        if chebyshev(role.pos, weapon.pos) <= 1:
+            travel = 0
+            path = []
+        else:
+            reserved = {(c["targetPos"][0]["x"], c["targetPos"][0]["y"])
+                        for rid, c in commands.items()
+                        if rid != role.id and c.get("action") == "move" and c.get("targetPos")}
+            path = adjacent_path(role, weapon.pos, (blocked | reserved) - {(role.pos.x, role.pos.y)}, state)
+            if path is None:
+                trace(state, role.id, "voucher_deadline_unreachable", "持券兜底：目标武器不可达",
+                      item=name, weapon_id=weapon.id)
+                continue
+            travel = len(path)
+        if remaining > travel + VOUCHER_DEADLINE_MARGIN:
+            continue
+        if current.get("action") == "use" and current.get("name") == name:
+            taken.add((target, _voucher_level(name)))
+            continue
+        taken.add((target, _voucher_level(name)))
+        state.worker_item_jobs[role.id] = {"item": name, "target": target, "kind": "weapon"}
+        if travel == 0:
+            cmd = {"action": "use", "name": name, "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]}
+            state.worker_item_jobs[role.id]["awaiting_use"] = True
+            cmd = selected(state, role.id, cmd, "入夜前兜底：手里的武器券必须用掉")
+        else:
+            cmd = move_on_path(state, role, path, set(), "入夜前兜底：走去同级武器旁用券")
+        if not cmd:
+            continue
+        trace(state, role.id, "voucher_deadline_use",
+              "按升级顺序没用掉的武器券，入夜前兜底用到同级武器上",
+              item=name, weapon_id=weapon.id, weapon_level=weapon.level or 1,
+              rounds_to_night=remaining, travel=travel, overridden=current or None)
+        commands[role.id] = cmd
+    return commands
+
+
 def resolve_actor_conflicts(commands: dict, state: "MatchState") -> dict:
     """同一执行角色只能有一条指令：紧急治疗覆盖其操炮及其它动作。计划阶段的预算副本会丢弃，不改活状态金币。"""
     if not commands or not state.team_our:
@@ -2275,6 +2364,7 @@ class V1Strategy(Strategy):
             commands = plan_day(state)
         else:
             commands = plan_night(state)
+        commands = enforce_voucher_deadline(state, commands)
         # 最低优先级兜底，不能同时占用正在操炮的角色。
         if state.team_our:
             controllers = {str(c.get('controllerId')) for c in commands.values()}
