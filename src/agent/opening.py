@@ -1234,8 +1234,9 @@ def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
             if len(path) > max_travel:
                 return False
             continue
-        # 敌人已在路上时，接替的人必须先于敌人到炮位。
-        if robots and len(path) + MUSTER_BUFFER >= min(
+        # 敌人已在路上时，接替的人必须先于敌人到炮位；已经站在炮位旁的人不用赶路，不做这项检查
+        # （否则开打后敌人一进 3 格，外出采矿的人就会被一直叫回，变成三人守家）。
+        if robots and path and len(path) + MUSTER_BUFFER >= min(
                 chebyshev(robot.pos, weapon.pos) for robot in robots):
             return False
     covered = {w.id for w in assignment.values()}

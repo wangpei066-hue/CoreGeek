@@ -473,11 +473,16 @@ class ThirdNightRepairTests(unittest.TestCase):
                                                 'targetPos': [{'x': 13, 'y': 10}]})
         self.assertFalse(any(c.get('controllerId') == str(builder.id) for c in commands.values()))
 
-    def test_builder_mans_gun_when_damaged_wall_is_outside_yard_reach(self):
+    def test_builder_goes_mining_when_damaged_wall_is_outside_yard_reach(self):
+        """院里够不着残墙时不回去当第三个炮手：两人已守住三炮，这名工人去后院采矿。"""
         state, builder = self._pressure_state((13, 7))  # 角落墙只能从墙外够到
-        self.decide(state)
-        self.assertIn(str(builder.id), state.policy_memory['weapon_assignment'])
-        self.assertFalse(any(e['code'] == 'night_worker_released_to_economy' for e in state.decision_events))
+        from src.agent.protocol import Zone
+        state.map_info.zones = [Zone(Pos(3, 10), 'iron')]
+        commands = self.decide(state)
+        self.assertNotIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        released = [e['role_id'] for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
+        self.assertEqual(released, [builder.id])
+        self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
 
     def test_upgrade_chain_waits_for_station_after_first_level_three_rocket(self):
         from src.agent.brain import maybe_start_shop_item_job
@@ -594,3 +599,47 @@ class FixtureNightMinerTests(unittest.TestCase):
                 self.assertIn('night_worker_released_to_economy', codes)
                 self.assertIn('income_mine', codes)
                 self.assertNotIn('emergency_front_seal', codes)
+
+
+class NightTwoOnThreeSimulationTests(unittest.TestCase):
+    """正式炮位布局下连跑一段夜战：机器人逼近并贴墙开打，也始终两人三炮、一名工人在后院。"""
+
+    def _run(self, night_start, rounds=20):
+        import contextlib
+        import io
+        from src.agent.protocol import Zone
+        state = _slot_layout_state(night_start)
+        state.map_info.zones = [Zone(Pos(3, 10), 'iron'), Zone(Pos(4, 6), 'stone')]
+        state.robot.roles = [RobotRole(1000 + i, Pos(26 + i // 9, 6 + i % 9), 'smallRobot', 40) for i in range(35)]
+        people = {r.id: r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')}
+        base_x = next(r.pos.x for r in state.team_our.roles if r.role_type == 'station')
+        strategy = V1Strategy(BasicActionValidator())
+        released = []
+        for _ in range(rounds):
+            with contextlib.redirect_stderr(io.StringIO()):
+                commands = strategy.decide(state)
+            ids = [e['role_id'] for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
+            released.append(ids[0] if ids else None)
+            self.assertFalse(any(c.get('action') == 'acceptTask' for c in commands.values()))
+            occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles}
+            for pid, person in people.items():
+                cmd = commands.get(pid)
+                if cmd and cmd['action'] == 'move':
+                    person.pos = Pos(cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+            for robot in state.robot.roles:
+                if (robot.pos.x - 1, robot.pos.y) not in occupied and robot.pos.x - 1 > base_x + 1:
+                    robot.pos = Pos(robot.pos.x - 1, robot.pos.y)
+            for weapon in state.team_our.roles:
+                if weapon.role_type == 'rocket':
+                    weapon.cooldown = 4 if weapon.id in commands else max(0, (weapon.cooldown or 0) - 1)
+            state.last_sent_command = commands
+            state.round_no += 1
+        return released
+
+    def test_one_worker_stays_out_all_wave(self):
+        for night_start in (70, 200, 330):
+            with self.subTest(night_start=night_start):
+                released = self._run(night_start)
+                steady = released[2:]
+                self.assertTrue(all(r is not None for r in steady), released)
+                self.assertEqual(len(set(steady)), 1, released)

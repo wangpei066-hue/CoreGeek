@@ -29,7 +29,6 @@ _WEAPON_UPGRADE_ORDER = {"rocket": 0, "railgun": 1, "gatling": 2}
 MAX_WEAPONS = 3
 WALL_UPGRADE_HEALTH_RATIO = 0.5  # 围墙只在低于半血时才买券升级（升级回满血）。
 WALL_UPGRADE_DUSK_WINDOW = 20  # 还有新墙要建时，离入夜这么多回合内才转去升级残墙。
-NIGHT_RELEASE_MARGIN = 2  # 夜间放工人外出时，回炮时间之外再留的回合。
 NIGHT_REPAIR_GUNNER_TRAVEL = 1  # 有压力时放施工工修墙，守炮的两人最多离炮位这么多步。
 WEAPON_GOLD_COST = 25
 ORE_TYPES = ("stone", "iron", "copper")
@@ -720,7 +719,7 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
             pending_targets.discard(tuple(old_job['target']))
     held = held_weapon_voucher_target(role, state, pending_targets)
     old_job = state.worker_item_jobs.get(role.id)
-    if held and allow_weapon and not (
+    if held and not (
             old_job and old_job.get('kind') == 'weapon' and old_job.get('item') in role.backpack):
         if old_job is None or old_job.get('item') not in role.backpack:
             name, weapon = held
@@ -791,33 +790,34 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
 
 
 def held_weapon_voucher_target(role: Role, state: "MatchState", pending_targets: set):
-    """手里的武器券用在哪门武器上：按升级顺序，找已被这张券抵扣、且武器现在就到了对应等级的那一步。
-    按顺序完全用不上的多余券，才兜底给身边/最近的同级武器。返回 (券名, 武器) 或 None。"""
-    names = {item for item in (role.backpack or [])
-             if isinstance(item, str) and item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")}
+    """手里的武器券立刻用在哪门武器上，返回 (券名, 武器) 或 None。
+    券1只能升1级武器、券2只能升2级武器。按升级顺序（火箭A→火箭B→……）找第一门「现在正好是这个等级」的武器；
+    顺序里没有（比如火箭A还是1级、手里却是券2）就给任意同级武器（火箭优先、近者优先）。
+    只要有同级武器就一定有目标，从不"拿着等"。"""
+    names = sorted({item for item in (role.backpack or [])
+                    if isinstance(item, str) and item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")})
     if not names:
         return None
-    steps, surplus = upgrade_plan(state)
-    for step in steps:
-        weapon = step["role"]
-        if (step["kind"] == "weapon" and step["covered"] and step["name"] in names
-                and (weapon.level or 1) == step["level"]
-                and (weapon.pos.x, weapon.pos.y) not in pending_targets):
-            return step["name"], weapon
-    for name in sorted(n for n in names if surplus[n] > 0):
+    steps, _surplus = upgrade_plan(state)
+    order = {}
+    for i, step in enumerate(steps):
+        if step["kind"] == "weapon":
+            order.setdefault((step["role"].id, step["level"]), i)
+    options = []
+    for name in names:
         level = 1 if name.endswith("1") else 2
-        candidates = [
-            r for r in state.team_our.roles
-            if r.role_type in WEAPON_TYPES and r.health > 0
-            and (r.level or 1) == level
-            and (r.pos.x, r.pos.y) not in pending_targets
-        ]
-        if candidates:
-            weapon = min(candidates, key=lambda r: (
-                chebyshev(role.pos, r.pos) > 1, _WEAPON_UPGRADE_ORDER.get(r.role_type, 99),
-                chebyshev(role.pos, r.pos), _weapon_front_key(state, r), r.id))
-            return name, weapon
-    return None
+        for weapon in state.team_our.roles:
+            if (weapon.role_type in WEAPON_TYPES and weapon.health > 0 and (weapon.level or 1) == level
+                    and (weapon.pos.x, weapon.pos.y) not in pending_targets):
+                options.append(((order.get((weapon.id, level), 999), _WEAPON_UPGRADE_ORDER.get(weapon.role_type, 99),
+                                 chebyshev(role.pos, weapon.pos), weapon.id), name, weapon))
+    if not options:
+        if pending_targets:
+            # 同级武器都被别人的任务锁着：锁不等于已经在用，照样给它，不能卡住
+            return held_weapon_voucher_target(role, state, set())
+        return None
+    _key, name, weapon = min(options, key=lambda o: o[0])
+    return name, weapon
 
 
 def _assign_weapon_step(role: Role, state: "MatchState", step: dict) -> None:
@@ -1946,47 +1946,55 @@ def _night_worker_release(state, blocked, reserved):
     """两人三炮下第三个人（一名工人）的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
     不看任务点是否可接：未清波时开拓者不接新任务、留在守炮名单。
     开拓者在做天黑前已开始的任务时由 plan_night 直接不调用本函数。
-    - 前两夜：放经济工去后院采矿，施工工和开拓者守三炮。
-    - 第三夜起：放施工工，经济工一人守双火箭、开拓者开另一门。
-      有防守压力时施工工留在家里用升级券/修墙包给残墙回血（夜里不能建造），没有可修的墙就回炮；
-      没有压力时去采矿，但必须在敌人到达前赶得回来。"""
+    - 前两夜：优先放经济工去后院采矿，施工工和开拓者守三炮。
+    - 第三夜起：优先放施工工，经济工一人守双火箭、开拓者开另一门。
+    - 偏好的人出不去（被炮位夹角堵住）或没事可做时，换另一名工人。
+      有防守压力时先在家用升级券/修墙包给残墙回血（夜里不能建造），没墙可修就去后院采矿。
+      两人已守住三炮，外出的人不需要赶在敌人之前回来。"""
     later_night = structure_priority_day(state)
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
         return None, None
-    from .opening import MUSTER_BUFFER, guns_covered_without, station_return_steps
+    from .opening import guns_covered_without
     from .opening_schedule import opening_worker_mode
-    from .tactics import front_breached, pressure, threat_eta_to_base
+    from .tactics import front_breached, pressure
     wanted = "builder" if later_night else "economist"
-    released = max(workers, key=lambda w: (opening_worker_mode(state, w) == wanted,
-                                          len(w.backpack or []), w.id))
     under_pressure = later_night and (pressure(state) or front_breached(state))
-    covered = (guns_covered_without(state, {released.id}, blocked, max_travel=NIGHT_REPAIR_GUNNER_TRAVEL)
-               if under_pressure else guns_covered_without(state, {released.id}, blocked))
-    if not covered:
+    # 按分工偏好排序，但不死认一个人：偏好的人被堵在炮位夹角里出不去、没矿可去时，换另一名工人出去。
+    # 上一回合放出去的人优先继续外出，避免两名工人来回换班。
+    previous = state.policy_memory.get("night_released_worker")
+    candidates = sorted(workers, key=lambda w: (w.id != previous,
+                                                opening_worker_mode(state, w) != wanted,
+                                                -len(w.backpack or []), -w.id))
+    released = cmd = reason = None
+    for worker in candidates:
+        covered = (guns_covered_without(state, {worker.id}, blocked, max_travel=NIGHT_REPAIR_GUNNER_TRAVEL)
+                   if under_pressure else guns_covered_without(state, {worker.id}, blocked))
+        if not covered:
+            trace(state, worker.id, "night_worker_release_uncovered", "放这名工人后剩下两人守不住三炮")
+            continue
+        state.night_released_ids = {worker.id}
+        try:
+            if not later_night:
+                cmd = decide_worker_day(worker, state, blocked, reserved)
+                reason = "前两夜两人三炮：一名工人去后院采矿，另一名工人与开拓者守炮"
+            else:
+                # 两人已守住三炮，外出的人不需要赶在敌人之前回来。有压力先在家修残墙，没墙可修就去后院采矿。
+                cmd = maintain_front_wall_health(worker, state, blocked, reserved) if under_pressure else None
+                reason = "第三夜起有压力：两人守三炮，另一名工人在家用道具修残墙（夜里不建造）"
+                if not cmd:
+                    cmd = decide_worker_day(worker, state, blocked, reserved)
+                    reason = "第三夜起：两人守三炮，另一名工人先修残墙再去后院采矿"
+        finally:
+            state.night_released_ids = set()
+        if cmd:
+            released = worker
+            break
+        trace(state, worker.id, "night_worker_release_idle", "放出去也没事可做（无可达的后院矿等），换人或留守")
+    if released is None:
+        state.policy_memory.pop("night_released_worker", None)
         return None, None
-    state.night_released_ids = {released.id}
-    try:
-        if not later_night:
-            cmd = decide_worker_day(released, state, blocked, reserved)
-            reason = "前两夜两人三炮：施工工与开拓者守炮，放经济工夜间采矿"
-        elif under_pressure:
-            cmd = maintain_front_wall_health(released, state, blocked, reserved)
-            reason = "第三夜起防守压力大：经济工守双火箭，施工工在家用道具修残墙（夜里不建造）"
-        else:
-            eta = threat_eta_to_base(state, released)
-            back = station_return_steps(released, state, blocked)
-            if back is None or (eta is not None and back + MUSTER_BUFFER + NIGHT_RELEASE_MARGIN >= eta):
-                trace(state, released.id, "night_worker_release_skipped",
-                      "敌人到达前来不及回炮，施工工不外出，留在炮位名单",
-                      threat_eta=eta, return_steps=back)
-                return None, None
-            cmd = decide_worker_day(released, state, blocked, reserved)
-            reason = "第三夜起无压力：经济工守双火箭，施工工先修残墙再夜间采矿"
-    finally:
-        state.night_released_ids = set()
-    if not cmd:
-        return None, None  # 没有可做的事就回到开炮名单
+    state.policy_memory["night_released_worker"] = released.id
     trace(state, released.id, "night_worker_released_to_economy", reason, command=cmd)
     return released, cmd
 
@@ -2219,44 +2227,13 @@ def command_actor_id(key, command):
     return key
 
 
-VOUCHER_DEADLINE_MARGIN = 6  # 走到武器旁的步数之外再留这么多回合，保证入夜前把券用掉
-
-
-def _voucher_level(name: str) -> int:
-    return 1 if name.endswith("1") else 2
-
-
-def deadline_voucher_target(role: Role, state: "MatchState", taken: set):
-    """兜底选武器：优先升级顺序给出的目标；顺序用不上时，任意同级存活武器（火箭优先、近者优先）。
-    taken 是本回合已被别人兜底占用的 (坐标, 等级)。返回 (券名, 武器) 或 None。"""
-    held = sorted({item for item in (role.backpack or [])
-                   if item in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")})
-    if not held:
-        return None
-    ordered = held_weapon_voucher_target(role, state, {pos for pos, _level in taken})
-    if ordered and ((ordered[1].pos.x, ordered[1].pos.y), _voucher_level(ordered[0])) not in taken:
-        return ordered
-    options = []
-    for name in held:
-        level = _voucher_level(name)
-        for weapon in state.team_our.roles:
-            if (weapon.role_type in WEAPON_TYPES and weapon.health > 0 and (weapon.level or 1) == level
-                    and ((weapon.pos.x, weapon.pos.y), level) not in taken):
-                options.append((level, _WEAPON_UPGRADE_ORDER.get(weapon.role_type, 99),
-                                chebyshev(role.pos, weapon.pos), weapon.id, name, weapon))
-    if not options:
-        return None
-    best = min(options, key=lambda o: o[:4])
-    return best[4], best[5]
-
-
-def enforce_voucher_deadline(state: "MatchState", commands: dict) -> dict:
-    """备用逻辑：白天手里还有武器升级券的人，到了"走过去 + 余量 ≥ 距入夜回合"就接管，
-    不论之前的升级顺序、施工/经济分支如何，入夜前必须把券用到同级武器上。"""
+def enforce_held_vouchers(state: "MatchState", commands: dict) -> dict:
+    """白天兜底：手里有武器升级券的工人/开拓者，本回合就去用（走过去或直接 use），覆盖其它白天分支。
+    目标由 held_weapon_voucher_target 决定（顺序优先、否则任意同级），同一回合两人不升同一门。
+    不接管：紧急治疗、正在买武器券（批量买完再去）、开拓者任务进行中、没有同级武器。"""
     if not state.team_our or not state.map_info or not is_day_round(state.round_no):
         return commands
-    from .opening import adjacent_path, day_rounds_remaining, move_on_path
-    remaining = day_rounds_remaining(state.round_no)
+    from .opening import adjacent_path, move_on_path
     blocked = build_blocked_set(state)
     taken = set()
     for role in state.team_our.roles:
@@ -2267,43 +2244,36 @@ def enforce_voucher_deadline(state: "MatchState", commands: dict) -> dict:
         current = commands.get(role.id) or {}
         if current.get("action") == "use" and current.get("name") == "Medicine":
             continue
-        pick = deadline_voucher_target(role, state, taken)
+        if current.get("action") == "buy" and str(current.get("name", "")).startswith("WeaponUpgradeVoucher"):
+            continue
+        pick = held_weapon_voucher_target(role, state, taken)
         if pick is None:
             continue
         name, weapon = pick
         target = (weapon.pos.x, weapon.pos.y)
+        taken.add(target)
+        if current.get("action") == "use" and current.get("name") == name:
+            continue
+        state.worker_item_jobs[role.id] = {"item": name, "target": target, "kind": "weapon"}
         if chebyshev(role.pos, weapon.pos) <= 1:
-            travel = 0
-            path = []
+            state.worker_item_jobs[role.id]["awaiting_use"] = True
+            cmd = selected(state, role.id, {"action": "use", "name": name,
+                                            "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]},
+                           "手里有武器券，立即使用")
         else:
             reserved = {(c["targetPos"][0]["x"], c["targetPos"][0]["y"])
                         for rid, c in commands.items()
                         if rid != role.id and c.get("action") == "move" and c.get("targetPos")}
             path = adjacent_path(role, weapon.pos, (blocked | reserved) - {(role.pos.x, role.pos.y)}, state)
-            if path is None:
-                trace(state, role.id, "voucher_deadline_unreachable", "持券兜底：目标武器不可达",
+            if not path:
+                trace(state, role.id, "held_voucher_unreachable", "持券：目标武器暂时不可达",
                       item=name, weapon_id=weapon.id)
                 continue
-            travel = len(path)
-        if remaining > travel + VOUCHER_DEADLINE_MARGIN:
-            continue
-        if current.get("action") == "use" and current.get("name") == name:
-            taken.add((target, _voucher_level(name)))
-            continue
-        taken.add((target, _voucher_level(name)))
-        state.worker_item_jobs[role.id] = {"item": name, "target": target, "kind": "weapon"}
-        if travel == 0:
-            cmd = {"action": "use", "name": name, "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]}
-            state.worker_item_jobs[role.id]["awaiting_use"] = True
-            cmd = selected(state, role.id, cmd, "入夜前兜底：手里的武器券必须用掉")
-        else:
-            cmd = move_on_path(state, role, path, set(), "入夜前兜底：走去同级武器旁用券")
+            cmd = move_on_path(state, role, path, set(), "手里有武器券，走去武器旁使用")
         if not cmd:
             continue
-        trace(state, role.id, "voucher_deadline_use",
-              "按升级顺序没用掉的武器券，入夜前兜底用到同级武器上",
-              item=name, weapon_id=weapon.id, weapon_level=weapon.level or 1,
-              rounds_to_night=remaining, travel=travel, overridden=current or None)
+        trace(state, role.id, "held_voucher_use", "手里有武器券就用：顺序优先，否则任意同级武器",
+              item=name, weapon_id=weapon.id, weapon_level=weapon.level or 1, overridden=current or None)
         commands[role.id] = cmd
     return commands
 
@@ -2364,7 +2334,7 @@ class V1Strategy(Strategy):
             commands = plan_day(state)
         else:
             commands = plan_night(state)
-        commands = enforce_voucher_deadline(state, commands)
+        commands = enforce_held_vouchers(state, commands)
         # 最低优先级兜底，不能同时占用正在操炮的角色。
         if state.team_our:
             controllers = {str(c.get('controllerId')) for c in commands.values()}
