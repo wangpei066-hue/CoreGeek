@@ -116,6 +116,33 @@ class TaskSolverStepTests(unittest.TestCase):
         state.last_round_role_action_results = last_round_role_action_results or {}
         return state
 
+    def test_heritage_contract_detected_from_read_task_document(self):
+        state = self._state('请阅读task_2_nanjing.md，获取任务信息')
+        self.solver.step(state, {})
+        request_id = self.solver.session['requestId']
+        task_doc = (
+            '# 查询南京文化遗产\n'
+            '从 API 查询南京市的全部文化遗产记录。\n'
+            '服务运行在 http://localhost:8899。'
+        )
+        read_result = json.dumps({
+            'marker': MARKER,
+            'requestId': request_id,
+            'event': 'read_document',
+            'path': '/tmp/task_2_nanjing.md',
+            'content': task_doc,
+            'nextOffset': len(task_doc),
+            'more': False,
+            'documentDir': '/tmp',
+        }, ensure_ascii=False)
+        state = self._state(state.phase_task, round_no=11, last_cmd_result=read_result)
+        self.solver.step(state, {})
+
+        replay = self.solver.session.get('apiReplay')
+        self.assertIsNotNone(replay)
+        self.assertEqual(replay['path'], '/api/v1/heritage/search')
+        self.assertEqual(self.solver.session.get('taskKind'), 'api')
+
     def sandbox(self, command):
         if not shutil.which('sh'):
             self.skipTest('需要 POSIX sh；请在 Linux 比赛运行环境补跑沙盒集成测试')

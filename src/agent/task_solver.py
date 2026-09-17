@@ -1633,9 +1633,16 @@ class PioneerTaskSolver:
                 s['workspace'] = learned['workspace']
             if learned.get('taskKind') in ('workspace', 'api'):
                 s['taskKind'] = learned['taskKind']
+            # phaseTask 往往只有“请阅读 task_x.md”，题型和城市都在刚读到的
+            # 文档正文中。只检查 phaseTask 会漏掉北京/南京等遗产任务，导致
+            # 确定性 API 收集与本地统计完全没有启用。
+            task_brief = '\n'.join(filter(None, (
+                state.phase_task,
+                result.get('content') or '',
+            )))
             if (s.get('taskKind') == 'api' and not s.get('apiReplay')
-                    and is_heritage_task(state.phase_task)):
-                replay = default_heritage_experience(state.phase_task, s.get('documents'))
+                    and is_heritage_task(task_brief)):
+                replay = default_heritage_experience(task_brief, s.get('documents'))
                 if replay:
                     s['apiReplay'] = replay
                     s['stage'] = 'api_fetch'
