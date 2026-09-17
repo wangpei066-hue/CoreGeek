@@ -139,8 +139,10 @@ def own_station(state: "MatchState"):
     return next((r for r in state.team_our.roles if r.role_type == "station"), None)
 
 
-def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: str = "weapon") -> Optional[Pos]:
-    """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。"""
+def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: str = "weapon",
+                      worker: Optional[Role] = None) -> Optional[Pos]:
+    """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。
+    墙：先正面后侧翼，同优先级选离施工工最近的格子，避免两端来回跑。"""
     width, height = state.map_info.width, state.map_info.height
     if kind == "wall":
         from .opening import (
@@ -154,11 +156,33 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
         existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
         if not set(plan) - existing:
             plan = primary_wall_plan(state, base)
-        if not full_wall_build_window(state):
+        if not full_wall_build_window(state, worker):
             plan = [p for p in plan if wall_priority(state, base, p) == 0]
-        return next((Pos(x, y) for x, y in plan
-                     if (x, y) not in blocked and (x, y, kind) not in state.failed_build_spots
-                     and safe_wall(state, (x, y), blocked, assign_weapons(state))), None)
+        origin = worker.pos if worker is not None else base_pos
+        from .opening import wall_approach_path
+        ranked = []
+        for p in plan:
+            if p in blocked or (p[0], p[1], kind) in state.failed_build_spots:
+                continue
+            if not safe_wall(state, p, blocked, assign_weapons(state)):
+                continue
+            path = None
+            if worker is not None:
+                path = wall_approach_path(worker, Pos(*p), blocked, state)
+                if path is None:
+                    continue
+            adj_built = any(chebyshev(Pos(*p), Pos(*e)) == 1 for e in existing) if existing else True
+            here = chebyshev(origin, Pos(*p))
+            ranked.append((
+                wall_priority(state, base, p),
+                0 if here <= 1 else 1,
+                0 if adj_built else 1,
+                0 if path is None else len(path),
+                here,
+                p,
+            ))
+        ranked.sort()
+        return next((Pos(x, y) for *_rest, (x, y) in ranked), None)
     from .opening import weapon_candidates
     base = own_station(state)
     if base is None:
@@ -1224,14 +1248,24 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
         return None
 
     pending = state.worker_build_targets.get(worker.id)
+    last_failed = (state.last_round_role_action_results or {}).get(worker.id) is False
     if pending and pending[2] == "wall":
-        from .opening import full_wall_build_window, primary_wall_plan, wall_priority
-        if pending[:2] not in primary_wall_plan(state, base):
+        from .opening import full_wall_build_window, primary_wall_plan, wall_priority, failed_move_cells
+        if last_failed or pending[:2] not in primary_wall_plan(state, base):
             del state.worker_build_targets[worker.id]
             pending = None
         elif not full_wall_build_window(state, worker) and wall_priority(state, base, pending[:2]) != 0:
             del state.worker_build_targets[worker.id]
             pending = None
+        elif worker is not None:
+            better = pick_build_target(state, base.pos, (blocked | reserved) - {(worker.pos.x, worker.pos.y)},
+                                       "wall", worker=worker)
+            stuck = (pending[0], pending[1]) in failed_move_cells(state, worker)
+            if better is not None and (
+                    stuck
+                    or chebyshev(worker.pos, Pos(*pending[:2])) > chebyshev(worker.pos, better) + 1):
+                del state.worker_build_targets[worker.id]
+                pending = None
     if pending:
         x, y, kind = pending
         if ((x, y, kind) in state.failed_build_spots
@@ -1240,6 +1274,7 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                 or (kind == "weapon" and sum(r.role_type in WEAPON_TYPES for r in state.team_our.roles)
                     + getattr(state, "planned_weapons", 0) >= MAX_WEAPONS)):
             del state.worker_build_targets[worker.id]
+            pending = None
         else:
             target = Pos(x, y)
             dist = chebyshev(worker.pos, target)
@@ -1273,12 +1308,25 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             if kind == "wall":
                 from .opening import wall_approach_path, move_on_path
                 path = wall_approach_path(worker, target, blocked | reserved, state)
-                return move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
-            step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
-            if step:
-                reserved.add((step.x, step.y))
-                return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
-            return None
+                if path is None:
+                    del state.worker_build_targets[worker.id]
+                    pending = None
+                else:
+                    cmd = move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
+                    if cmd:
+                        return cmd
+                    del state.worker_build_targets[worker.id]
+                    pending = None
+            else:
+                step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
+                if step:
+                    reserved.add((step.x, step.y))
+                    return selected(state, worker.id, {"action": "move", "targetPos": [{"x": step.x, "y": step.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+                return None
+
+    # pending 仍在说明这一回合已经处理过建造目标（走到半路），不要另开新目标。
+    if pending:
+        return None
 
     weapon_count = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES)
     can_weapon = state.team_our.gold_num >= WEAPON_GOLD_COST and weapon_count + getattr(state, "planned_weapons", 0) < MAX_WEAPONS
@@ -1294,7 +1342,8 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
 
     pending_spots = {(x, y) for x, y, _ in state.worker_build_targets.values()}
     own = {(worker.pos.x, worker.pos.y)}
-    target = pick_build_target(state, base.pos, (blocked | reserved | pending_spots) - own, kind)
+    target = pick_build_target(state, base.pos, (blocked | reserved | pending_spots) - own, kind,
+                               worker=worker if kind == "wall" else None)
     if target is None:
         trace(state, worker.id, "no_build_candidate", "搜索范围内无可用建造候选格（占用、越界或失败冷却）", kind=kind)
         return None
@@ -1494,6 +1543,14 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         if cmd:
             return cmd
         if handled:
+            from .opening import builder_move_to_dual_rockets, builder_unjam_walls
+            cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=True)
+            if cmd:
+                return cmd
+            cmd = builder_move_to_dual_rockets(
+                worker, state, blocked, reserved, '施工工本回合砌不上墙，去双火箭位待命')
+            if cmd:
+                return cmd
             heal = decide_self_heal(worker) or decide_buy_medicine(worker, state)
             if heal:
                 return heal
@@ -1993,6 +2050,11 @@ def _night_worker_release(state, blocked, reserved):
     candidates = sorted(workers, key=lambda w: (w.id != previous,
                                                 opening_worker_mode(state, w) != wanted,
                                                 -len(w.backpack or []), -w.id))
+    if not later_night:
+        # 前两夜施工工必须留家开双火箭，只放经济工外出。
+        stay_home = [w for w in candidates if opening_worker_mode(state, w) != "builder"]
+        if stay_home:
+            candidates = stay_home
     released = cmd = reason = None
     danger = night_danger_cells(state)
     for worker in candidates:

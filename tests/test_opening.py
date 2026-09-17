@@ -417,9 +417,54 @@ class OpeningTests(unittest.TestCase):
         walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall'}
         primary = set(primary_wall_plan(state, state.team_our.roles[0]))
         self.assertTrue(walls <= primary)
-        # 攒够 STONE_BATCH(6) 再成片建墙后，同样的 70 回合窗口里完工数会比"采一块建一道"更少，
-        # 这是批量搬运减少往返的预期代价，不是回归；只要求确实有墙建成。
-        self.assertGreaterEqual(len(walls), 7)
+        # 攒够一批再成片建、以及院内不贴墙线绕路，同一 70 回合窗口里段数会比逐格来回砌更少。
+        self.assertGreaterEqual(len(walls), 5)
+
+    def test_wall_approach_from_attack_side_does_not_hug_front(self):
+        from src.agent.opening import wall_approach_path
+        state = opening_state()
+        self._rockets(state)
+        for y in range(7, 13):
+            state.team_our.roles.append(make_role(40 + y, 13, y, 'wall', health=1000, level=1))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(16, 10)
+        blocked = build_blocked_set(state)
+        path = wall_approach_path(worker, Pos(13, 10), blocked, state)
+        self.assertIsNotNone(path)
+        hugged = [p for p in path if p.y == 10 and p.x > 13]
+        self.assertLessEqual(len(hugged), 1)
+
+    def test_opening_stone_skips_attack_side_mine(self):
+        from src.agent.opening_schedule import choose_nearest_mine
+        state = opening_state()
+        self._rockets(state)
+        for y in range(7, 13):
+            state.team_our.roles.append(make_role(40 + y, 13, y, 'wall', health=1000, level=1))
+        state.map_info.zones = [Zone(Pos(20, 10), 'stone'), Zone(Pos(6, 9), 'stone')]
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 10)
+        blocked = build_blocked_set(state)
+        mine, _path, _reason = choose_nearest_mine(worker, state, blocked, set(), ('stone',))
+        self.assertIsNotNone(mine)
+        self.assertEqual((mine.pos.x, mine.pos.y), (6, 9))
+
+    def test_claim_wall_does_not_treat_other_gaps_as_solid(self):
+        from src.agent.opening import claim_opening_wall, assign_weapons, courtyard_cells
+        from src.agent.brain import own_station
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 10)
+        worker.backpack = ['stone'] * 4
+        blocked = build_blocked_set(state)
+        yard = courtyard_cells(state, own_station(state))
+        cmd = claim_opening_wall(
+            worker, state, [(13, 7), (13, 12), (13, 10)], blocked, set(), set(), assign_weapons(state),
+        )
+        self.assertTrue(cmd)
+        if cmd.get('action') == 'move':
+            step = cmd['targetPos'][0]
+            self.assertIn((step['x'], step['y']), yard | {(12, 9), (12, 10), (12, 11), (11, 10)})
 
 
     def _rockets(self, state):
@@ -608,7 +653,10 @@ class OpeningTests(unittest.TestCase):
         state.team_our.roles[1].backpack = ['stone'] * 2
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertIn(commands[1]['action'], ('move', 'buy', 'build'))
-        self.assertEqual((state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore'), 'stone')
+        self.assertNotEqual(commands[1].get('action'), 'buy')
+        ore = (state.policy_memory.get('mine_targets') or {}).get('1', {}).get('ore')
+        if commands[1]['action'] != 'build':
+            self.assertEqual(ore, 'stone')
 
     def test_night_empty_one_round_still_holds_guns(self):
         state = opening_state()

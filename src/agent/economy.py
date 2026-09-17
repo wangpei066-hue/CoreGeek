@@ -1019,6 +1019,14 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
         return score, batch, path_len, return_len, None
 
     sticky = get_mine_target(state, role.id)
+    if sticky and purpose == 'stone' and base is not None:
+        from .opening import attack_side_of_front
+        try:
+            if attack_side_of_front(state, base, Pos(int(sticky['x']), int(sticky['y']))):
+                sticky = None
+                clear_mine_target(state, role.id)
+        except (KeyError, TypeError, ValueError):
+            pass
     if sticky:
         try:
             mine = _mine_at(state, int(sticky['x']), int(sticky['y']), want)
@@ -1047,8 +1055,12 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
         score, batch, path_len, return_len, plan = ranked
         claimed = (mine.pos.x, mine.pos.y) in occupied
         if night or purpose == 'stone':
-            # 夜里、以及施工工采石：只看往返距离（走过去 + 矿离基地多远），越近越好。
-            candidates.append((1 if claimed else 0, path_len + home_distance(mine), path_len,
+            # 夜里、以及施工工采石：只看往返距离；迎敌墙外侧的矿大幅降权，避免封在墙外绕路。
+            from .opening import attack_side_of_front
+            attack_penalty = 0
+            if purpose == 'stone' and base is not None and attack_side_of_front(state, base, mine.pos):
+                attack_penalty = 1000
+            candidates.append((attack_penalty + (1 if claimed else 0), path_len + home_distance(mine), path_len,
                                mine, path, batch, return_len, score))
         elif purpose == 'voucher':
             candidates.append((plan['rounds'], 1 if claimed else 0, path_len, mine, path, batch, return_len, score))
