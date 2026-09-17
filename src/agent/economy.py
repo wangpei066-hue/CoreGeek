@@ -994,7 +994,7 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
     """一人一矿：能沿用粘性目标就继续；筹资买券时按 vendorShopList 选总回合最短的铜铁。
     夜里只采防线后方、离机器人远的矿，并按离基地最近选，避免绕路或挨打。"""
     from .brain import is_day_round, own_station
-    from .opening import adjacent_path, night_danger_cells, night_safe_path
+    from .opening import adjacent_path, night_danger_cells, night_strict_path
     want = set(want_ores)
     if not want or state.map_info is None:
         return None
@@ -1006,7 +1006,9 @@ def pick_mine(role, state, blocked, reserved, want_ores, purpose='income'):
         if night:
             if (mine.pos.x, mine.pos.y) in danger:
                 return None
-            return night_safe_path(role, mine.pos, blocked | reserved, state)
+            # 采矿不是回防等紧急移动，夜里不允许寻路降级后穿越正面或机器人
+            # 危险区；没有严格安全路线就留守。
+            return night_strict_path(role, mine.pos, blocked | reserved, state)
         return adjacent_path(role, mine.pos, blocked | reserved, state)
 
     def home_distance(mine):

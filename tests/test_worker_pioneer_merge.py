@@ -65,19 +65,17 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(commands[20]['controllerId'], '3')
         self.assertFalse(any(c['action'] == 'acceptTask' for c in commands.values()))
 
-    def test_night_pioneer_takes_task_when_workers_cover_all_guns(self):
-        for active in (False, True):
-            with self.subTest(active=active):
-                state = opening_state()
-                state.round_no = 80
-                state.phase_task = '任务进行中' if active else ''
-                state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
-                state.team_our.roles.append(make_role(20, 10, 11, 'gatling', level=1, attack_range=20))
-                state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
-                commands = self.decide(state)
-                self.assertNotEqual(commands.get(20, {}).get('controllerId'), '3')
-                if not active:
-                    self.assertEqual(commands[3]['action'], 'acceptTask')
+    def test_first_two_nights_pioneer_stays_on_guns_even_when_task_is_available(self):
+        state = opening_state()
+        state.round_no = 80
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+        state.team_our.roles.append(make_role(20, 10, 11, 'gatling', level=1, attack_range=20))
+        state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
+        commands = self.decide(state)
+        self.assertEqual(commands.get(20, {}).get('controllerId'), '3')
+        self.assertNotEqual(commands.get(3, {}).get('action'), 'acceptTask')
+        self.assertTrue(any(e['code'] == 'early_night_fixed_defense'
+                            for e in state.decision_events))
 
     def test_pioneer_keeps_task_when_worker_can_cover_two_adjacent_rockets(self):
         state = opening_state()
@@ -387,6 +385,20 @@ class NightRouteTests(unittest.TestCase):
         picked = pick_mine(worker, state, build_blocked_set(state), set(), ('iron',))
         self.assertIsNotNone(picked)
         self.assertEqual(picked[0].pos, rear_mine.pos)
+
+    def test_night_economist_refuses_front_mine_when_no_safe_mine_exists(self):
+        from src.agent.economy import pick_mine
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import attack_direction, defense_bounds
+        state = opening_state()
+        state.round_no = 80
+        base = state.team_our.roles[0]
+        left, right, _, _ = defense_bounds(state, base)
+        direction = attack_direction(state, base)
+        front = right if direction == 1 else left
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        state.map_info.zones = [Zone(Pos(front + 2 * direction, worker.pos.y), 'iron')]
+        self.assertIsNone(pick_mine(worker, state, build_blocked_set(state), set(), ('iron',)))
 
 
 def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):

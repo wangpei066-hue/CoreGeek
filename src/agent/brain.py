@@ -2060,7 +2060,18 @@ def plan_night(state: "MatchState") -> dict:
                     state.team_our.gold_num -= cost
                 commands[role.id] = cmd
         return commands
-    commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
+    # 前两夜固定执行“两人三炮”：经济工外出采后方安全矿，施工工和
+    # 开拓者留守。不能让任务点是否恰好位于机器人另一侧改变开拓者分工。
+    # 清波分支在上面已经提前返回，因此机器人清完后开拓者仍会立刻恢复任务。
+    early_night = not structure_priority_day(state)
+    if early_night and not state.phase_task:
+        commands, task_pioneers = {}, set()
+        trace(state, None, "early_night_fixed_defense",
+              "前两夜固定两人三炮：开拓者不接任务，施工工与开拓者留守，经济工采后方安全矿")
+    else:
+        # 已经进入任务阶段时离开任务点会直接失败，只能保留；固定编组通过
+        # 前两夜不再新接任务来保证，而不是中途抛弃已开始的任务。
+        commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
     urgent = pressure(state) or front_breached(state)
     released_worker, released_cmd = _night_worker_release(state, blocked, reserved, task_pioneers)
     excluded = set(task_pioneers)
