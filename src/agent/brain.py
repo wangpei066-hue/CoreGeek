@@ -10,6 +10,7 @@ from .protocol import (
 from .decision_log import trace, selected, log_judge_feedback
 from .grid import build_blocked_set, chebyshev, move_towards, nearest_adjacent_free_cell
 from .news_memory import vendor_prices
+from .targeting import DamageLedger, TargetContext, plan_attack
 from .pioneer_schedule import (
     SCHEDULER_VERSION, SHOP_STALL_ROUNDS, add_branch, apply_task_choice, begin_schedule,
     bump_streak, emit_scheduler_log, ensure_schedule_buckets, interrupt_reservation,
@@ -62,8 +63,8 @@ HEAL_HP_RATIO = 0.5
 EMERGENCY_HP_RATIO = 0.15
 EMERGENCY_HP_ABS = 30
 MEDICINE_GOLD_COST = 10
+TARGETING_REASON = "按有效伤害×价值+击杀奖励选落点；火箭先算，电磁炮补刀"
 
-_ROBOT_PRIORITY = {"bossRobot": 4, "largeRobot": 3, "middleRobot": 2, "smallRobot": 1}
 
 
 def is_day_round(round_no) -> bool:
@@ -1868,7 +1869,7 @@ def try_station_upgrade_during_cooldown(role: Role, state: "MatchState", blocked
     from .tactics import threat_robots
     if weapon is not None:
         ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-        if ready and pick_attack_target(weapon, threat_robots(state)):
+        if ready and plan_attack(weapon, threat_robots(state), state):
             return None
         cooldown = 99 if weapon.role_type != "rocket" else (weapon.cooldown or 0)
     else:
@@ -1896,23 +1897,10 @@ def try_station_upgrade_during_cooldown(role: Role, state: "MatchState", blocked
     return move_on_path(state, role, path, reserved, "火箭冷却，前往基地使用升级券")
 
 
-def pick_attack_target(weapon: Role, robots: list):
-    in_range = [r for r in robots if chebyshev(weapon.pos, r.pos) <= weapon.attack_range]
-    if not in_range:
-        return None
-    in_range.sort(key=lambda r: (-_ROBOT_PRIORITY.get(r.role_type, 0), r.health))
-    return in_range[0]
-
-
-def target_positions_for_weapon(weapon: Role, target):
-    """加特林/火箭的目标位置数须等于武器等级（接口文档2.2）。"""
-    count = (weapon.level or 1) if weapon.role_type in ("gatling", "rocket") else 1
-    return [{"x": target.pos.x, "y": target.pos.y}] * count
-
-
 def adjacent_ready_rocket(fighter: Role, assigned: Optional[Role], state: "MatchState", robots: list,
-                          commands: dict):
-    """火箭冷却时，同一操作者可切到相邻且已冷却的另一门火箭炮。"""
+                          commands: dict, ledger: Optional[DamageLedger] = None,
+                          ctx: Optional[TargetContext] = None):
+    """火箭冷却时，同一操作者可切到相邻且已冷却的另一门火箭炮；返回 (武器, (落点, 伤害表))。"""
     from .opening import dual_rocket_partner
     used_weapons = set(commands)
     partner = None
@@ -1931,13 +1919,13 @@ def adjacent_ready_rocket(fighter: Role, assigned: Optional[Role], state: "Match
             continue
         if weapon.cooldown or 0:
             continue
-        target = pick_attack_target(weapon, robots)
-        if target:
-            candidates.append((weapon.level or 1, -weapon.id, weapon, target))
+        plan = plan_attack(weapon, robots, state, ledger, ctx)
+        if plan:
+            candidates.append((weapon.level or 1, -weapon.id, weapon, plan))
     if not candidates:
         return None, None
-    _, _, weapon, target = max(candidates)
-    return weapon, target
+    _, _, weapon, plan = max(candidates, key=lambda c: c[:2])
+    return weapon, plan
 
 
 def plan_pioneer_tasks(state, blocked, reserved):
@@ -2081,10 +2069,13 @@ def plan_night(state: "MatchState") -> dict:
     assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
     fighters = [r for r in state.team_our.roles
                 if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]
+    # 已在炮位的先决策；其中火箭先算，电磁炮读同一份伤害表补刀。
     fighters.sort(key=lambda r: (
         0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
+        0 if (assignments.get(r.id) and assignments[r.id].role_type == "rocket") else 1,
         _fighter_layer(state, r),
     ))
+    target_ctx, ledger = TargetContext(state, robots), DamageLedger()
     for fighter in fighters:
         heal = decide_emergency_heal(fighter, state)
         if heal:
@@ -2103,30 +2094,32 @@ def plan_night(state: "MatchState") -> dict:
         weapon = assignments.get(fighter.id)
         if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-            target = pick_attack_target(weapon, robots) if ready else None
-            upgrade = night_voucher_use(fighter, state, target)
+            plan = plan_attack(weapon, robots, state, ledger, target_ctx) if ready else None
+            upgrade = night_voucher_use(fighter, state, plan)
             if upgrade:
                 commands[fighter.id] = upgrade
                 continue
-            if target is None and weapon.role_type == "rocket":
-                alternate, alt_target = adjacent_ready_rocket(fighter, weapon, state, robots, commands)
+            if plan is None and weapon.role_type == "rocket":
+                alternate, alt_plan = adjacent_ready_rocket(fighter, weapon, state, robots, commands,
+                                                            ledger, target_ctx)
                 if alternate is not None:
                     trace(state, fighter.id, "weapon_assignment",
                           "分配火箭冷却，切到相邻已冷却火箭炮开火", weapon_id=alternate.id,
                           assigned_weapon_id=weapon.id)
-                    trace(state, fighter.id, "selected",
-                          "优先BOSS、大型、中型、小型；同等级优先低血量",
-                          weapon_id=alternate.id, target_robot_id=alt_target.id)
+                    trace(state, fighter.id, "selected", TARGETING_REASON,
+                          weapon_id=alternate.id, target_pos=alt_plan[0], expected_damage=alt_plan[1])
+                    ledger.add(alt_plan[1])
                     commands[alternate.id] = {
-                        "action": "attack", "controllerId": str(fighter.id),
-                        "targetPos": target_positions_for_weapon(alternate, alt_target),
+                        "action": "attack", "controllerId": str(fighter.id), "targetPos": alt_plan[0],
                     }
                     continue
-            if target:
+            if plan:
                 trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-                trace(state, fighter.id, "selected", "优先BOSS、大型、中型、小型；同等级优先低血量", weapon_id=weapon.id, target_robot_id=target.id)
+                trace(state, fighter.id, "selected", TARGETING_REASON,
+                      weapon_id=weapon.id, target_pos=plan[0], expected_damage=plan[1])
+                ledger.add(plan[1])
                 commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
-                                       "targetPos": target_positions_for_weapon(weapon, target)}
+                                       "targetPos": plan[0]}
                 continue
             heal_cmd = try_station_upgrade_during_cooldown(fighter, state, blocked, reserved, weapon)
             if heal_cmd:

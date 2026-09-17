@@ -334,18 +334,20 @@ class OpeningTests(unittest.TestCase):
         target = commands[3]['targetPos'][0]
         self.assertNotIn((target['x'], target['y']), wall_ring(state, state.team_our.roles[0]))
 
-    def test_night_three_different_weapons_and_high_tier_target(self):
+    def test_night_three_different_weapons_share_damage_ledger(self):
         state = opening_state()
         state.round_no = 75
         for i, (kind, x) in enumerate([('gatling', 9), ('railgun', 12), ('rocket', 10)]):
             state.team_our.roles.append(make_role(20+i, x, 10 if i < 2 else 11, kind, level=1, attack_range=20))
         state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 1),
-                             RobotRole(101, Pos(16, 10), 'bossRobot', 800)]
+                             RobotRole(101, Pos(16, 12), 'bossRobot', 800)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
         attacks = [c for c in commands.values() if c['action'] == 'attack']
         self.assertEqual(len(attacks), 3)
         self.assertEqual(len({c['controllerId'] for c in attacks}), 3)
-        self.assertTrue(all(c['targetPos'] == [{'x': 16, 'y': 10}] for c in attacks))
+        # 1血小怪只需一发：火箭溅射已打死它，其余武器不再重复打它
+        weak_hits = [c for c in attacks if c['targetPos'] == [{'x': 15, 'y': 10}]]
+        self.assertLessEqual(len(weak_hits), 1)
 
     def test_two_people_control_three_guns_by_switching_rockets(self):
         state = opening_state()
