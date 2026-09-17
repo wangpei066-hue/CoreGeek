@@ -102,6 +102,22 @@ class NewsMemoryTests(unittest.TestCase):
         }, resume=True)
         self.assertEqual(cleared["mineBannedDays"], [])
         self.assertTrue(is_resume_official("铁矿区修复工程完成，即日起恢复开采。"))
+        self.assertFalse(is_resume_official(IRON_COLLAPSE))
+        self.assertFalse(is_resume_official(
+            "修复工程通常需要2天左右才能完成并恢复开采。"
+        ))
+
+        # 误判复工会把 LLM 已填的 [3,4] 清成空（见 issue #647）
+        self.memory.data["officialHash"] = IRON_COLLAPSE
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [3, 4],
+            "priceUpDays": [3, 4],
+            "notes": "明日停工2天",
+        }, published_day=2)
+        self.assertEqual(self.memory.data["oreEffects"][0]["mineBannedDays"], [3, 4])
+        self.assertEqual(self.memory.banned_ores(3), {"iron"})
+        self.assertEqual(self.memory.banned_ores(4), {"iron"})
 
     def test_status_update_llm_merges_with_memory(self):
         state = self._state(131, official=IRON_COLLAPSE)

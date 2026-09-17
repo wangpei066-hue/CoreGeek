@@ -51,7 +51,14 @@ _NEGATE_RE = re.compile(
     r"(?:不停工|未停工|不涨价|未涨价|无需停工)"
 )
 _RESUME_RE = re.compile(
-    r"恢复开采|修复(?:工程)?完成|即日起恢复|已恢复开采|结束停工|解除禁采|恢复生产"
+    r"(?:即日起|现已|已经|正式)恢复(?:开采|生产|作业)|"
+    r"已恢复(?:开采|生产)|结束停工|解除禁采|"
+    r"修复(?:工程)?完成"
+)
+# 首发停工里常出现「需要2天才能恢复开采」——这是未来时，不能当复工。
+_RESUME_FUTURE_RE = re.compile(
+    r"(?:才能|方可|预计|需要|需|待).{0,16}恢复(?:开采|生产)|"
+    r"(?:左右|上下).{0,8}(?:才能完成并)?恢复(?:开采|生产)"
 )
 
 
@@ -207,7 +214,12 @@ def legend_mentions_open_time(text: str) -> bool:
 
 
 def is_resume_official(text: str) -> bool:
-    return bool(text and _RESUME_RE.search(text))
+    """是否为「现在已恢复」通报。首发里的『N天才能恢复开采』不算。"""
+    if not text:
+        return False
+    if _RESUME_FUTURE_RE.search(text):
+        return False
+    return bool(_RESUME_RE.search(text))
 
 
 def _int_day_list(values) -> list:
