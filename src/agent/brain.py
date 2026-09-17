@@ -565,7 +565,7 @@ def self_evolution_work_open(state: "MatchState") -> bool:
     return any(
         getattr(t, "is_valid", False)
         and getattr(t, "task_type", None) in ("自进化类1", "自进化类2")
-        and getattr(t, "cooldown", 0) == 0
+        and (getattr(t, "cold_down_rounds", 0) or 0) == 0
         for t in (state.team_our.player_tasks or [])
     )
 
@@ -1951,7 +1951,10 @@ def _night_worker_release(state, blocked, reserved, task_pioneers):
     - 第三夜起：放施工工，经济工一人守双火箭、开拓者开另一门。
       有防守压力时施工工留在家里用升级券/修墙包给残墙回血（夜里不能建造），没有可修的墙就回炮；
       没有压力时去采矿，但必须在敌人到达前赶得回来。"""
-    if self_evolution_work_open(state) or task_pioneers:
+    later_night = structure_priority_day(state)
+    # 前两夜开拓者固定守炮、不接新任务：任务点"可接"不代表开拓者会去做，只有进行中的任务才占人。
+    pioneer_busy = self_evolution_work_open(state) if later_night else bool(state.phase_task)
+    if pioneer_busy or task_pioneers:
         return None, None
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
@@ -1959,7 +1962,6 @@ def _night_worker_release(state, blocked, reserved, task_pioneers):
     from .opening import MUSTER_BUFFER, guns_covered_without, station_return_steps
     from .opening_schedule import opening_worker_mode
     from .tactics import front_breached, pressure, threat_eta_to_base
-    later_night = structure_priority_day(state)
     wanted = "builder" if later_night else "economist"
     released = max(workers, key=lambda w: (opening_worker_mode(state, w) == wanted,
                                           len(w.backpack or []), w.id))

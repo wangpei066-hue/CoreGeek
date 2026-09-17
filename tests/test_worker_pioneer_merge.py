@@ -168,6 +168,26 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(commands[freed.id]['action'], 'collect')
         self.assertFalse(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
 
+    def test_first_two_nights_release_miner_even_when_task_is_available(self):
+        """前两夜开拓者不接任务，任务点可接不应挡住经济工去基地后方采矿。"""
+        for round_no in (80, 210):
+            with self.subTest(round_no=round_no):
+                state = self._dual_rocket_night()
+                state.round_no = round_no
+                next(r for r in state.team_our.roles if r.id == 1).pos = Pos(9, 10)
+                freed = next(r for r in state.team_our.roles if r.id == 2)
+                freed.pos = Pos(7, 9)
+                pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+                pioneer.pos = Pos(10, 12)
+                state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
+                state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
+                state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+                commands = self.decide(state)
+                self.assertEqual(commands[freed.id]['action'], 'collect')
+                self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'acceptTask')
+                self.assertTrue(any(e['code'] == 'night_worker_released_to_economy'
+                                    for e in state.decision_events))
+
     def test_third_night_worker_stays_on_guns_when_defense_is_due(self):
         state = self._dual_rocket_night()
         state.round_no = 270
@@ -523,3 +543,40 @@ class ChainVoucherTests(unittest.TestCase):
         target = tuple(state.worker_item_jobs[1]['target'])
         kind = next(r.role_type for r in state.team_our.roles if (r.pos.x, r.pos.y) == target)
         self.assertEqual(kind, 'rocket')  # 就站在电磁炮旁也先按顺序升火箭
+
+
+class FixtureNightMinerTests(unittest.TestCase):
+    """用真实请求样例：前两夜带石头的经济工不去正面缺口（夜里不能建造），而是去基地后方采矿。"""
+
+    def _state(self, round_no):
+        import json
+        from pathlib import Path
+        from src.agent.protocol import MatchState
+        payload = json.loads((Path(__file__).parent / 'fixtures/sample_match_state.json').read_text(encoding='utf-8'))
+        payload['roundNo'] = round_no
+        for r in payload['teamOur']['roles']:
+            if r['roleType'] == 'gatling':
+                r.update(roleType='rocket', level=1, cooldown=0, attackRange=10)
+            if r['id'] == 10010:
+                r['pos'] = {'x': 8, 'y': 24}
+            if r['id'] == 10012:
+                r['pos'] = {'x': 11, 'y': 26}
+        payload['teamOur']['playerTasks'] = [{
+            'taskType': '自进化类1', 'taskPosition': {'x': 14, 'y': 14}, 'coldDownRounds': 0,
+            'scoreReward': 10, 'goldReward': 10, 'isValid': True,
+        }]
+        payload['robot'] = {'roles': [{'id': 1, 'pos': {'x': 30, 'y': 10}, 'roleType': 'smallRobot',
+                                       'health': 40, 'targetTeam': ''}]}
+        state = MatchState()
+        state.update(payload)
+        return state
+
+    def test_released_worker_heads_to_rear_mine(self):
+        for round_no in (85, 215):
+            with self.subTest(round_no=round_no):
+                state = self._state(round_no)
+                V1Strategy(BasicActionValidator()).decide(state)
+                codes = [e['code'] for e in state.decision_events if e['role_id'] == 10012]
+                self.assertIn('night_worker_released_to_economy', codes)
+                self.assertIn('income_mine', codes)
+                self.assertNotIn('emergency_front_seal', codes)

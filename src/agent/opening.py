@@ -1517,8 +1517,11 @@ def adjacent_critical_build(role, state, blocked, reserved):
 def emergency_front_seal(role, state, blocked, reserved):
     """正面缺口会使关键目标暴露，且工人能在安全窗内封堵时，暂停未买到手的采购。"""
     from .tactics import threat_eta_to_base, threat_robots
+    from .brain import is_day_round
     if role.role_type != 'worker' or 'stone' not in role.backpack:
         return None
+    if not is_day_round(state.round_no):
+        return None  # 夜里不能建造（任务书4.4），走过去也封不上，别占用夜间采矿的人
     gaps = [Pos(*p) for p in critical_wall_missing(state)]
     if not gaps:
         return None
