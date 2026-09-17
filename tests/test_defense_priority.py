@@ -71,12 +71,13 @@ class DefensePriorityTests(unittest.TestCase):
         self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
         self.assertNotEqual(state.worker_item_jobs.get(economist.id, {}).get('kind'), 'wall')
 
-    def test_keeper_repairs_low_front_walls_before_new_wall_backlog(self):
+    def test_keeper_builds_new_walls_before_half_health_upgrades_early_day(self):
+        """白天还早、侧翼没齐：施工工先补新墙，不跑商店升半血墙。"""
         state, workers = self._day_three_low_front_walls(2, round_no=270)
         commands = self.decide(state)
         keeper = workers[0]
-        self.assertEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
-        self.assertEqual(state.worker_item_jobs[keeper.id]['kind'], 'wall')
+        self.assertNotEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+        self.assertIn(commands[keeper.id].get('action'), ('build', 'move', 'collect'))
 
     def test_front_wall_does_not_override_held_weapon_voucher(self):
         state, workers = self._day_three_low_front_walls(1, gold=100)

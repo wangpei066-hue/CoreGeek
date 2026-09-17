@@ -1058,13 +1058,24 @@ def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, re
     if any(isinstance(item, str) and item.startswith("WeaponUpgradeVoucher") for item in (role.backpack or [])):
         return None
     pending = _pending_item_job_targets(state)
-    while True:
-        wall = _pick_front_wall_below_floor(state, pending, floor=WALL_UPGRADE_HEALTH_RATIO)
-        if wall is None or not night or _night_repair_reachable(role, state, blocked, reserved, wall):
-            break
-        pending = pending | {(wall.pos.x, wall.pos.y)}
-    if wall is None:
-        return None
+    from .opening import staged_walls_incomplete, critical_wall_missing, day_rounds_remaining
+    new_walls_due = staged_walls_incomplete(state) or critical_wall_missing(state)
+    early_day = is_day_round(state.round_no) and day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW
+    if new_walls_due and early_day:
+        # 白天还早且新墙没齐：不跑商店升半血墙，只修即将倒塌的。
+        wall = _pick_damaged_wall(state, pending)
+        if wall is None:
+            return None
+        if night and not _night_repair_reachable(role, state, blocked, reserved, wall):
+            return None
+    else:
+        while True:
+            wall = _pick_front_wall_below_floor(state, pending, floor=WALL_UPGRADE_HEALTH_RATIO)
+            if wall is None or not night or _night_repair_reachable(role, state, blocked, reserved, wall):
+                break
+            pending = pending | {(wall.pos.x, wall.pos.y)}
+        if wall is None:
+            return None
     level = wall.level or 1
     item = voucher_for("wall", level)[0] if level < 3 else "WallFixer"
     if item not in role.backpack and state.team_our.gold_num < item_cost(item, state):
@@ -1386,9 +1397,11 @@ def decide_pioneer_voucher(pioneer: Role, state: "MatchState", blocked: set, res
 
 def builder_on_walls(state: "MatchState", worker: Role) -> bool:
     """第一晚之后，开局定的施工工在防线（正面 + 两翼）没修完前专心修墙。只剩一名工人时不锁定。"""
-    if worker.role_type != "worker" or (state.round_no or 0) < DAY_ROUNDS:
+    if worker.role_type != "worker" or not is_day_round(state.round_no):
         return False
     if sum(1 for r in state.team_our.roles if r.role_type == "worker" and r.health > 0) < 2:
+        return False
+    if sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0) < MAX_WEAPONS:
         return False
     from .opening_schedule import opening_worker_mode
     if opening_worker_mode(state, worker) != "builder":
@@ -1436,7 +1449,9 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             allow_weapon = False  # 施工工防线没修完不专程去买券；人在商店边顺手买、手里有券照常用
     # 第三天起经济工只在正面出现关键缺口时帮墙，其余时间留给采卖矿和武器券。
     economist = day3_worker_duty(state, worker) == 'economist'
-    wall_help = not economist or critical_wall_missing(state)
+    guns_ready = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0) >= MAX_WEAPONS
+    # 三炮未齐时先补武器，墙循环让路；经济工第三天只在正面缺口帮墙。
+    wall_help = guns_ready and (not economist or critical_wall_missing(state))
     cashout = False if builder_focus else in_pre_night_cashout_window(worker, state, blocked, reserved)
     job = state.worker_item_jobs.get(worker.id)
     held_item = bool(job and job.get('item') in worker.backpack)
@@ -1475,6 +1490,14 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=False, allow_build=allow_build)
         if cmd:
             return cmd
+        if handled:
+            heal = decide_self_heal(worker) or decide_buy_medicine(worker, state)
+            if heal:
+                return heal
+            trace(state, worker.id, 'builder_waiting_on_walls',
+                  '施工工本回合没有可走的墙动作，留在防线任务上不转去采铜铁',
+                  allow_build=allow_build, stones=worker.backpack.count('stone'))
+            return None
     continue_job = False
     if job:
         if job.get('kind') == 'station' and job.get('item') in worker.backpack:

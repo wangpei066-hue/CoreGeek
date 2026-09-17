@@ -447,9 +447,9 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
             maybe_start_shop_item_job(worker, state)
         self.assertNotIn(10010, state.worker_item_jobs)
 
-    def test_day3_keeper_repairs_front_wall_even_with_new_wall_backlog(self):
+    def test_day3_keeper_repairs_front_wall_in_dusk_window(self):
         from src.agent.grid import build_blocked_set
-        state = minimal_state(round_no=260, gold_num=1000)
+        state = minimal_state(round_no=312, gold_num=1000)
         state.team_our.roles[0] = make_role(10013, 10, 10, "station", health=1500, level=1)
         keeper = make_role(1, 19, 20, "worker", health=220, back_pack_capability=100)
         economist = make_role(2, 18, 20, "worker", health=220, back_pack_capability=100)

@@ -975,39 +975,63 @@ def worker_wall_muster_rounds(state, role, missing):
     return mine_travel + collect + gap_travel + share * WALL_STEP_SLACK + gun_travel + MUSTER_BUFFER + wall_overrun_margin(state)
 
 
+def worker_one_wall_rounds(state, role):
+    """建完离自己最近的一段墙并回炮的估计，用来判断侧翼能不能开工。"""
+    missing = staged_wall_missing(state)
+    if not missing:
+        return 0
+    if role is None:
+        return worker_wall_muster_rounds(state, None, missing[:1])
+    blocked = build_blocked_set(state)
+    nearest = None
+    best = None
+    for point in missing:
+        path = wall_approach_path(role, Pos(*point), blocked, state)
+        if path is None:
+            continue
+        cost = len(path)
+        if best is None or cost < best:
+            best = cost
+            nearest = point
+    return worker_wall_muster_rounds(state, role, [nearest] if nearest else missing[:1])
+
+
 def full_wall_build_window(state, role=None):
-    """侧翼：按该工人回炮时间开工，不用固定「剩余≤估计+5」。"""
+    """侧翼：回炮前至少能建完一段才开工。正面缺口不走这扇门。"""
     from .tactics import night_wave_cleared
     if night_wave_cleared(state):
         return True
-    if first_night_economy_open(state) or (state.round_no or 0) < 70:
+    if (state.round_no or 0) < 70:
         return True
-    if defense_rounds_remaining(state, role) <= 0:
+    remaining = defense_rounds_remaining(state, role)
+    if remaining <= 0:
         return False
     missing = staged_wall_missing(state)
     if not missing:
         return False
-    return defense_rounds_remaining(state, role) <= worker_wall_muster_rounds(state, role, missing)
+    if role is not None and "stone" in (role.backpack or []):
+        blocked = build_blocked_set(state)
+        gun = station_return_steps(role, state, blocked)
+        if gun is None:
+            gun = MUSTER_BUFFER
+        if any(chebyshev(role.pos, Pos(*point)) == 1 for point in missing):
+            return remaining > gun + 1
+    return remaining > worker_one_wall_rounds(state, role)
 
 
 def worker_should_build_walls(state, role=None):
-    """正面缺口有石就补；侧翼等基本防线形成后再按回炮工时安排。"""
-    from .brain import structure_priority_day
+    """正面缺口有石就补；侧翼在回炮前能建完一段时开工。"""
     from .tactics import night_wave_cleared, night_near_work_allowed
     if night_wave_cleared(state):
         return True
-    if first_night_economy_open(state) or (state.round_no or 0) < 70:
+    if (state.round_no or 0) < 70:
         return True
     if defense_rounds_remaining(state, role) <= 0:
         return bool(night_near_work_allowed(state) and critical_wall_missing(state))
     if critical_wall_missing(state):
         return True
-    if structure_priority_day(state):
-        missing = staged_wall_missing(state)
-        if not missing:
-            return False
-        need = worker_wall_muster_rounds(state, role, missing)
-        return defense_rounds_remaining(state, role) > need
+    if not staged_wall_missing(state):
+        return False
     return full_wall_build_window(state, role)
 
 
@@ -1397,7 +1421,7 @@ STONE_BUILD_ROUNDS = 2  # 每块石头回家后大约要 移动+建造 两回合
 
 
 def keep_collecting_stone(role, state, blocked, reserved, base):
-    """人在石矿边、石头还不够补完整条防线时继续采，攒够一批再回家，不采一块跑一趟。
+    """人在石矿边、石头还不够这一趟批量时继续采。凑够 STONE_BATCH 或缺口数就回家建。
     背包满、离天黑不够“回家 + 建完手上石头”、或矿已采空时才停。"""
     from .brain import is_day_round
     if not is_day_round(state.round_no) or not state.map_info:
@@ -1410,9 +1434,7 @@ def keep_collecting_stone(role, state, blocked, reserved, base):
         return None
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
     need = len(set(primary_wall_plan(state, base)) - existing)
-    carried = sum(r.backpack.count('stone') for r in state.team_our.roles
-                  if r.role_type == 'worker' and r.health > 0 and r.id != role.id)
-    if stones + carried >= need:
+    if stones >= min(need, STONE_BATCH):
         return None
     mines = [z for z in state.map_info.zones
              if z.neutral_type == 'stone' and chebyshev(role.pos, z.pos) <= 1]
@@ -1422,16 +1444,16 @@ def keep_collecting_stone(role, state, blocked, reserved, base):
     if day_rounds_remaining(state.round_no) <= 1 + home + STONE_BUILD_ROUNDS * (stones + 1) + MUSTER_BUFFER:
         return None
     mine = min(mines, key=lambda z: (z.pos.x, z.pos.y))
-    trace(state, role.id, 'stone_batch_collect', '石头还不够补完防线，继续在矿点采集，攒够再回家',
-          stones=stones, need=need, carried_by_others=carried)
+    trace(state, role.id, 'stone_batch_collect', '石头还不够这一趟批量，继续在矿点采集',
+          stones=stones, need=need, batch=STONE_BATCH)
     return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]},
                     '攒够一批石头再回家修墙')
 
 
 def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_build=True):
-    """缺墙就是持续施工任务，缺石主动找石矿，不转去采铜铁。仅工人：开拓者不能 collect/build。"""
-    from .brain import own_station, try_build
-    if role.role_type != 'worker':
+    """缺墙就是持续施工任务，缺石主动找石矿，不转去采铜铁。仅工人白天：开拓者不能 collect/build。"""
+    from .brain import is_day_round, own_station, try_build
+    if role.role_type != 'worker' or not is_day_round(state.round_no):
         return False, None
     base = own_station(state)
     if base is None:
@@ -1455,24 +1477,57 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         clear_mine_target(state, role.id)
         if not allow_build:
             trace(state, role.id, 'stones_reserved_for_late_day',
-                  '正面已封，侧翼留到回炮工时足够时再施工', stones=role.backpack.count('stone'), missing=len(missing))
-            return False, None
+                  '回炮前不够再建一段侧翼，先回院子待命', stones=role.backpack.count('stone'), missing=len(missing))
+            cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
+            return True, cmd
         cmd = try_build(role, state, blocked, reserved)
         if cmd:
             state.policy_memory['wall_work_attempted'] = True
             return True, cmd
-        return False, None
-    from .economy import go_mine
-    if len(role.backpack) < role.back_pack_capability:
-        cmd = go_mine(
-            role, state, blocked, reserved, want_ores=('stone',), purpose='stone',
-            travel_reason='防线尚未完成，专程采石',
-            collect_reason='采集下一段城墙所需石料',
-        )
-        if cmd:
-            return True, cmd
+        cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
+        return True, cmd
+    cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=True)
+    if cmd:
+        return True, cmd
     trace(state, role.id, 'wall_material_blocked', '缺墙但石矿不可达或背包已满', backpack_count=len(role.backpack))
-    return False, None
+    return True, None
+
+
+def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
+    """施工工缺墙却没发出建造时：丢铜铁、回院子、走向缺口或去采石，避免空转去挖铜铁。"""
+    from .brain import own_station
+    from .economy import go_mine, clear_mine_target
+    base = own_station(state)
+    if base is None:
+        return None
+    drop = drop_nonstone_for_walls(role, state)
+    if drop:
+        return drop
+    if not in_courtyard(state, base, role.pos):
+        path = interior_retreat_path(role, blocked | reserved, state)
+        if path:
+            return move_on_path(state, role, path, reserved, '墙外空转，先回院子再施工')
+    if "stone" in role.backpack:
+        clear_mine_target(state, role.id)
+        existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
+        missing = [p for p in primary_wall_plan(state, base) if p not in existing]
+        best = None
+        for point in missing:
+            path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
+            if path is None:
+                continue
+            if best is None or len(path) < len(best):
+                best = path
+        if best:
+            return move_on_path(state, role, best, reserved, '走向最近墙缺口，避免站着空转')
+        return None
+    if not allow_mine or len(role.backpack) >= (role.back_pack_capability or 0):
+        return None
+    return go_mine(
+        role, state, blocked, reserved, want_ores=("stone",), purpose="stone",
+        travel_reason="防线尚未完成，专程采石",
+        collect_reason="采集下一段城墙所需石料",
+    )
 
 
 def adjacent_critical_build(role, state, blocked, reserved):
@@ -1605,6 +1660,9 @@ def safe_wall(state, point, blocked, assignments):
 
 
 def drop_nonstone_for_walls(role, state):
+    cap = role.back_pack_capability or 0
+    if cap and len(role.backpack or []) < cap:
+        return None
     for name in ('copper', 'iron'):
         if name in (role.backpack or []):
             return selected(state, role.id, {'action': 'drop', 'name': name},

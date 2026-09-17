@@ -13,6 +13,7 @@ WEAPON_BUILD_NAMES = ("gatling", "railgun", "rocket")
 WALL_EVENT_CODES = {
     "persistent_wall_plan", "wall_material_blocked", "wall_no_stone", "wall_route_blocked",
     "funnel_layout", "opening_no_candidate", "stones_reserved_for_late_day",
+    "builder_waiting_on_walls", "stone_batch_collect",
 }
 WEAPON_EVENT_CODES = {
     "opening_rockets_first", "await_weapons", "opening_no_gold", "weapon_assignment",

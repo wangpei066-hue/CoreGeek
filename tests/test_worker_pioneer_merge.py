@@ -311,7 +311,8 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertTrue(any(c.get('action') == 'build' and c.get('name') == 'wall' for c in early.values()))
         self.assertFalse(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
 
-    def test_workers_hold_stones_when_only_flanks_missing(self):
+    def test_workers_build_flanks_when_front_is_sealed(self):
+        """正面已齐、白天还早：施工工带着石头应立刻补侧翼，不能空转留石。"""
         state = opening_state()
         state.round_no = 140
         state.team_our.gold_num = 0
@@ -327,8 +328,34 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             worker.backpack = ['stone'] * 8
             worker.pos = Pos(12, 10)
         early = self.decide(state)
-        self.assertFalse(any(c.get('action') == 'build' for c in early.values()))
-        self.assertTrue(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
+        builder_cmd = early.get(1) or {}
+        self.assertIn(builder_cmd.get('action'), ('build', 'move'))
+        if builder_cmd.get('action') == 'build':
+            self.assertEqual(builder_cmd.get('name'), 'wall')
+        self.assertFalse(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
+
+    def test_day3_builder_keeps_building_flanks(self):
+        state = opening_state()
+        state.round_no = 270
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=2),
+            make_role(21, 12, 8, 'rocket', level=2),
+            make_role(22, 12, 12, 'rocket', level=2),
+        ]
+        for y in range(7, 13):
+            state.team_our.roles.append(make_role(40 + y, 13, y, 'wall', health=1000, level=1))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.backpack = ['stone'] * 8
+        builder.pos = Pos(12, 8)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.backpack = []
+        economist.pos = Pos(6, 10)
+        commands = self.decide(state)
+        cmd = commands.get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'))
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
 
 
 class PioneerIdleRegressionTests(unittest.TestCase):
