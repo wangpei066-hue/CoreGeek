@@ -59,7 +59,7 @@ class OpeningTests(unittest.TestCase):
     def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
         ring = wall_ring(state, state.team_our.roles[0])
-        self.assertEqual(len(ring), 19)
+        self.assertEqual(len(ring), 14)  # 单层：正面一列 + 两侧翼，无外层
         # 后方竖边保持开放；侧墙延伸到最靠后的短射程武器列。
         self.assertFalse(any(x == 9 and 7 < y < 12 for x, y in ring))
         self.assertTrue(all(x == 13 for x, y in ring[:6]))
@@ -274,7 +274,7 @@ class OpeningTests(unittest.TestCase):
         base = state.team_our.roles[0]
         base.pos = Pos(30, 8)
         line = wall_ring(state, base)
-        self.assertEqual(len(line), 19)
+        self.assertEqual(len(line), 14)
         self.assertFalse(any(x == 32 and 5 < y < 10 for x, y in line))
         self.assertTrue(all(x == 28 for x, y in line[:6]))
 

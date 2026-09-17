@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from src.agent.brain import V1Strategy, BasicActionValidator
-from src.agent.opening import weapon_candidates, wall_ring, primary_wall_plan, active_wall_plan, outer_wall_ready
+from src.agent.opening import weapon_candidates, wall_ring, primary_wall_plan
 from src.agent.protocol import Pos, RobotRole, Zone
 from src.agent.task_solver import PioneerTaskSolver
 from test_opening import opening_state
@@ -34,6 +34,102 @@ class DefensePriorityTests(unittest.TestCase):
         state.robot.roles = [RobotRole(100, Pos(16, 8), 'largeRobot', 100)]
         commands = self.decide(state)
         self.assertIn('3', {c['controllerId'] for c in commands.values() if c['action'] == 'attack'})
+
+    def test_day_three_worker_upgrades_front_wall_below_half_health(self):
+        state = defended()
+        state.team_our.gold_num = 100
+        state.round_no = 312  # 还有新墙要建时，入夜前窗口内才升级残墙
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        worker.pos = Pos(8, 9)
+        front = primary_wall_plan(state, state.team_our.roles[0])[0]
+        state.team_our.roles.append(make_role(200, front[0], front[1], 'wall', health=400, level=1))
+        commands = self.decide(state)
+        self.assertEqual(commands[worker.id], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 1})
+
+    def _day_three_low_front_walls(self, count, gold=300, round_no=312):
+        state = defended()
+        state.team_our.gold_num = gold
+        state.round_no = round_no
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        workers = [r for r in state.team_our.roles if r.role_type == 'worker']
+        for worker in workers:
+            worker.pos = Pos(8, 9)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])[:count]):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=400, level=1))
+        return state, workers
+
+    def test_day_three_only_wall_keeper_takes_front_wall_jobs(self):
+        state, workers = self._day_three_low_front_walls(2)
+        commands = self.decide(state)
+        keeper, economist = workers[0], workers[1]
+        self.assertEqual(commands[keeper.id]['name'], 'WallUpgradeVoucher1')
+        self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
+        self.assertNotIn(economist.id, state.worker_item_jobs)
+
+    def test_keeper_builds_new_walls_before_upgrading_early_in_day(self):
+        state, workers = self._day_three_low_front_walls(2, round_no=270)
+        commands = self.decide(state)
+        keeper = workers[0]
+        self.assertNotEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+        self.assertNotIn(keeper.id, state.worker_item_jobs)
+
+    def test_front_wall_does_not_override_held_weapon_voucher(self):
+        state, workers = self._day_three_low_front_walls(1, gold=100)
+        keeper = workers[0]
+        keeper.backpack = ['WeaponUpgradeVoucher1']
+        rocket = next(r for r in state.team_our.roles if r.role_type == 'rocket')
+        state.worker_item_jobs[keeper.id] = {
+            'item': 'WeaponUpgradeVoucher1', 'target': (rocket.pos.x, rocket.pos.y), 'kind': 'weapon'}
+        commands = self.decide(state)
+        self.assertEqual(state.worker_item_jobs[keeper.id]['kind'], 'weapon')
+        self.assertNotEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+
+    def _day_three_wall_gap(self, gold, pack):
+        from src.agent.protocol import ShopItem
+        state = defended()
+        state.round_no = 280
+        state.team_our.gold_num = gold
+        state.map_info.zones += [Zone(Pos(8, 9), 'weaponShop'), Zone(Pos(4, 12), 'vendor'),
+                                 Zone(Pos(2, 14), 'copper')]
+        state.vendor_shop_list = [ShopItem('stone', 1), ShopItem('iron', 3), ShopItem('copper', 5)]
+        for i, y in enumerate(range(6, 12)):
+            state.team_our.roles.append(make_role(40 + i, 13, y, 'wall', level=1, health=1000))
+        keeper, economist = [r for r in state.team_our.roles if r.role_type == 'worker']
+        keeper.pos, economist.pos = Pos(12, 9), Pos(5, 12)
+        economist.back_pack_capability = 100
+        economist.backpack = pack
+        return state, keeper, economist
+
+    def test_day_three_economist_clears_pack_before_judging_gold(self):
+        state, keeper, economist = self._day_three_wall_gap(50, ['copper'] * 40)
+        commands = self.decide(state)
+        self.assertEqual(commands[economist.id], {'action': 'sell', 'name': 'copper', 'num': 40})
+        self.assertNotEqual(commands[keeper.id]['action'], 'sell')
+
+    def test_day_three_economist_keeps_wall_stone_when_clearing(self):
+        state, _keeper, economist = self._day_three_wall_gap(50, ['stone'] * 5)
+        commands = self.decide(state)
+        self.assertNotEqual(commands[economist.id]['action'], 'sell')
+
+    def test_day_three_economist_spends_gold_while_keeper_fills_wall_gap(self):
+        from src.agent.opening import critical_wall_missing
+        from src.agent.protocol import ShopItem
+        state = defended()
+        state.round_no = 280
+        state.team_our.gold_num = 400
+        state.map_info.zones += [Zone(Pos(8, 9), 'weaponShop'), Zone(Pos(4, 12), 'vendor'),
+                                 Zone(Pos(2, 14), 'copper')]
+        state.vendor_shop_list = [ShopItem('stone', 1), ShopItem('iron', 3), ShopItem('copper', 5)]
+        for i, y in enumerate(range(6, 12)):
+            state.team_our.roles.append(make_role(40 + i, 13, y, 'wall', level=1, health=1000))
+        keeper, economist = [r for r in state.team_our.roles if r.role_type == 'worker']
+        keeper.pos, economist.pos = Pos(12, 9), Pos(9, 9)
+        self.assertTrue(critical_wall_missing(state))
+        commands = self.decide(state)
+        self.assertEqual(commands[economist.id]['action'], 'buy')
+        self.assertNotEqual(commands[keeper.id]['action'], 'buy')
+        self.assertTrue(any(e['code'] == 'economist_upgrade_during_wall_gap' for e in state.decision_events))
 
     def test_task_pioneer_stays_to_submit_when_answer_ready_before_threat(self):
         """答案已就绪且敌人还来不及打到基地时，留在任务点提交。"""
@@ -201,7 +297,7 @@ class DefensePriorityTests(unittest.TestCase):
             side_y = min(y for _, y in primary)
             self.assertIn((gatling[0], side_y), primary)
 
-    def test_primary_upgrades_precede_outer_construction(self):
+    def test_outer_construction_precedes_healthy_wall_upgrades(self):
         state = defended()
         for building in state.team_our.roles:
             if building.role_type in ('gatling', 'railgun', 'rocket'):
@@ -211,9 +307,7 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         state.team_our.roles[1].backpack = ['stone'] * 4
         commands = self.decide(state)
-        self.assertFalse(outer_wall_ready(state))
-        self.assertEqual(commands[1], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 3})
-        self.assertEqual(active_wall_plan(state, state.team_our.roles[0]), primary_wall_plan(state, state.team_our.roles[0]))
+        self.assertNotEqual(commands[1].get('name'), 'WallUpgradeVoucher1')
 
     def test_level_two_weapons_upgrade_before_walls(self):
         state = defended()
@@ -256,18 +350,6 @@ class DefensePriorityTests(unittest.TestCase):
             state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1500, level=2))
         begin_round(state)
         self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set()))
-
-    def test_outer_unlock_requires_complete_upgraded_healthy_primary_and_weapons(self):
-        state = defended()
-        for r in state.team_our.roles:
-            if r.role_type in ('gatling', 'railgun', 'rocket'):
-                r.level = 2
-        for i, (x, y) in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
-            state.team_our.roles.append(make_role(100+i, x, y, 'wall', health=1500, level=2))
-        self.assertTrue(outer_wall_ready(state))
-        self.assertEqual(active_wall_plan(state, state.team_our.roles[0]), wall_ring(state, state.team_our.roles[0]))
-        state.team_our.roles[-1].health = 100
-        self.assertFalse(outer_wall_ready(state))
 
     def test_breach_uses_bomb_against_single_robot_before_healing(self):
         state = defended()

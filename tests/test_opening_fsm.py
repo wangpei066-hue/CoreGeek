@@ -294,14 +294,13 @@ class OpeningFsmTrailTests(unittest.TestCase):
     def test_opening_wall_work_batches_one_stone_until_late(self):
         """opening_wall_work 单测：早期 1 石继续采，临近入夜才提前补墙。"""
         from src.agent.opening_schedule import opening_wall_work
-        from src.agent.opening import movement_avoid
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
         _rockets(state)
         state.map_info.zones = [Zone(Pos(6, 9), 'stone')]
         worker = next(r for r in state.team_our.roles if r.id == 1)
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
 
         worker.backpack = ['stone']
         state.decision_events = []
@@ -312,7 +311,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
 
         state.round_no = 65
         worker.pos = Pos(12, 7)
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         late_tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')
@@ -332,7 +331,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
     def test_survival_fallback_batches_one_stone_until_ready(self):
         """兜底施工也不能一块石头一趟墙，避免绕开 opening_wall_work 的批量规则。"""
         from src.agent.opening import opening_worker_survival_action
-        from src.agent.opening import assign_weapons, movement_avoid, survival_wall_missing
+        from src.agent.opening import assign_weapons, survival_wall_missing
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -340,7 +339,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.map_info.zones = [Zone(Pos(6, 9), 'stone')]
         worker = next(r for r in state.team_our.roles if r.id == 1)
         worker.backpack = ['stone']
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         cmd, status = opening_worker_survival_action(
             worker, state, blocked, set(), set(), assign_weapons(state), survival_wall_missing(state))
         self.assertEqual(status, 'MINE_STONE')
@@ -348,7 +347,6 @@ class OpeningFsmTrailTests(unittest.TestCase):
 
     def test_claimed_mine_does_not_force_large_detour(self):
         from src.agent.opening_schedule import choose_nearest_mine
-        from src.agent.opening import movement_avoid
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -357,14 +355,13 @@ class OpeningFsmTrailTests(unittest.TestCase):
         worker.pos = Pos(7, 9)
         state.map_info.zones = [Zone(Pos(6, 9), 'stone'), Zone(Pos(20, 20), 'stone')]
         state.policy_memory['mine_targets'] = {'2': {'x': 6, 'y': 9, 'ore': 'stone'}}
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         mine, path, reason = choose_nearest_mine(worker, state, blocked, set(), ('stone',))
         self.assertEqual((mine.pos.x, mine.pos.y), (6, 9))
         self.assertEqual(path, [])
 
     def test_clearly_closer_mine_breaks_sticky_goal(self):
         from src.agent.opening_schedule import choose_nearest_mine
-        from src.agent.opening import movement_avoid
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -378,7 +375,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
                 'target_pos': [20, 20], 'stalled_rounds': 0, 'last_pos': [7, 9],
             }
         }
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         mine, path, reason = choose_nearest_mine(worker, state, blocked, set(), ('stone',))
         self.assertEqual((mine.pos.x, mine.pos.y), (6, 9))
         self.assertEqual(reason, 'clearly_closer')
@@ -386,7 +383,6 @@ class OpeningFsmTrailTests(unittest.TestCase):
     def test_wall_stage_sells_metal_even_when_backpack_not_full(self):
         """回归：修墙阶段背包没满也不能一直攥着铜铁不出手，浪费到入夜。"""
         from src.agent.opening_schedule import opening_wall_work
-        from src.agent.opening import movement_avoid
         state = opening_state()
         state.round_no = 45
         state.team_our.gold_num = 0
@@ -397,7 +393,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.vendor_shop_list = [ShopItem('iron', 3)]
         worker = next(r for r in state.team_our.roles if r.id == 1)
         worker.backpack = ['iron'] * 10  # 远没塞满 100 容量的背包
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         state.decision_events = []
         opening_wall_work(worker, state, blocked, set(), set(), {})
         tick = next(e for e in state.decision_events if e['code'] == 'opening_worker_tick')

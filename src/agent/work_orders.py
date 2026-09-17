@@ -180,7 +180,7 @@ def wall_feasible_target(state, blocked=None):
     """
     from .brain import own_station
     from .grid import build_blocked_set
-    from .opening import primary_wall_plan, movement_avoid
+    from .opening import primary_wall_plan
     base = own_station(state)
     if base is None:
         return 0
@@ -188,7 +188,7 @@ def wall_feasible_target(state, blocked=None):
     if isinstance(cached, tuple) and cached[0] == state.round_no:
         return cached[1]
     if blocked is None:
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
     plan_slots = len(primary_wall_plan(state, base))
     built_on_plan = sum(1 for p in primary_wall_plan(state, base)
                         if any(r.role_type == 'wall' and r.health > 0 and (r.pos.x, r.pos.y) == p

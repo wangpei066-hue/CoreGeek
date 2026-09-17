@@ -4,7 +4,7 @@ import unittest
 from src.agent import work_orders as wo
 from src.agent.grid import build_blocked_set
 from src.agent.opening import (
-    assign_weapons, movement_avoid, primary_wall_plan, safe_wall, staged_wall_plan,
+    assign_weapons, primary_wall_plan, safe_wall, staged_wall_plan,
     survival_wall_missing, weapon_slots,
 )
 from src.agent.opening_schedule import (
@@ -26,7 +26,7 @@ def scene(round_no=30):
 
 
 def blocked_of(state):
-    return build_blocked_set(state) | movement_avoid(state)
+    return build_blocked_set(state)
 
 
 def builder(state):
