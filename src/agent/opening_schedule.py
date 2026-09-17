@@ -362,9 +362,17 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
         else:
             value_score = length
         claimed = 1 if pos in occupied else 0
+        attack_penalty = 0
+        if want <= {'stone'}:
+            from .brain import own_station
+            from .opening import attack_side_of_front
+            base = own_station(state)
+            if base is not None and attack_side_of_front(state, base, mine.pos):
+                attack_penalty = 1
         row = dict(
             claimed=claimed, value_score=value_score, length=length, mine=mine,
             path=path, pos=pos, relaxed_reserved=relaxed_reserved,
+            attack_penalty=attack_penalty,
         )
         candidates.append(row)
         if sticky and pos == sticky:
@@ -372,10 +380,10 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
     if not candidates:
         return None, None, 'unreachable'
 
-    nearest = min(candidates, key=lambda row: (row['length'], row['claimed'], row['value_score'], row['pos']))
+    nearest = min(candidates, key=lambda row: (row['attack_penalty'], row['length'], row['claimed'], row['value_score'], row['pos']))
     best_unclaimed = min(
         (row for row in candidates if not row['claimed']),
-        key=lambda row: (row['value_score'], row['length'], row['pos']),
+        key=lambda row: (row['attack_penalty'], row['value_score'], row['length'], row['pos']),
         default=None,
     )
     if best_unclaimed is None:
@@ -385,6 +393,8 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
     else:
         best = best_unclaimed
 
+    if sticky_cand is not None and sticky_cand.get('attack_penalty') and any(not row['attack_penalty'] for row in candidates):
+        sticky_cand = None
     if sticky_cand is not None:
         stalled = int((goal or {}).get('stalled_rounds') or 0)
         oscillating = bool((goal or {}).get('oscillation_detected'))
@@ -567,8 +577,12 @@ def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
 
 
 def opening_muster(role, state, blocked, reserved, assignments, stage):
-    from .opening import weapon_approach_path
+    from .opening import builder_dual_rocket, weapon_approach_path
     weapon = assignments.get(role.id)
+    if opening_worker_mode(state, role) == 'builder':
+        night_weapon = builder_dual_rocket(state, role)
+        if night_weapon is not None:
+            weapon = night_weapon
     if weapon is None or weapon.health <= 0:
         trace(state, role.id, 'opening_muster_no_weapon', '回防时没有分配到存活武器，本回合无命令',
               stage=stage, assignment_found=weapon is not None,
@@ -652,11 +666,13 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
               stone_carried_to_day2=None if choice is None else choice['stone_carried_to_day2'])
 
     # BUILD_WALL_BATCH：手上有石、还有墙位就连续修，中途不跳回普通采矿/卖矿/等待。
-    prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY'
+    # 人已经贴着缺口时不要为了凑批次再跑去矿上绕路。
+    at_gap = any(chebyshev(role.pos, Pos(*p)) == 1 for p in slots)
+    prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY' and stones <= 0
     build_now = bool(
         stones > 0 and slots and not prefer_gather
         and (pack_full or batch_ready or urgent_ready or mine_exhausted
-             or previous == 'BUILD_WALL_BATCH')
+             or previous == 'BUILD_WALL_BATCH' or at_gap)
     )
     if build_now:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
@@ -921,7 +937,7 @@ def plan_opening_fsm(state):
         plan_pioneer_tasks, is_day_round,
     )
     from .opening import (
-        MUSTER_BUFFER, assign_weapons, day_rounds_remaining, opening_has_voucher,
+        MUSTER_BUFFER, assign_weapons, builder_dual_rocket, day_rounds_remaining, opening_has_voucher,
         weapon_approach_path, live_l2_weapon_count, survival_wall_missing,
     )
     from .tactics import imminent_contact
@@ -944,6 +960,14 @@ def plan_opening_fsm(state):
     assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
     travel = [weapon_approach_path(r, assignments[r.id], blocked, set(), state)
               for r in fighters if r.id in assignments]
+    reachable = [len(p) for p in travel if p is not None]
+    if travel and not reachable:
+        muster_need = remaining + MUSTER_BUFFER
+    else:
+        muster_need = max(reachable + [0]) + MUSTER_BUFFER
+    if imminent_contact(state):
+        muster_need = remaining
+    stage = resolve_opening_stage(state, remaining=remaining, muster_need=muster_need)
     reachable = [len(p) for p in travel if p is not None]
     if travel and not reachable:
         muster_need = remaining + MUSTER_BUFFER
@@ -1003,6 +1027,16 @@ def plan_opening_fsm(state):
     role_travel = {}
     for role, path in zip((r for r in fighters if r.id in assignments), travel):
         role_travel[role.id] = None if path is None else len(path)
+    builder_id = opening_worker_roles(state).get('builder')
+    builder_role = next((r for r in fighters if r.id == builder_id), None)
+    night_weapon = builder_dual_rocket(state, builder_role) if builder_role else None
+    if builder_role is not None and night_weapon is not None:
+        bpath = weapon_approach_path(builder_role, night_weapon, blocked, set(), state)
+        night_travel = None if bpath is None else len(bpath)
+        day_travel = role_travel.get(builder_role.id)
+        # 白天按当前炮位继续施工；只在走去双火箭位已经来得及的最后窗口才改用夜里估时。
+        if night_travel is not None and remaining <= night_travel + MUSTER_BUFFER:
+            role_travel[builder_role.id] = night_travel if day_travel is None else max(day_travel, night_travel)
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
         if role.id in task_pioneers and stage != STAGE_MUSTER:
             continue
