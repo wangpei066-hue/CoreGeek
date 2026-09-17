@@ -389,17 +389,21 @@ def wall_priority(state, base, point):
 
 
 def weapon_slot_plan(state, base):
-    """武器编位：前排两侧一火箭一电磁，火箭侧后方再补一门火箭。"""
+    """武器编位（布局 C）：两门火箭竖排在院子后列、紧贴基地背面；电磁炮在前列、与基地上一行同高。
+
+    火箭射程覆盖全图，放后面不影响打击，还有基地挡在前面；两门火箭共用的操控位在基地正后方
+    （后方开口外一格），不和电磁炮手、施工通道抢格子。电磁炮射程短，放在前列。
+    院内其余格子全部空出来，16 段墙都能从院内砌。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front_x = (right if direction == 1 else left) - direction
-    rear_x = front_x - direction
-    y_low, y_high = bottom + 1, top - 1
+    rear_x = (left if direction == 1 else right) + direction
+    upper_y, lower_y = base.pos.y - 1, base.pos.y
     width, height = state.map_info.width, state.map_info.height
     slots = [
-        ('rocket', (front_x, y_low)),
-        ('railgun', (front_x, y_high)),
-        ('rocket', (rear_x, y_low)),
+        ('rocket', (rear_x, upper_y)),
+        ('railgun', (front_x, upper_y)),
+        ('rocket', (rear_x, lower_y)),
     ]
     station = {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
     cleaned = []
@@ -1484,11 +1488,29 @@ def best_voucher_worker(state, workers, blocked):
 
 
 def station_path(role, weapon, blocked, state):
-    """操控位置不能停在未来墙体缺口上，避免堵塞回城通道。"""
+    """操控位置不能停在未来墙体缺口上，避免堵塞回城通道。
+    施工工（每晚守双火箭的人）优先回到两门火箭的共用操控位，入夜后不用再绕路过去；
+    其他人回火箭旁时不占共用位，免得施工工天黑时被挤到只挨一门火箭的格子上。"""
+    from .opening_schedule import opening_worker_mode
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
     ring = set(wall_ring(state, base)) if base else set()
+    shared = set()
+    if weapon is not None and weapon.role_type == 'rocket':
+        _partner, shared = dual_rocket_partner(state, weapon, blocked)
+        if opening_worker_mode(state, role) == 'builder':
+            here = (role.pos.x, role.pos.y)
+            if here in shared:
+                return []
+            free = {c for c in shared if c not in blocked}
+            if free:
+                path = path_to_any(role.pos, free, blocked, state.map_info.width, state.map_info.height)
+                if path is not None:
+                    return path
+            shared = set()
     goals = {(p.x, p.y) for p in neighbors8(weapon.pos, state.map_info.width, state.map_info.height)
              if (p.x, p.y) not in ring and ((p.x, p.y) not in blocked or p == role.pos)}
+    if goals - shared:
+        goals -= shared
     return path_to_any(role.pos, goals, blocked, state.map_info.width, state.map_info.height)
 
 
@@ -1510,6 +1532,28 @@ def dual_rocket_stands(state, first, second, blocked):
         if (p.x, p.y) not in ring and (p.x, p.y) not in obstacles
     }
     return first_goals & second_goals
+
+
+def shared_rocket_stand_cells(state, blocked):
+    """所有火箭两两之间的共用操控位（队友站着不算占用）。"""
+    rockets = [r for r in state.team_our.roles if r.role_type == 'rocket' and r.health > 0]
+    cells = set()
+    for first, second in combinations(rockets, 2):
+        cells |= dual_rocket_stands(state, first, second, blocked)
+    return cells
+
+
+def step_off_cells(role, avoid, blocked, state):
+    """从 avoid 里的格走到最近的不在 avoid 里、不在迎敌外侧的空格。"""
+    here = (role.pos.x, role.pos.y)
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    width, height = state.map_info.width, state.map_info.height
+    obstacles = set(blocked) - {here}
+    goals = {(x, y) for x in range(max(0, role.pos.x - 4), min(width, role.pos.x + 5))
+             for y in range(max(0, role.pos.y - 4), min(height, role.pos.y + 5))
+             if (x, y) not in avoid and (x, y) not in obstacles
+             and not (base and attack_side_of_front(state, base, Pos(x, y)))}
+    return path_to_any(role.pos, goals, obstacles, width, height)
 
 
 def dual_rocket_partner(state, weapon, blocked):

@@ -2188,11 +2188,23 @@ def plan_night(state: "MatchState") -> dict:
         trace(state, None, "night_fixed_defense",
               "未清波：两人三炮，一名工人去后院采矿；开拓者留守不接任务")
     urgent = pressure(state) or front_breached(state)
-    released_worker, released_cmd = (None, None) if task_pioneers else _night_worker_release(state, blocked, reserved)
+    # 双火箭共用操控位留给守火箭的人：外出的人不能在这些格上采矿、也不从上面走，否则一门火箭整夜没人开。
+    from .opening import shared_rocket_stand_cells, step_off_cells
+    rocket_stands = shared_rocket_stand_cells(state, blocked)
+    release_reserved = set(reserved) | rocket_stands
+    released_worker, released_cmd = ((None, None) if task_pioneers
+                                      else _night_worker_release(state, blocked, release_reserved))
+    reserved |= release_reserved - rocket_stands
     excluded = set(task_pioneers)
     exit_hold = set()
     if released_worker is not None:
         excluded.add(released_worker.id)
+        here = (released_worker.pos.x, released_worker.pos.y)
+        if here in rocket_stands and (released_cmd or {}).get('action') != 'move':
+            step = step_off_cells(released_worker, rocket_stands, blocked | reserved, state)
+            if step:
+                released_cmd = move_on_path(state, released_worker, step, reserved,
+                                            "外出的人让开双火箭共用操控位")
         commands[released_worker.id] = released_cmd
         # 外出的人还在院里：把他出院要经过的格留给他，守炮的人本回合不先站上去把他堵住。
         # 只限制本回合的落脚格，不当成整条路线的障碍（远处的人照常规划回炮路线）。

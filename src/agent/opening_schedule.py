@@ -629,14 +629,16 @@ def opening_muster_step(role, state, blocked, reserved, assignments, stage):
                  if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id != role.id}
     detoured = False
     if weapon.role_type == 'rocket' and path:
-        # 回防只要站到这门火箭旁边就能开火；双火箭共用位是夜里冷却时再去的（plan_night）。
-        # 去共用位的路不把队友当障碍，常要穿过别人守着或正走过的格子，每回合结论都在变，
-        # 会让两个火箭手在院里来回走。这里按队友当障碍，走到本炮任一邻格就算到位。
-        from .opening import adjacent_path
-        if chebyshev(role.pos, weapon.pos) <= 1 and role.pos != weapon.pos:
+        # 回防按队友当障碍找路（去共用位的通用路线不把队友当障碍，结论每回合都在变，会来回走）。
+        # station_path：施工工直接回双火箭共用位，其他人站本炮普通邻格、不占共用位。
+        from .opening import dual_rocket_partner, station_path
+        _partner, shared = dual_rocket_partner(state, weapon, blocked)
+        at_shared = (role.pos.x, role.pos.y) in shared
+        if chebyshev(role.pos, weapon.pos) <= 1 and role.pos != weapon.pos and (
+                at_shared or opening_worker_mode(state, role) != 'builder'):
             path = []
         else:
-            alt = adjacent_path(role, weapon.pos, blocked | reserved, state)
+            alt = station_path(role, weapon, blocked | reserved, state)
             if alt is not None:
                 path = alt
                 detoured = True

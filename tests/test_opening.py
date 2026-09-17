@@ -178,17 +178,53 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] == 'SURVIVAL_WALL'
                             for e in state.decision_events))
 
-    def test_two_weapons_on_rear_rank_one_cell_forward(self):
-        from src.agent.opening import weapon_slot_plan, weapon_slots
-        state = opening_state()
-        plan = weapon_slot_plan(state, state.team_our.roles[0])
-        slots = weapon_slots(state, state.team_our.roles[0])
-        self.assertEqual(len(slots), 3)
-        self.assertEqual([name for name, _point in plan], ['rocket', 'railgun', 'rocket'])
-        self.assertEqual(slots[0][0], slots[1][0])
-        self.assertEqual(slots[2][0], slots[0][0] - 1)
-        self.assertEqual(slots[0][1], slots[2][1])
-        self.assertNotEqual(slots[0][1], slots[1][1])
+    def test_layout_c_rockets_behind_station_railgun_front(self):
+        """布局 C：火箭竖排在后列贴着基地背面，电磁炮在前列；左右两种基地朝向对称。
+
+        两门火箭必须有共用操控格；16 段墙每段都要有院内邻格可站（不被炮/基地占住）。
+        """
+        from src.agent.grid import neighbors8
+        from src.agent.opening import (
+            attack_direction, courtyard_cells, dual_rocket_stands, rear_gate_cells,
+            wall_ring, weapon_slot_plan,
+        )
+        for base_x in (10, 29):
+            with self.subTest(base_x=base_x):
+                state = opening_state()
+                base = state.team_our.roles[0]
+                base.pos = Pos(base_x, 10)
+                plan = weapon_slot_plan(state, base)
+                self.assertEqual([name for name, _point in plan], ['rocket', 'railgun', 'rocket'])
+                (_, rocket_a), (_, railgun), (_, rocket_b) = plan
+                direction = attack_direction(state, base)
+                yard = courtyard_cells(state, base)
+                self.assertTrue({rocket_a, railgun, rocket_b} <= yard)
+                self.assertEqual(rocket_a[0], rocket_b[0])
+                self.assertEqual({rocket_a[1], rocket_b[1]}, {base.pos.y - 1, base.pos.y})
+                station_rear = base.pos.x - 1 if direction == 1 else base.pos.x + 2
+                self.assertEqual(rocket_a[0], station_rear)
+                self.assertGreater((railgun[0] - rocket_a[0]) * direction, 0)
+                self.assertEqual(railgun[1], base.pos.y - 1)
+                occupied = {
+                    (base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)
+                } | {rocket_a, railgun, rocket_b}
+                width, height = state.map_info.width, state.map_info.height
+                for wall in wall_ring(state, base):
+                    stands = [
+                        (p.x, p.y) for p in neighbors8(Pos(*wall), width, height)
+                        if (p.x, p.y) in yard and (p.x, p.y) not in occupied
+                    ]
+                    self.assertTrue(stands, wall)
+                self.assertTrue(rear_gate_cells(state, base) - occupied)
+                state.team_our.roles += [
+                    make_role(20, rocket_a[0], rocket_a[1], 'rocket'),
+                    make_role(21, rocket_b[0], rocket_b[1], 'rocket'),
+                ]
+                stands = dual_rocket_stands(
+                    state, state.team_our.roles[-2], state.team_our.roles[-1],
+                    build_blocked_set(state),
+                )
+                self.assertTrue(stands)
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
         state = opening_state()

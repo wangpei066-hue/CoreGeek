@@ -746,8 +746,8 @@ class NightRouteTests(unittest.TestCase):
 
 
 def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):
-    """按正式炮位编制布三门炮和整圈单层墙。"""
-    from src.agent.opening import wall_ring, weapon_slot_plan
+    """按正式炮位编制布三门炮和整圈单层墙。人站在院内空位，不和炮/墙/基地重叠。"""
+    from src.agent.opening import courtyard_cells, wall_ring, weapon_slot_plan
     state = opening_state()
     state.round_no = round_no
     state.team_our.gold_num = 0
@@ -759,7 +759,28 @@ def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):
         state.team_our.roles.append(make_role(20 + i, x, y, name, level=level, attack_range=20, health=1000))
     for i, (x, y) in enumerate(wall_ring(state, base)):
         state.team_our.roles.append(make_role(100 + i, x, y, 'wall', level=1, health=1000))
+    occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                if r.role_type not in ('worker', 'pioneer')}
+    free = [c for c in sorted(courtyard_cells(state, base)) if c not in occupied]
+    for role in state.team_our.roles:
+        if role.role_type not in ('worker', 'pioneer'):
+            continue
+        here = (role.pos.x, role.pos.y)
+        if here in occupied:
+            cell = free.pop(0)
+            role.pos = Pos(*cell)
+            occupied.add(cell)
+        else:
+            occupied.add(here)
     return state
+
+
+def _dual_rocket_stand(state):
+    from src.agent.grid import build_blocked_set
+    from src.agent.opening import dual_rocket_stands
+    rockets = [r for r in state.team_our.roles if r.role_type == 'rocket']
+    stands = dual_rocket_stands(state, rockets[0], rockets[1], build_blocked_set(state))
+    return Pos(*sorted(stands)[0])
 
 
 class ThirdNightRepairTests(unittest.TestCase):
@@ -778,7 +799,7 @@ class ThirdNightRepairTests(unittest.TestCase):
     def test_builder_stays_on_dual_rockets_under_pressure(self):
         """夜里有压力也先守双火箭，不用墙券把施工工从炮位拉开。"""
         state, builder = self._pressure_state((13, 10))
-        builder.pos = Pos(12, 10)
+        builder.pos = _dual_rocket_stand(state)
         commands = self.decide(state)
         self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
         self.assertIn(str(builder.id), state.policy_memory.get('weapon_assignment', {}))
@@ -832,7 +853,8 @@ class HeldVoucherAndNightRouteTests(unittest.TestCase):
         for weapon in state.team_our.roles:
             if weapon.role_type in ('rocket', 'railgun'):
                 weapon.attack_range = 3  # 敌人在射程外
-        gunner = next(r for r in state.team_our.roles if r.id == 2)
+        gunner = next(r for r in state.team_our.roles if r.id == 1)
+        gunner.pos = _dual_rocket_stand(state)
         gunner.backpack = ['WeaponUpgradeVoucher1']
         commands = self.decide(state)
         self.assertEqual(commands[gunner.id]['action'], 'use')
@@ -872,7 +894,7 @@ class ChainVoucherTests(unittest.TestCase):
         from src.agent.brain import maybe_start_shop_item_job
         state = _slot_layout_state(150, levels=(1, 1, 1))
         railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
-        worker = make_role(1, railgun.pos.x - 1, railgun.pos.y, 'worker',
+        worker = make_role(1, railgun.pos.x, railgun.pos.y + 1, 'worker',
                            back_pack_capability=100, backpack=['WeaponUpgradeVoucher1'])
         maybe_start_shop_item_job(worker, state)
         target = tuple(state.worker_item_jobs[1]['target'])
@@ -1022,7 +1044,11 @@ class DayAssignmentMatchesNightLayoutTests(unittest.TestCase):
                 state = _slot_layout_state(round_no)
                 pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
                 rocket = next(r for r in state.team_our.roles if r.role_type == 'rocket')
-                pioneer.pos = Pos(rocket.pos.x - 1, rocket.pos.y + 1)  # 白天正好站在火箭旁
+                stand = Pos(rocket.pos.x, rocket.pos.y - 1)  # 一门火箭旁，但不是双火箭共用位
+                for other in state.team_our.roles:
+                    if other.id != pioneer.id and (other.pos.x, other.pos.y) == (stand.x, stand.y):
+                        other.pos = Pos(11, 11)
+                pioneer.pos = stand
                 weapon = assign_weapons(state).get(pioneer.id)
                 self.assertIsNotNone(weapon)
                 self.assertNotEqual(weapon.role_type, 'rocket', (round_no, weapon))
@@ -1037,6 +1063,10 @@ class NightPressureRecallTests(unittest.TestCase):
         eco = next(r for r in state.team_our.roles if r.id == 2)
         eco.pos = Pos(4, 10)  # 已在后院矿旁
         eco.backpack = list(backpack)
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(10, 20)
+        pioneer.pos = Pos(20, 20)
         state.policy_memory['night_released_worker'] = eco.id
         # 6 个机器人在基地 7 格内：pressure 成立；守炮两人还没站到炮位旁。
         state.robot.roles = [RobotRole(1000 + i, Pos(15, 7 + i), 'smallRobot', 40) for i in range(6)]
