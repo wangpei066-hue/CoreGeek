@@ -791,6 +791,53 @@ class FixtureNightMinerTests(unittest.TestCase):
                 self.assertNotIn('emergency_front_seal', codes)
 
 
+class NightPressureRecallTests(unittest.TestCase):
+    """敌人逼近时叫外出工人回防：前两夜不叫；第三夜起只有带着能在家用上的道具才叫。"""
+
+    def _state(self, round_no, backpack):
+        state = _slot_layout_state(round_no)
+        state.map_info.zones = [Zone(Pos(3, 10), 'iron'), Zone(Pos(4, 6), 'stone')]
+        eco = next(r for r in state.team_our.roles if r.id == 2)
+        eco.pos = Pos(4, 10)  # 已在后院矿旁
+        eco.backpack = list(backpack)
+        state.policy_memory['night_released_worker'] = eco.id
+        # 6 个机器人在基地 7 格内：pressure 成立；守炮两人还没站到炮位旁。
+        state.robot.roles = [RobotRole(1000 + i, Pos(15, 7 + i), 'smallRobot', 40) for i in range(6)]
+        return state, eco
+
+    def _decide_released(self, state, eco):
+        from src.agent.tactics import pressure
+        self.assertTrue(pressure(state))
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        codes = {e['code'] for e in state.decision_events if e.get('role_id') == eco.id}
+        return commands.get(eco.id), codes
+
+    def test_first_two_nights_never_recall(self):
+        for round_no in (80, 210):
+            for backpack in ([], ['WallFixer']):
+                with self.subTest(round_no=round_no, backpack=backpack):
+                    state, eco = self._state(round_no, backpack)
+                    cmd, codes = self._decide_released(state, eco)
+                    self.assertIn('night_worker_released_to_economy', codes)
+                    self.assertNotIn('night_worker_release_uncovered', codes)
+                    self.assertEqual((cmd or {}).get('action'), 'collect', cmd)
+
+    def test_third_night_empty_handed_stays_out(self):
+        for backpack in ([], ['Medicine']):
+            with self.subTest(backpack=backpack):
+                state, eco = self._state(340, backpack)
+                cmd, codes = self._decide_released(state, eco)
+                self.assertNotIn('night_worker_release_uncovered', codes)
+                self.assertEqual((cmd or {}).get('action'), 'collect', cmd)
+
+    def test_third_night_recalls_worker_carrying_defense_item(self):
+        state, eco = self._state(340, ['WallFixer'])
+        cmd, codes = self._decide_released(state, eco)
+        self.assertIn('night_worker_release_uncovered', codes)
+        self.assertEqual((cmd or {}).get('action'), 'move', cmd)
+        self.assertGreater(cmd['targetPos'][0]['x'], eco.pos.x)  # 往基地方向走
+
+
 class NightTwoOnThreeSimulationTests(unittest.TestCase):
     """正式炮位布局下连跑一段夜战：机器人逼近并贴墙开打，也始终两人三炮、一名工人在后院。"""
 

@@ -1408,8 +1408,22 @@ def dual_rocket_path(role, weapon, blocked, state):
     return path_to_any(role.pos, stands, blocked, state.map_info.width, state.map_info.height)
 
 
-def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
-    """两人三炮规则：排除指定角色后，剩下的人（一人站双火箭共同邻格轮流开火）能否及时覆盖全部武器。"""
+# 外出的人带着这些东西回家才有用：升级券、修墙道具、战斗道具。空手回来改变不了火箭冷却。
+HOME_DEFENSE_ITEMS = frozenset({
+    'WeaponUpgradeVoucher1', 'WeaponUpgradeVoucher2',
+    'WallUpgradeVoucher1', 'WallUpgradeVoucher2',
+    'StationUpgradeVoucher1', 'StationUpgradeVoucher2',
+    'WallFixer', 'Bomb', 'DizzyWeapon',
+})
+
+
+def carries_home_defense_item(role):
+    return any(item in HOME_DEFENSE_ITEMS for item in (role.backpack or []))
+
+
+def guns_covered_without(state, excluded_ids, blocked, max_travel=None, enemy_timing=True):
+    """两人三炮规则：排除指定角色后，剩下的人（一人站双火箭共同邻格轮流开火）能否覆盖全部武器。
+    enemy_timing=False 时只看结构上能不能覆盖（都有路、三门都有人），不因敌人逼近判成“守不住”。"""
     weapons = {r.id for r in state.team_our.roles
                if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0}
     if not weapons:
@@ -1425,6 +1439,8 @@ def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
         path = weapon_approach_path(fighter, weapon, blocked, set(), state) if fighter else None
         if path is None:
             return False
+        if not enemy_timing:
+            continue
         if max_travel is not None:
             # 有压力时大家都在家：守炮的人必须已经在炮位旁（最多再走 max_travel 步）。
             if len(path) > max_travel:

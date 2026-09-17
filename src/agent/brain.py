@@ -2045,18 +2045,19 @@ def _night_worker_release(state, blocked, reserved):
     - 前两夜：优先放经济工去后院采矿，施工工和开拓者守三炮。
     - 第三夜起：优先放施工工，经济工一人守双火箭、开拓者开另一门。
     - 偏好的人出不去（被炮位夹角堵住）或没事可做时，换另一名工人。
-      有防守压力时先在家用升级券/修墙包给残墙回血（夜里不能建造），没墙可修就去后院采矿。
-      两人已守住三炮，外出的人不需要赶在敌人之前回来。
+    - 敌人逼近/有压力时叫人回防：前两夜一律不叫（火箭 3 回合冷却，空手回来改变不了什么），
+      只要剩下两人结构上能覆盖三炮就继续在外面干活；第三夜起只有外出的人身上带着
+      升级券、修墙道具或战斗道具时才按压力叫回，回来先在家用道具给残墙回血（夜里不能建造）。
     - 只放站在安全处（不在正面、机器人及其进攻路线上）的人；外出只走完全避险的路线。"""
     later_night = structure_priority_day(state)
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
         return None, None
-    from .opening import guns_covered_without, night_danger_cells
+    from .opening import carries_home_defense_item, guns_covered_without, night_danger_cells
     from .opening_schedule import opening_worker_mode
     from .tactics import front_breached, pressure
     wanted = "builder" if later_night else "economist"
-    under_pressure = later_night and (pressure(state) or front_breached(state))
+    pressed = pressure(state) or front_breached(state)
     # 按分工偏好排序，但不死认一个人：偏好的人被堵在炮位夹角里出不去、没矿可去时，换另一名工人出去。
     # 上一回合放出去的人优先继续外出，避免两名工人来回换班。
     previous = state.policy_memory.get("night_released_worker")
@@ -2075,8 +2076,12 @@ def _night_worker_release(state, blocked, reserved):
             # 还站在正面/机器人进攻路线上：先按守炮的人沿避险路线撤回基地，撤到安全处再放出去。
             trace(state, worker.id, "night_worker_release_unsafe", "人还在危险区，先撤回基地再外出")
             continue
-        covered = (guns_covered_without(state, {worker.id}, blocked, max_travel=NIGHT_REPAIR_GUNNER_TRAVEL)
-                   if under_pressure else guns_covered_without(state, {worker.id}, blocked))
+        recall_on_pressure = later_night and carries_home_defense_item(worker)
+        under_pressure = recall_on_pressure and pressed
+        if under_pressure:
+            covered = guns_covered_without(state, {worker.id}, blocked, max_travel=NIGHT_REPAIR_GUNNER_TRAVEL)
+        else:
+            covered = guns_covered_without(state, {worker.id}, blocked, enemy_timing=recall_on_pressure)
         if not covered:
             trace(state, worker.id, "night_worker_release_uncovered", "放这名工人后剩下两人守不住三炮")
             continue
@@ -2086,9 +2091,9 @@ def _night_worker_release(state, blocked, reserved):
                 cmd = decide_worker_day(worker, state, blocked, reserved)
                 reason = "前两夜两人三炮：一名工人去后院采矿，另一名工人与开拓者守炮"
             else:
-                # 两人已守住三炮，外出的人不需要赶在敌人之前回来。有压力先在家修残墙，没墙可修就去后院采矿。
+                # 有压力且带着道具：先在家修残墙；否则照常去后院采矿。
                 cmd = maintain_front_wall_health(worker, state, blocked, reserved) if under_pressure else None
-                reason = "第三夜起有压力：两人守三炮，另一名工人在家用道具修残墙（夜里不建造）"
+                reason = "第三夜起有压力且带着道具：两人守三炮，另一名工人在家用道具修残墙（夜里不建造）"
                 if not cmd:
                     cmd = decide_worker_day(worker, state, blocked, reserved)
                     reason = "第三夜起：两人守三炮，另一名工人先修残墙再去后院采矿"
@@ -2181,12 +2186,14 @@ def plan_night(state: "MatchState") -> dict:
     urgent = pressure(state) or front_breached(state)
     released_worker, released_cmd = (None, None) if task_pioneers else _night_worker_release(state, blocked, reserved)
     excluded = set(task_pioneers)
+    exit_hold = set()
     if released_worker is not None:
         excluded.add(released_worker.id)
         commands[released_worker.id] = released_cmd
         # 外出的人还在院里：把他出院要经过的格留给他，守炮的人本回合不先站上去把他堵住。
+        # 只限制本回合的落脚格，不当成整条路线的障碍（远处的人照常规划回炮路线）。
         from .opening import yard_exit_cells
-        reserved |= yard_exit_cells(released_worker, state, blocked)
+        exit_hold = yard_exit_cells(released_worker, state, blocked)
     assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
     fighters = [r for r in state.team_our.roles
                 if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]
@@ -2275,9 +2282,18 @@ def plan_night(state: "MatchState") -> dict:
         trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
         from .opening import night_danger_cells
         danger = night_danger_cells(state, include_front=False) - {(fighter.pos.x, fighter.pos.y)}
-        path = weapon_approach_path(fighter, weapon, blocked | danger, reserved, state)
-        if path is None:
-            path = weapon_approach_path(fighter, weapon, blocked, reserved, state)
+        # 队友本回合的落脚格和外出的人的出院通道都是临时占位：先绕开它们找路，
+        # 找不到就不把它们当整条路线的障碍，只是第一步不踩上去（踩上去就原地等一回合）。
+        path = None
+        for avoid in (blocked | danger, blocked):
+            path = weapon_approach_path(fighter, weapon, avoid, reserved | exit_hold, state)
+            if path is None:
+                path = weapon_approach_path(fighter, weapon, avoid, set(), state)
+            if path is not None:
+                break
+        if path and (path[0].x, path[0].y) in (reserved | exit_hold):
+            trace(state, fighter.id, "night_wait_for_teammate", "回炮第一步被队友本回合的落脚格占着，先让一回合")
+            continue
         cmd = move_on_path(state, fighter, path, reserved, "前往独立分配的武器（绕开机器人进攻路线）")
         if cmd:
             commands[fighter.id] = cmd
