@@ -581,8 +581,22 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             worker.backpack = ['stone'] * 8
             worker.pos = pos
         early = self.decide(state)
-        self.assertTrue(any(c.get('action') == 'build' and c.get('name') == 'wall' for c in early.values()))
+        built = [
+            (c['targetPos'][0]['x'], c['targetPos'][0]['y'])
+            for c in early.values()
+            if c.get('action') == 'build' and c.get('name') == 'wall'
+        ]
+        self.assertTrue(
+            built or any(c.get('action') == 'move' for c in early.values()),
+            early,
+        )
+        for cell in built:
+            self.assertEqual(cell[0], 13, cell)
+            self.assertIn(cell[1], (8, 9, 10, 11), cell)
+        self.assertNotIn((13, 7), built)
+        self.assertNotIn((12, 7), built)
         self.assertFalse(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
+        self.assertFalse(any(e['code'] == 'emergency_front_seal' for e in state.decision_events))
 
     def test_workers_build_flanks_when_front_is_sealed(self):
         """正面已齐、白天还早：施工工带着石头应立刻补侧翼，不能空转留石。"""

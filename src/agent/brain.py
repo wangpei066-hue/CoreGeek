@@ -2116,9 +2116,9 @@ def _night_worker_release(state, blocked, reserved):
 
 
 def night_voucher_use(fighter: Role, state: "MatchState", target):
-    """夜里守炮的人手里有券：身边有同级武器，且这回合没有可打的目标（冷却或射程外）就地升级。"""
-    if target is not None:
-        return None
+    """夜里守炮的人手里有券：身边有同级武器就地升级。
+    电磁炮/加特林没有冷却，有敌人也会每回合开火，必须允许打断一轮射击把券用掉；
+    火箭仍只在本回合打不了（冷却或没目标）时升级。"""
     for name in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2"):
         if name not in (fighter.backpack or []):
             continue
@@ -2126,11 +2126,14 @@ def night_voucher_use(fighter: Role, state: "MatchState", target):
         near = [r for r in state.team_our.roles
                 if r.role_type in WEAPON_TYPES and r.health > 0 and (r.level or 1) == level
                 and chebyshev(fighter.pos, r.pos) <= 1]
-        if near:
-            weapon = min(near, key=lambda r: (_WEAPON_UPGRADE_ORDER.get(r.role_type, 99), r.id))
-            return selected(state, fighter.id, {"action": "use", "name": name,
-                                                "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]},
-                            "夜里手里有武器券，趁炮冷却/无目标就地升级")
+        if not near:
+            continue
+        weapon = min(near, key=lambda r: (_WEAPON_UPGRADE_ORDER.get(r.role_type, 99), r.id))
+        if target is not None and weapon.role_type == "rocket":
+            continue
+        return selected(state, fighter.id, {"action": "use", "name": name,
+                                            "targetPos": [{"x": weapon.pos.x, "y": weapon.pos.y}]},
+                        "夜里手里有武器券，就地升级同级武器")
     return None
 
 
@@ -2407,12 +2410,15 @@ def command_actor_id(key, command):
 
 
 def worker_defers_voucher_use(role: Role, state: "MatchState", blocked: set) -> bool:
-    """工人白天拿到武器券先不专程去用：背包还有空、也没到回防时间，就继续采矿修墙，
-    回防时顺路到武器旁用掉（夜里守炮的人没目标时也会就地用）。开拓者夜里要开电磁炮，拿到就用。"""
+    """工人白天拿到武器券：火箭可以等回防顺路用（夜里就站在火箭旁）。
+    电磁炮夜里由开拓者守，工人不会站过去，必须白天专程用掉，否则券会一直揣着。"""
     if role.role_type != "worker" or not is_day_round(state.round_no):
         return False
     cap = role.back_pack_capability or 0
     if cap and len(role.backpack or []) >= cap:
+        return False
+    pick = held_weapon_voucher_target(role, state, set())
+    if pick is not None and pick[1].role_type != "rocket":
         return False
     from .economy import defense_due
     return not defense_due(role, state, blocked)

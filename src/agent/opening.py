@@ -2145,27 +2145,19 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
 
 
 def _buildable_wall_paths(role, state, blocked, reserved):
-    """只走向能砌的缺口：跳过失败冷却和 safe_wall 拒建的格子，避免对着砌不上的墙空转。"""
+    """只走向能砌的缺口：按 U 形下一格，不改成离人最近。"""
     from .brain import own_station
     base = own_station(state)
     if base is None:
         return []
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
-    assignments = assign_weapons(state)
-    ranked = []
-    for point in due_wall_gaps(state, role):
-        if point in existing or point in blocked | reserved:
-            continue
-        if (point[0], point[1], 'wall') in state.failed_build_spots:
-            continue
-        if not safe_wall(state, point, blocked | reserved, assignments):
-            continue
-        path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
-        if path is None:
-            continue
-        ranked.append((len(path), point, path))
-    ranked.sort()
-    return ranked
+    candidates = [p for p in due_wall_gaps(state, role)
+                  if p not in existing and p not in blocked | reserved
+                  and (p[0], p[1], 'wall') not in state.failed_build_spots]
+    point, path = next_wall_gap(role, state, candidates, blocked, reserved)
+    if point is None or path is None:
+        return []
+    return [(0 if path == [] else len(path), point, path)]
 
 
 def step_toward_wall_gap(role, point, blocked, reserved, state):
@@ -2219,15 +2211,15 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
                 path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
                 if path is None:
                     continue
-                ranked.append((len(path), point, path))
-            ranked.sort()
+                ranked.append((0 if path == [] else len(path), point, path))
+            # 仍按 due_wall_gaps / U 形顺序取第一格，不要按路程改成离人最近。
         if ranked:
             _cost, point, path = ranked[0]
             if not path and chebyshev(role.pos, Pos(*point)) == 1:
                 reserved.add(point)
                 return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': point[0], 'y': point[1]}]},
                                 '贴着可砌缺口，就地建造避免空转')
-            cmd = move_on_path(state, role, path, reserved, '走向最近可砌墙缺口，避免站着空转')
+            cmd = move_on_path(state, role, path, reserved, '走向 U 形下一缺口，避免站着空转')
             if cmd:
                 return cmd
         if not in_courtyard(state, base, role.pos):
@@ -2305,13 +2297,18 @@ def adjacent_critical_build(role, state, blocked, reserved):
 
 
 def emergency_front_seal(role, state, blocked, reserved):
-    """正面缺口会使关键目标暴露，且工人能在安全窗内封堵时，暂停未买到手的采购。"""
+    """正面缺口会使关键目标暴露，且工人能在安全窗内封堵时，暂停未买到手的采购。
+
+    没有敌人时不要走这条：否则贴边角的人会先砌 (front, 角)，打乱从 U 心向外的顺序。
+    """
     from .tactics import threat_eta_to_base, threat_robots
     from .brain import is_day_round
     if role.role_type != 'worker' or 'stone' not in role.backpack:
         return None
     if not is_day_round(state.round_no):
         return None  # 夜里不能建造（任务书4.4），走过去也封不上，别占用夜间采矿的人
+    if not threat_robots(state):
+        return None
     gaps = [Pos(*p) for p in critical_wall_missing(state)]
     if not gaps:
         return None

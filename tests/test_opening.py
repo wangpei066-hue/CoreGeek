@@ -73,6 +73,15 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(xs, sorted(xs, reverse=True))  # 基地朝右：两翼从靠前（x大）往后修
         self.assertEqual({p[0] for p in wings[-2:]}, {8})  # 最后才是后沿两个角
 
+    def test_remaining_slots_keep_u_order_after_front_is_sealed(self):
+        """正面列砌完后，扩墙名单仍从翼头往后，不能按坐标把后沿两角排到前面。"""
+        from src.agent.work_orders import remaining_wall_slots
+        state = opening_state()
+        ring = wall_ring(state, state.team_our.roles[0])
+        for i, (x, y) in enumerate(ring[:6]):
+            state.team_our.roles.append(make_role(40 + i, x, y, 'wall', level=1, health=1000))
+        self.assertEqual(remaining_wall_slots(state), ring[6:])
+
     def test_day_one_survival_walls_are_front_plus_wing_heads(self):
         from src.agent.opening import survival_wall_plan
         state = opening_state()
@@ -225,6 +234,49 @@ class OpeningTests(unittest.TestCase):
                     build_blocked_set(state),
                 )
                 self.assertTrue(stands)
+
+    def test_next_wall_gap_starts_at_front_center(self):
+        """空墙时第一格必须是迎敌列靠近 U 心的格子；人即使贴着边角也不从翼头起砌。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps, defense_mid_y
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 7)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        point, path = next_wall_gap(worker, state, due_wall_gaps(state, worker), blocked)
+        self.assertEqual(point, (13, 9), (point, due_wall_gaps(state, worker)[:8]))
+        mid = defense_mid_y(state, state.team_our.roles[0])
+        self.assertLess(abs(point[1] - mid), abs(7 - mid))
+        self.assertIsNotNone(path)
+
+    def test_quiet_day_builds_front_center_not_corner(self):
+        """没有敌人时紧急封堵不得抢跑；贴边角的施工工应去砌/走近 U 心。"""
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        for worker_id, pos in ((1, Pos(12, 7)), (2, Pos(12, 8))):
+            worker = next(r for r in state.team_our.roles if r.id == worker_id)
+            worker.backpack = ['stone'] * 8
+            worker.pos = pos
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        built = [
+            (c['targetPos'][0]['x'], c['targetPos'][0]['y'])
+            for c in commands.values()
+            if c.get('action') == 'build' and c.get('name') == 'wall'
+        ]
+        self.assertTrue(
+            built or any(c.get('action') == 'move' for c in commands.values()),
+            commands,
+        )
+        for cell in built:
+            self.assertEqual(cell[0], 13, cell)
+            self.assertIn(cell[1], (8, 9, 10, 11), cell)
+        self.assertNotIn((13, 7), built)
+        self.assertNotIn((13, 12), built)
+        self.assertNotIn((12, 7), built)
+        self.assertFalse(any(e['code'] == 'emergency_front_seal' for e in state.decision_events))
 
     def test_wall_grows_from_existing_not_the_far_end(self):
         """已有墙时下一格必须接上去，不能跳到对面另一头。"""

@@ -89,6 +89,54 @@ class HeldVoucherTests(unittest.TestCase):
         self.decide(state)
         self.assertFalse(any(e['code'] == 'held_voucher_use' for e in state.decision_events))
 
+    def test_night_railgun_uses_vouchers_even_with_targets_in_range(self):
+        """电磁炮无冷却：射程内有怪也要把 2 级券用在 1 级电磁炮上。"""
+        from src.agent.protocol import RobotRole
+        from test_worker_pioneer_merge import _slot_layout_state
+        state = _slot_layout_state(80, levels=(3, 1, 3), station_level=2)
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(railgun.pos.x - 1, railgun.pos.y)
+        pioneer.backpack = ['WeaponUpgradeVoucher1', 'WeaponUpgradeVoucher2']
+        railgun.attack_range = 10
+        state.robot.roles = [RobotRole(100, Pos(railgun.pos.x + 2, railgun.pos.y), 'smallRobot', 40)]
+        commands = self.decide(state)
+        self.assertEqual(commands.get(pioneer.id, {}), {
+            'action': 'use', 'name': 'WeaponUpgradeVoucher1',
+            'targetPos': [{'x': railgun.pos.x, 'y': railgun.pos.y}],
+        })
+        self.assertFalse(any(c.get('controllerId') == str(pioneer.id) for c in commands.values()))
+
+    def test_night_railgun_uses_level3_voucher_when_already_level2(self):
+        from src.agent.protocol import RobotRole
+        from test_worker_pioneer_merge import _slot_layout_state
+        state = _slot_layout_state(80, levels=(3, 2, 3), station_level=2)
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(railgun.pos.x - 1, railgun.pos.y)
+        pioneer.backpack = ['WeaponUpgradeVoucher2']
+        railgun.attack_range = 10
+        state.robot.roles = [RobotRole(100, Pos(railgun.pos.x + 2, railgun.pos.y), 'smallRobot', 40)]
+        commands = self.decide(state)
+        self.assertEqual(commands.get(pioneer.id, {}), {
+            'action': 'use', 'name': 'WeaponUpgradeVoucher2',
+            'targetPos': [{'x': railgun.pos.x, 'y': railgun.pos.y}],
+        })
+
+    def test_worker_does_not_defer_railgun_only_voucher(self):
+        """工人夜里不守电磁炮：火箭已满级时，白天必须专程去把 2 级券用在电磁炮上。"""
+        from src.agent.protocol import Zone
+        state, holder = voucher_state(140, Pos(16, 11), ['WeaponUpgradeVoucher1'], levels=(3, 3))
+        state.map_info.zones.append(Zone(Pos(17, 11), 'copper'))
+        commands = self.decide(state)
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        self.assertEqual(state.worker_item_jobs[holder.id]['target'], (railgun.pos.x, railgun.pos.y))
+        self.assertIn(commands[holder.id]['action'], ('move', 'use'))
+        self.assertNotIn(
+            'weapon_voucher_deferred',
+            [e['code'] for e in state.decision_events if e.get('role_id') == holder.id],
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

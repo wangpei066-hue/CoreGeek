@@ -157,14 +157,21 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010]['action'], 'sell')
 
     def test_worker_builds_front_wall_before_selling_when_holding_stone(self):
+        """有石头时先修迎敌墙，不跑去卖铁。人在边角时先走向 U 心，不就地砌角。"""
         state = minimal_state(round_no=135)
         state.team_our.roles[0].health = 1500
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
         worker = make_role(10010, 12, 7, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        self.assertEqual(commands[10010].get('action'), 'build')
-        self.assertEqual(commands[10010].get('name'), 'wall')
+        cmd = commands[10010]
+        self.assertNotEqual(cmd.get('action'), 'sell')
+        self.assertIn(cmd.get('action'), ('build', 'move'), cmd)
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
+            target = cmd['targetPos'][0]
+            self.assertEqual(target['x'], 13)
+            self.assertIn(target['y'], (8, 9, 10, 11), target)
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night
