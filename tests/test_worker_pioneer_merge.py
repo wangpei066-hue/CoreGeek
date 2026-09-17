@@ -1012,6 +1012,22 @@ class NightDualRocketRotationTests(unittest.TestCase):
         self.assertLessEqual(railgun_on_full, railgun_dealt * 0.2, (railgun_on_full, railgun_dealt))
 
 
+class DayAssignmentMatchesNightLayoutTests(unittest.TestCase):
+    """白天三人各守一门时按夜里的布局分炮：开拓者守非火箭炮，否则入夜换炮位要穿院子、电磁炮空着。"""
+
+    def test_pioneer_keeps_railgun_every_day(self):
+        from src.agent.opening import assign_weapons
+        for round_no in (30, 160, 290, 420):
+            with self.subTest(round_no=round_no):
+                state = _slot_layout_state(round_no)
+                pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+                rocket = next(r for r in state.team_our.roles if r.role_type == 'rocket')
+                pioneer.pos = Pos(rocket.pos.x - 1, rocket.pos.y + 1)  # 白天正好站在火箭旁
+                weapon = assign_weapons(state).get(pioneer.id)
+                self.assertIsNotNone(weapon)
+                self.assertNotEqual(weapon.role_type, 'rocket', (round_no, weapon))
+
+
 class NightPressureRecallTests(unittest.TestCase):
     """敌人逼近时叫外出工人回防：前两夜不叫；第三夜起只有带着能在家用上的道具才叫。"""
 
