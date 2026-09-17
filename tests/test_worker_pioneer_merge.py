@@ -74,7 +74,7 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         commands = self.decide(state)
         self.assertEqual(commands.get(20, {}).get('controllerId'), '3')
         self.assertNotEqual(commands.get(3, {}).get('action'), 'acceptTask')
-        self.assertTrue(any(e['code'] == 'early_night_fixed_defense'
+        self.assertTrue(any(e['code'] == 'night_fixed_defense'
                             for e in state.decision_events))
 
     def test_pioneer_keeps_task_when_worker_can_cover_two_adjacent_rockets(self):
@@ -168,25 +168,39 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(commands[freed.id]['action'], 'collect')
         self.assertFalse(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
 
-    def test_first_two_nights_release_miner_even_when_task_is_available(self):
-        """前两夜开拓者不接任务，任务点可接不应挡住经济工去基地后方采矿。"""
-        for round_no in (80, 210):
+    def test_night_pioneer_never_takes_new_task_and_one_worker_goes_out(self):
+        """未清波的夜里开拓者不接新任务、留在守炮名单；是否放工人与任务点可不可接无关。"""
+        for round_no in (80, 210, 340):
             with self.subTest(round_no=round_no):
                 state = self._dual_rocket_night()
                 state.round_no = round_no
                 next(r for r in state.team_our.roles if r.id == 1).pos = Pos(9, 10)
-                freed = next(r for r in state.team_our.roles if r.id == 2)
-                freed.pos = Pos(7, 9)
+                next(r for r in state.team_our.roles if r.id == 2).pos = Pos(7, 9)
                 pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
                 pioneer.pos = Pos(10, 12)
                 state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(11, 13), 0, 10, 10, True)]
-                state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 10)]
+                state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
                 state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
                 commands = self.decide(state)
-                self.assertEqual(commands[freed.id]['action'], 'collect')
                 self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'acceptTask')
-                self.assertTrue(any(e['code'] == 'night_worker_released_to_economy'
-                                    for e in state.decision_events))
+                self.assertIn(str(pioneer.id), state.policy_memory['weapon_assignment'])
+                released = [e for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
+                self.assertEqual(len(released), 1)
+                self.assertIn(released[0]['role_id'], (1, 2))
+                self.assertFalse(any(e['code'] == 'pioneer_task' for e in state.decision_events))
+
+    def test_night_active_task_holds_pioneer_and_keeps_both_workers_on_guns(self):
+        state = self._dual_rocket_night()
+        state.phase_task = '天黑前已开始的任务'
+        next(r for r in state.team_our.roles if r.id == 1).pos = Pos(9, 10)
+        next(r for r in state.team_our.roles if r.id == 2).pos = Pos(7, 9)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(11, 14)
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        self.decide(state)
+        self.assertTrue(any(e['code'] == 'night_hold_active_task' for e in state.decision_events))
+        self.assertFalse(any(e['code'] == 'night_worker_released_to_economy' for e in state.decision_events))
+        self.assertNotIn(str(pioneer.id), state.policy_memory.get('weapon_assignment', {}))
 
     def test_third_night_worker_stays_on_guns_when_defense_is_due(self):
         state = self._dual_rocket_night()
@@ -546,7 +560,7 @@ class ChainVoucherTests(unittest.TestCase):
 
 
 class FixtureNightMinerTests(unittest.TestCase):
-    """用真实请求样例：前两夜带石头的经济工不去正面缺口（夜里不能建造），而是去基地后方采矿。"""
+    """用真实请求样例：任务点可接也不影响放人；带石头的经济工夜里不去正面缺口（不能建造），而是去基地后方采矿。"""
 
     def _state(self, round_no):
         import json

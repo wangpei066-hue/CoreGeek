@@ -1594,7 +1594,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
 def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserved: set):
     """进行中的任务一直待到做完（离开任务点即失败）。
-    未开始的任务受 defense_due 约束（夜里工人守得住三炮时除外）；普通买券不抢占可行任务。"""
+    未开始的任务受 defense_due 约束；普通买券不抢占可行任务。"""
     from .economy import defense_due
     add_branch(state, 'decide_pioneer_task')
     if pioneer.health <= 0:
@@ -1603,8 +1603,6 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     ctx = getattr(state, '_pioneer_sched', None)
     if not isinstance(ctx, dict) or 'candidates' not in ctx:
         ctx = begin_schedule(state, pioneer, blocked, reserved)
-    from .opening import pioneer_free_at_night
-    night_free = pioneer_free_at_night(state, pioneer, blocked)
     if state.phase_task:
         add_branch(state, 'active_phase_task')
         # 规则：任务开始后离开任务点一格外就直接失败，所以一旦开始就待到做完或超时。
@@ -1615,7 +1613,7 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     reservation = reservation_of(state)
     if reservation and reservation.get('stage') == 'accept_pending':
         add_branch(state, 'accept_pending')
-        if defense_due(pioneer, state, blocked) and not night_free:
+        if defense_due(pioneer, state, blocked):
             add_branch(state, 'accept_pending_yield_defense')
             mark_outcome(state, 'task_yields_to_defense', None, 'yield_pending_to_defense')
             trace(state, pioneer.id, 'task_yields_to_defense',
@@ -1631,7 +1629,7 @@ def decide_pioneer_task(pioneer: Role, state: "MatchState", blocked: set, reserv
     if row and (not reservation or reservation.get('stage') == 'approaching'):
         from .pioneer_schedule import save_reservation
         save_reservation(state, pioneer, row, stage='approaching')
-    if defense_due(pioneer, state, blocked) and not night_free:
+    if defense_due(pioneer, state, blocked):
         add_branch(state, 'new_task_defense_gate')
         mark_outcome(state, 'task_yields_to_defense', None, 'defense_blocks_new_task')
         trace(state, pioneer.id, 'task_yields_to_defense', '回防时间已到或家中告急，不再新接任务',
@@ -1944,18 +1942,15 @@ def plan_pioneer_tasks(state, blocked, reserved):
     return commands, handled_ids
 
 
-def _night_worker_release(state, blocked, reserved, task_pioneers):
-    """两人三炮下第三个人的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
-    - 开拓者在做任务：他就是第三个人，不再放工人。
-    - 前两夜：放经济工去采矿，施工工和开拓者守三炮。
+def _night_worker_release(state, blocked, reserved):
+    """两人三炮下第三个人（一名工人）的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
+    不看任务点是否可接：未清波时开拓者不接新任务、留在守炮名单。
+    开拓者在做天黑前已开始的任务时由 plan_night 直接不调用本函数。
+    - 前两夜：放经济工去后院采矿，施工工和开拓者守三炮。
     - 第三夜起：放施工工，经济工一人守双火箭、开拓者开另一门。
       有防守压力时施工工留在家里用升级券/修墙包给残墙回血（夜里不能建造），没有可修的墙就回炮；
       没有压力时去采矿，但必须在敌人到达前赶得回来。"""
     later_night = structure_priority_day(state)
-    # 前两夜开拓者固定守炮、不接新任务：任务点"可接"不代表开拓者会去做，只有进行中的任务才占人。
-    pioneer_busy = self_evolution_work_open(state) if later_night else bool(state.phase_task)
-    if pioneer_busy or task_pioneers:
-        return None, None
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
         return None, None
@@ -2050,20 +2045,19 @@ def plan_night(state: "MatchState") -> dict:
                     state.team_our.gold_num -= cost
                 commands[role.id] = cmd
         return commands
-    # 前两夜固定执行“两人三炮”：经济工外出采后方安全矿，施工工和
-    # 开拓者留守。不能让任务点是否恰好位于机器人另一侧改变开拓者分工。
-    # 清波分支在上面已经提前返回，因此机器人清完后开拓者仍会立刻恢复任务。
-    early_night = not structure_priority_day(state)
-    if early_night and not state.phase_task:
-        commands, task_pioneers = {}, set()
-        trace(state, None, "early_night_fixed_defense",
-              "前两夜固定两人三炮：开拓者不接任务，施工工与开拓者留守，经济工采后方安全矿")
-    else:
-        # 已经进入任务阶段时离开任务点会直接失败，只能保留；固定编组通过
-        # 前两夜不再新接任务来保证，而不是中途抛弃已开始的任务。
+    # 机器人未清完前固定"两人三炮 + 一名工人去后院采矿"：开拓者不接新任务，留在守炮名单。
+    # 唯一例外：天黑前已开始的任务（离开任务点即失败）做完再回炮，这期间两名工人守炮、不放人。
+    # 机器人清完后走上面的清波分支，开拓者才恢复接任务。
+    commands, task_pioneers = {}, set()
+    if state.phase_task:
         commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
+        trace(state, None, "night_hold_active_task",
+              "开拓者做完已开始的任务再回炮；两名工人守三炮，暂不放人采矿")
+    else:
+        trace(state, None, "night_fixed_defense",
+              "未清波：两人三炮，一名工人去后院采矿；开拓者留守不接任务")
     urgent = pressure(state) or front_breached(state)
-    released_worker, released_cmd = _night_worker_release(state, blocked, reserved, task_pioneers)
+    released_worker, released_cmd = (None, None) if task_pioneers else _night_worker_release(state, blocked, reserved)
     excluded = set(task_pioneers)
     if released_worker is not None:
         excluded.add(released_worker.id)

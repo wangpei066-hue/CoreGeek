@@ -190,13 +190,13 @@ def defense_snapshot(role, state, blocked):
 
 
 def evaluate_task_candidates(pioneer, state, blocked, reserved=None):
-    from .opening import MUSTER_BUFFER, adjacent_path, pioneer_free_at_night, station_return_detail
+    from .opening import MUSTER_BUFFER, adjacent_path, station_return_detail
     from .brain import is_day_round
     from .tactics import night_wave_cleared, threat_eta_to_base
     solve, solve_source = estimated_solve_rounds(state)
     eta = threat_eta_to_base(state, pioneer)
-    # 夜里工人能守住全部炮位时，开拓者不受回防时间约束，可以接新任务。
-    wave = night_wave_cleared(state) or pioneer_free_at_night(state, pioneer, blocked)
+    # 夜里只有机器人清完（试探清波）后才允许接新任务；未清波时开拓者固定守炮。
+    wave = night_wave_cleared(state)
     obstacles = blocked if reserved is None else (blocked | reserved)
     rows = []
     tasks = []

@@ -1246,24 +1246,6 @@ def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
     return weapons <= covered
 
 
-def crew_covers_without(state, excluded_ids, blocked):
-    """其余两人能守住三门炮时，被排除的那个人可以去做任务或采矿。"""
-    from .brain import structure_priority_day
-    if structure_priority_day(state):
-        from .tactics import front_breached, pressure
-        if pressure(state) or front_breached(state):
-            return False
-    return guns_covered_without(state, excluded_ids, blocked)
-
-
-def pioneer_free_at_night(state, pioneer, blocked):
-    """夜里两名工人守住三门炮时，开拓者可以接新任务。"""
-    from .brain import is_day_round
-    if pioneer is None or is_day_round(state.round_no):
-        return False
-    return crew_covers_without(state, {pioneer.id}, blocked)
-
-
 def weapon_approach_path(role, weapon, blocked, reserved, state):
     """去开炮：先绕开队友，走不通再让路穿过占位，避免空转。"""
     own = {(role.pos.x, role.pos.y)}
