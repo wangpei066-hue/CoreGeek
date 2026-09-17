@@ -6,7 +6,7 @@ from src.agent.opening import (
     wall_ring, primary_wall_plan, assign_weapons, safe_wall, opening_time_budget,
     estimate_opening_upgrade, day_rounds_remaining, plan_opening,
 )
-from src.agent.grid import build_blocked_set
+from src.agent.grid import build_blocked_set, chebyshev
 from src.agent.protocol import Pos, Zone, RobotRole, ShopItem
 from test_shop_items import minimal_state, make_role
 
@@ -225,6 +225,66 @@ class OpeningTests(unittest.TestCase):
                     build_blocked_set(state),
                 )
                 self.assertTrue(stands)
+
+    def test_wall_grows_from_existing_not_the_far_end(self):
+        """已有墙时下一格必须接上去，不能跳到对面另一头。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(10, 10)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertIsNotNone(point)
+        self.assertEqual(max(abs(point[0] - 13), abs(point[1] - 10)), 1, (point, gaps[:8]))
+
+    def test_wall_sticky_is_not_abandoned_for_a_nearer_gap(self):
+        """已经认准一格时，不因为旁边更近就换目标。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 8)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        sticky = (13, 12)
+        self.assertIn(sticky, {tuple(p) for p in gaps})
+        point, path = next_wall_gap(worker, state, gaps, blocked, sticky=sticky)
+        self.assertEqual(point, sticky)
+        self.assertIsNotNone(path)
+
+    def test_next_wall_gap_keeps_top_bottom_symmetric(self):
+        """正面已有中心上侧时，下一格补中心下侧，即使人离上侧更近。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 9), (point, gaps[:8]))
+
+    def test_next_wall_gap_picks_closer_side_of_a_symmetric_pair(self):
+        """同一圈上下都缺时，砌离人更近的那一侧，省走路。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        state.team_our.roles.append(make_role(41, 13, 9, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 11), (point, gaps[:8]))
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
         state = opening_state()
@@ -1372,6 +1432,35 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
         point, path = next_wall_gap(worker, state, gaps, blocked, sticky=sticky)
         self.assertEqual(point, sticky)
         self.assertIsNotNone(path)
+
+    def test_next_wall_gap_keeps_top_bottom_symmetric(self):
+        """正面已有中心上侧时，下一格补中心下侧，即使人离上侧更近。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 9), (point, gaps[:8]))
+
+    def test_next_wall_gap_picks_closer_side_of_a_symmetric_pair(self):
+        """同一圈上下都缺时，砌离人更近的那一侧，省走路。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        state.team_our.roles.append(make_role(41, 13, 9, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 11)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertEqual(point, (13, 11), (point, gaps[:8]))
 
     def test_full_metal_backpack_in_survival_goes_to_vendor(self):
         state = opening_state()

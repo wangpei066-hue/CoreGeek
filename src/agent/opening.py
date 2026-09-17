@@ -376,6 +376,12 @@ def defense_bounds(state, base):
     return left, right, bottom, top
 
 
+def defense_mid_y(state, base):
+    """U 形墙的竖直中心：基地 2×2 偏下，用上下墙沿的中点，而不是 station.pos.y。"""
+    _left, _right, bottom, top = defense_bounds(state, base)
+    return (bottom + top) / 2
+
+
 def attack_direction(state, base):
     """用户确认：左上基地受右侧进攻，右下基地受左侧进攻；按实际坐标换边。"""
     return 1 if base.pos.x + 0.5 < (state.map_info.width - 1) / 2 else -1
@@ -388,29 +394,66 @@ def wall_priority(state, base, point):
     return 0 if point[0] == front else 2
 
 
+def station_cells(base):
+    return {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
+
+
+def _in_map(state, point):
+    x, y = point
+    return 0 <= x < state.map_info.width and 0 <= y < state.map_info.height
+
+
+def rear_corner_layout(state, base):
+    """背敌角落：两门火箭分别贴在基地 2×2 后角的两条边上，工人站在角落格同时够到两门。
+
+        蓝方（敌人从右来）用左上角，给采石进院留出下沿通道；红方用右上角。上沿出界则改用下沿。
+    返回 (后边火箭, 顶/底边火箭, 角落操控格)。
+    """
+    direction = attack_direction(state, base)
+    sx, sy = base.pos.x, base.pos.y
+    station = station_cells(base)
+    left, right, bottom, top = defense_bounds(state, base)
+    front = right if direction == 1 else left
+    ring = {(front, y) for y in range(bottom, top + 1)}
+    ring.update((x, y) for x in range(left, right + 1) for y in (bottom, top))
+    rear_x = sx if direction == 1 else sx + 1
+    for sign_y in (1, -1):
+        corner_y = sy - 1 if sign_y < 0 else sy
+        rocket_rear = (rear_x - direction, corner_y)
+        rocket_side = (rear_x, corner_y + sign_y)
+        stand = (rear_x - direction, corner_y + sign_y)
+        cells = (rocket_rear, rocket_side, stand)
+        if all(_in_map(state, p) and p not in station and p not in ring for p in cells):
+            return rocket_rear, rocket_side, stand
+    fallback_rear = (left + 1 if direction == 1 else right - 1, bottom + 1)
+    fallback_side = (fallback_rear[0] + direction, fallback_rear[1])
+    fallback_stand = (fallback_rear[0], fallback_rear[1] + 1)
+    return fallback_rear, fallback_side, fallback_stand
+
+
 def weapon_slot_plan(state, base):
     """武器编位（布局 C）：两门火箭竖排在院子后列、紧贴基地背面；电磁炮在前列、与基地上一行同高。
 
     火箭射程覆盖全图，放后面不影响打击，还有基地挡在前面；两门火箭共用的操控位在基地正后方
     （后方开口外一格），不和电磁炮手、施工通道抢格子。电磁炮射程短，放在前列。
-    院内其余格子全部空出来，16 段墙都能从院内砌。"""
-    left, right, bottom, top = defense_bounds(state, base)
+    院内其余格子全部空出来，16 段墙都能从院内砌。
+    """
+    left, right, _bottom, _top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front_x = (right if direction == 1 else left) - direction
     rear_x = (left if direction == 1 else right) + direction
     upper_y, lower_y = base.pos.y - 1, base.pos.y
-    width, height = state.map_info.width, state.map_info.height
+    station = station_cells(base)
     slots = [
         ('rocket', (rear_x, upper_y)),
         ('railgun', (front_x, upper_y)),
         ('rocket', (rear_x, lower_y)),
     ]
-    station = {(base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1)}
     cleaned = []
-    for name, (x, y) in slots:
-        if not (0 <= x < width and 0 <= y < height) or (x, y) in station:
+    for name, point in slots:
+        if not _in_map(state, point) or point in station:
             continue
-        cleaned.append((name, (x, y)))
+        cleaned.append((name, point))
     return cleaned
 
 
@@ -420,13 +463,21 @@ def weapon_slots(state, base):
 
 def wall_ring(state, base):
     """单层防线：迎敌正面一整列，两翼一直延伸到院子后沿，后方竖边开放。
-    顺序：正面 → 两翼从靠前往后交替展开，后面的墙最后修。"""
+    顺序：正面从 U 形中心向两边对称展开 → 两翼同一深度上下成对、由前往后，后沿两角最后。"""
     left, right, bottom, top = defense_bounds(state, base)
     direction = attack_direction(state, base)
     front = right if direction == 1 else left
+    mid_y = defense_mid_y(state, base)
     cells = {(front, y) for y in range(bottom, top + 1)}
     cells.update((x, y) for x in range(left, right + 1) for y in (bottom, top))
-    return sorted(cells, key=lambda p: (wall_priority(state, base, p), abs(p[0] - front), p[1]))
+
+    def ring_key(point):
+        x, y = point
+        if x == front:
+            return (0, abs(y - mid_y), y)
+        return (2, abs(x - front), abs(y - mid_y), y)
+
+    return sorted(cells, key=ring_key)
 
 
 def primary_wall_plan(state, base):
@@ -901,28 +952,10 @@ def lock_survival_walls(state, reason):
 
 
 def survival_wall_plan(state, base):
-    """第一天主目标：正面整列 + 两侧拐角再各延伸 1 格。其余 16 段留给后面有余量再补。"""
-    from .brain import WEAPON_TYPES
-    inner = [p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) != 1]
-    front = [p for p in inner if wall_priority(state, base, p) == 0]
-    flanks = [p for p in inner if wall_priority(state, base, p) == 2]
-    weapons = [r for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0]
-    fighters = [r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0]
-
-    def front_key(point):
-        _x, y = point
-        cover_base = 0 if abs(y - base.pos.y) <= 2 else 1
-        cover_weapon = 0 if any(abs(y - w.pos.y) <= 1 for w in weapons) else 1
-        cover_gunner = 0 if any(abs(y - f.pos.y) <= 1 and chebyshev(f.pos, Pos(*point)) <= 3 for f in fighters) else 1
-        return (cover_base, cover_weapon, cover_gunner, abs(y - base.pos.y), y)
-
-    ordered = sorted(front, key=front_key)
-    # 两翼各取紧挨正面的那一格（flanks 已按由前往后排序），不取后沿。
-    for row in sorted({p[1] for p in flanks}):
-        point = next(p for p in flanks if p[1] == row)
-        if point not in ordered:
-            ordered.append(point)
+    """第一天主目标：正面从中心向两边对称展开，再补两翼紧挨正面各 1 格。"""
+    ordered = list(wall_ring(state, base)[:DAY1_WALL_TARGET])
     if len(ordered) < SURVIVAL_WALL_FLOOR:
+        inner = [p for p in wall_ring(state, base) if wall_priority(state, base, p) != 1]
         for point in inner:
             if point not in ordered:
                 ordered.append(point)
@@ -1357,15 +1390,13 @@ def assign_weapons(state, excluded_ids=(), persist=False):
     from .brain import is_day_round
     from .opening_schedule import opening_worker_mode
     night_two_on_three = (not is_day_round(state.round_no)) and bool(dual_pairs)
-    # 白天三人各守一门时按夜里两人三炮的布局分：开拓者守非火箭炮（夜里他固定开这门），
-    # 前两天施工工拿火箭（前两夜他守双火箭）。否则入夜重新分配时开拓者要穿院子换炮位，
-    # 头几回合电磁炮没人开。
+    # 白天三人各守一门时按夜里两人三炮的布局分：开拓者守电磁炮，施工工拿火箭。
+    # 入夜经济工外出后施工工正好站在背敌角落开双火箭，不用换炮位。
     rockets_all = [w for w in weapons if w.role_type == 'rocket']
     day_layout = (is_day_round(state.round_no) and len(fighters) >= len(weapons)
                   and any(dual_rocket_stands(state, a, b, static)
                           for a, b in combinations(rockets_all, 2)))
-    early_days = (state.round_no or 0) // 130 < 2
-    prefer_builder_rockets = (night_two_on_three and early_days) or (day_layout and early_days)
+    prefer_builder_rockets = night_two_on_three or day_layout
     prefer_pioneer_off_rockets = day_layout or night_two_on_three
     builder = next((f for f in fighters if f.role_type == 'worker'
                     and opening_worker_mode(state, f) == 'builder'), None)
@@ -1612,7 +1643,15 @@ def control_stand_path(role, weapon, blocked, reserved, state):
     if stands:
         if here in stands:
             return []
-        path = path_to_any(role.pos, stands, walkable, state.map_info.width, state.map_info.height)
+        goals = set(stands)
+        base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+        if base is not None:
+            _rear, _side, corner = rear_corner_layout(state, base)
+            if corner in stands:
+                goals = {corner}
+        path = path_to_any(role.pos, goals, walkable, state.map_info.width, state.map_info.height)
+        if path is None and goals != stands:
+            path = path_to_any(role.pos, stands, walkable, state.map_info.width, state.map_info.height)
         if path is not None:
             return path
     if partner is None:
@@ -1740,7 +1779,7 @@ def weapon_candidates(state, base, name, extra_names=(), extra_positions=()):
     occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles
                 if r.health > 0 and r.role_type in ('gatling', 'railgun', 'rocket', 'wall', 'station')}
     occupied.update((p[0], p[1]) for p in extra_positions)
-    occupied.update((base.pos.x + dx, base.pos.y - dy) for dx in (0, 1) for dy in (0, 1))
+    occupied.update(station_cells(base))
     slots = [p for slot_name, p in weapon_slot_plan(state, base)
              if slot_name == name and p not in occupied]
     if slots:
@@ -2473,17 +2512,26 @@ def release_stalled_opening_jobs(state, survival_mode):
 
 
 def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sticky=None):
-    """沿计划从已有墙往外接。粘住当前格，不因为另一格离人更近就换。
+    """沿已有墙往外接，上下对称展开。粘住当前格，不跳到另一头。
 
-    本回合只认一个目标：sticky 仍在名单且走得到就继续；否则优先接在已有墙上的格子，
-    再按 `candidates` 的计划顺序取最早那格。返回 (point, path)；path==[] 表示已贴着可砌。
+    本回合只认一个目标：sticky 仍在名单且走得到就继续；否则接在已有墙上。
+    同一圈（正面离中心同样远，或两翼同一深度）优先补更短的那一侧，贴着人的先砌以省步数。
+    返回 (point, path)；path==[] 表示已贴着可砌。
     """
+    from .brain import own_station
     occupied = (set(blocked) | set(reserved) | set(claimed))
     if role is not None:
         occupied.discard((role.pos.x, role.pos.y))
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
     order = {tuple(p): i for i, p in enumerate(candidates)}
     assignments = assign_weapons(state)
+    base = own_station(state)
+    left, right, _bottom, _top = defense_bounds(state, base) if base is not None else (0, 0, 0, 0)
+    direction = attack_direction(state, base) if base is not None else 1
+    front = (right if direction == 1 else left) if base is not None else 0
+    mid_y = defense_mid_y(state, base) if base is not None else 0
+    existing_top = sum(1 for e in existing if e[1] > mid_y)
+    existing_bot = sum(1 for e in existing if e[1] < mid_y)
 
     def usable(point):
         point = tuple(point)
@@ -2499,6 +2547,20 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
         path = wall_approach_path(role, Pos(*point), set(blocked) | set(reserved), state)
         return path
 
+    def side_bias(point):
+        y = point[1]
+        if y == mid_y:
+            return 0
+        if y > mid_y:
+            return 0 if existing_top <= existing_bot else 1
+        return 0 if existing_bot <= existing_top else 1
+
+    def depth(point):
+        x, y = point
+        if x == front:
+            return abs(y - mid_y)
+        return 10 + abs(x - front)
+
     if sticky:
         sticky = tuple(sticky)
         path = usable(sticky)
@@ -2513,11 +2575,12 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
             continue
         adj_exist = any(chebyshev(Pos(*point), Pos(*e)) == 1 for e in existing)
         isolated = 0 if (not existing or adj_exist) else 1
-        ranked.append((isolated, order[point], point, path))
+        walk = 0 if path == [] else len(path)
+        ranked.append((isolated, side_bias(point), depth(point), walk, order[point], point, path))
     if not ranked:
         return None, None
     ranked.sort()
-    _iso, _idx, point, path = ranked[0]
+    *_rest, point, path = ranked[0]
     return point, path
 
 

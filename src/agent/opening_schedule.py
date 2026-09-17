@@ -571,13 +571,16 @@ def day1_wall_floor_met(state, floor=7):
 
 
 def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
-    from .brain import own_station, pick_weapon_name
+    from .brain import MAX_WEAPONS, WEAPON_TYPES, own_station, pick_weapon_name
     from .opening import adjacent_path, weapon_candidates
     base = own_station(state)
     if base is None or gold < 25:
         trace(state, role.id, 'opening_no_gold', '武器资金不足；三座火箭未齐前不改去修墙')
         return None, gold
     pending = list(getattr(state, '_opening_pending_weapon_names', []))
+    alive = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0)
+    if alive + len(pending) >= MAX_WEAPONS:
+        return None, gold
     name = pick_weapon_name(state, pending)
     for point in weapon_candidates(state, base, name, extra_positions=claimed):
         if point in claimed or (*point, 'weapon') in state.failed_build_spots:

@@ -1068,6 +1068,10 @@ class NightPressureRecallTests(unittest.TestCase):
         builder.pos = Pos(10, 20)
         pioneer.pos = Pos(20, 20)
         state.policy_memory['night_released_worker'] = eco.id
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 12)
+        pioneer.pos = Pos(7, 7)
         # 6 个机器人在基地 7 格内：pressure 成立；守炮两人还没站到炮位旁。
         state.robot.roles = [RobotRole(1000 + i, Pos(15, 7 + i), 'smallRobot', 40) for i in range(6)]
         return state, eco
