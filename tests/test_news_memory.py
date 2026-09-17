@@ -119,6 +119,35 @@ class NewsMemoryTests(unittest.TestCase):
         self.assertEqual(self.memory.banned_ores(3), {"iron"})
         self.assertEqual(self.memory.banned_ores(4), {"iron"})
 
+    def test_empty_llm_arrays_filled_from_notes_or_heuristic(self):
+        # #651：Day2 LLM notes 写「禁采日为3和4」但数组为空 → 禁采/涨价/抢收全空
+        self.memory.data["officialHash"] = IRON_COLLAPSE
+        self.memory.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [],
+            "priceUpDays": [],
+            "notes": "铁矿区塌方，明日（第3天）起停工修复，预计工期2天，禁采日为3和4",
+        }, published_day=2)
+        effect = self.memory.data["oreEffects"][0]
+        self.assertEqual(effect["mineBannedDays"], [3, 4])
+        self.assertEqual(effect["priceUpDays"], [3, 4])
+        plan = self.memory.store_official_plan(137)
+        self.assertEqual(plan["today"], 2)
+        self.assertEqual(plan["bannedOres"], [])
+        self.assertEqual(plan["stockpileOres"], ["iron"])
+        self.assertEqual(plan["priceUpOres"], [])
+
+        # notes 没写具体日时，回退启发式
+        other = NewsMemory(Path(self.temp.name) / "other")
+        other.data["officialHash"] = IRON_COLLAPSE
+        other.apply_ore_llm({
+            "affectedOre": "iron",
+            "mineBannedDays": [],
+            "priceUpDays": [],
+            "notes": "塌方停工，工期约两天",
+        }, published_day=2)
+        self.assertEqual(other.data["oreEffects"][0]["mineBannedDays"], [3, 4])
+
     def test_status_update_llm_merges_with_memory(self):
         state = self._state(131, official=IRON_COLLAPSE)
         self.memory.ingest(state)

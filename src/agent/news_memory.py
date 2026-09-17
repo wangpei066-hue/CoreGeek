@@ -251,6 +251,55 @@ def merge_ore_effect(previous: Optional[dict], incoming: dict, resume: bool) -> 
     return effect
 
 
+def _days_from_notes(notes: str) -> list:
+    """LLM 偶尔把日程只写在 notes 里，尝试捞回数字日（避开「工期2天」这类）。"""
+    text = notes or ""
+    found = []
+    for match in re.finditer(
+        r"(?:禁采|停工|涨价)(?:日|天)?[为是:：]\s*([0-9]+(?:\s*[、,，和及至\-–~到]+\s*[0-9]+)*)",
+        text,
+    ):
+        found.extend(int(x) for x in re.findall(r"[0-9]+", match.group(1)))
+    for match in re.finditer(r"第\s*([0-9]+)\s*[、,，和及]\s*([0-9]+)\s*天", text):
+        found.extend([int(match.group(1)), int(match.group(2))])
+    return sorted({d for d in found if 1 <= d <= 20})
+
+
+def fill_empty_ore_effect(effect: dict, official_text: str, published_day: int) -> dict:
+    """LLM 交空窗时的兜底：优先 notes 里的日，再跑启发式。"""
+    if effect.get("mineBannedDays") or effect.get("priceUpDays"):
+        return effect
+    if is_resume_official(official_text):
+        return effect
+    notes_days = _days_from_notes(str(effect.get("notes") or ""))
+    # notes「禁采日为3和4」常见；工期「需要2天」也会出现 2，过滤掉单独的工期数字需靠语境。
+    # 若 notes 同时出现 ≥2 个合理日，采用它们。
+    if len(notes_days) >= 2:
+        effect = dict(effect)
+        effect["mineBannedDays"] = notes_days
+        effect["priceUpDays"] = list(notes_days)
+        effect["notes"] = (effect.get("notes") or "") + " | filled_from_notes"
+        return effect
+    for weak in heuristic_ore_effects(official_text, published_day):
+        if weak.get("affectedOre") == effect.get("affectedOre"):
+            effect = dict(effect)
+            effect["mineBannedDays"] = list(weak.get("mineBannedDays") or [])
+            effect["priceUpDays"] = list(weak.get("priceUpDays") or [])
+            effect["notes"] = (effect.get("notes") or "") + " | filled_from_heuristic"
+            return effect
+    # 矿种对不上时，仍可用启发式第一条（同文通常只有一个矿）
+    weak = heuristic_ore_effect(official_text, published_day)
+    if weak and (weak.get("mineBannedDays") or weak.get("priceUpDays")):
+        effect = dict(effect)
+        if not effect.get("affectedOre"):
+            effect["affectedOre"] = weak["affectedOre"]
+        if effect.get("affectedOre") == weak.get("affectedOre"):
+            effect["mineBannedDays"] = list(weak.get("mineBannedDays") or [])
+            effect["priceUpDays"] = list(weak.get("priceUpDays") or [])
+            effect["notes"] = (effect.get("notes") or "") + " | filled_from_heuristic"
+    return effect
+
+
 class NewsMemory:
     """落盘 state/news_memory.json：官方消息效应、传闻列表、宝藏假设与 LLM 额度。"""
 
@@ -426,8 +475,12 @@ class NewsMemory:
             "publishedDay": published_day,
         }
         # 与旧日程取并集，避免「仍在修复」把 Day2 推出的 [3,4] 盖成 [3]。
-        resume = is_resume_official(self.data.get("officialHash") or "")
+        official = self.data.get("officialHash") or ""
+        resume = is_resume_official(official)
         effect = merge_ore_effect(previous, incoming, resume=resume)
+        # #651：LLM 把「禁采日为3和4」只写进 notes、数组交空 → 禁采/涨价/抢收全丢。
+        if not resume:
+            effect = fill_empty_ore_effect(effect, official, published_day)
         self._upsert_ore_effect(effect)
         self.data["needOreParse"] = False
         self.data["lastOreParseDay"] = published_day
