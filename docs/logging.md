@@ -12,6 +12,7 @@
 
 | marker | 何时出现 | 看什么 |
 | --- | --- | --- |
+| `BUILD_INFO` | **进程只打一行**（启动或首回合） | `commit` 为当前 git HEAD；下载日志的第一行 |
 | `STRATEGY_DECISION` | 每回合 | 昼夜、金币、武器/墙数量、告警码、各角色指令 |
 | `BUILD_WEAPON` | 每回合 | 已建炮、待升级资金缺口、本回合建造/买券/开火 |
 | `BUILD_WALL` | 每回合 | 一层/二层进度、缺口、本回合砌墙或采石 |
@@ -48,7 +49,6 @@
 | 字段 | 含义 |
 | --- | --- |
 | `primary` | 一层 planned/built/missing（最多 20 格）/missingCount |
-| `outer` | 二层进度与 `unlocked` |
 | `thisRound` | 砌墙或为墙采石 |
 | `events` | 墙相关分支 |
 
@@ -81,7 +81,7 @@
 | `llm_output` | LLM | `parsedJson` + 落地后的 `plan` |
 | `llm_empty` | LLM | 等待中的响应为空 |
 
-处理顺序：官方启发式命中则不送矿价 LLM；未命中当天最多送 1 次且优先于传闻。传闻只走宝藏 LLM，每天至少预留 1 次送推。两份 JSON 只落盘并打日志，默认不改工人/开拓者动作。详情见 [`news.md`](news.md)。
+处理顺序：官方原文变化当天固定 1 次矿价 LLM（优先）；剩余额度给传闻。启发式暂时关闭。两份 JSON 只落盘并打日志。详情见 [`news.md`](news.md)。
 
 `official_plan` / `folk_plan` 只在官方原文变化（ingest）或对应 LLM 落地时打，不每回合重打。平台下载搜 `"event":"official_plan"` 或 `"event":"folk_plan"`。
 

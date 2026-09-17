@@ -6,7 +6,7 @@ import unittest
 from src.agent.brain import BasicActionValidator, V1Strategy, item_cost
 from src.agent.economy import liquidate, pick_mine, profitable_mine, sellable_ores
 from src.agent.tactics import begin_round, tactical_action
-from src.agent.opening import funnel_gap, wall_ring, movement_avoid, safe_wall, assign_weapons
+from src.agent.opening import primary_wall_plan, wall_ring, safe_wall, assign_weapons
 from src.agent.grid import build_blocked_set
 from src.agent.protocol import MatchState, Pos, Zone, RobotRole, ShopItem
 from src.agent.server import load_build_memory, save_build_memory
@@ -38,11 +38,12 @@ class EconomyTests(unittest.TestCase):
         from src.agent.brain import maybe_start_shop_item_job, decide_shop_item_job
         state, role = defended_state(gold=0)
         role.backpack = ['WeaponUpgradeVoucher1']
-        role.pos = Pos(9, 7)
+        role.pos = Pos(11, 7)  # 挨着升级链上的第一门火箭 (11, 8)
         maybe_start_shop_item_job(role, state)
         command = decide_shop_item_job(role, state, build_blocked_set(state), set())
         self.assertEqual(command['action'], 'use')
         self.assertEqual(command['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(command['targetPos'], [{'x': 11, 'y': 8}])
 
     def test_later_day_returns_to_weapon_instead_of_collecting_at_dusk(self):
         state, role = defended_state()
@@ -235,7 +236,13 @@ class EconomyTests(unittest.TestCase):
         state, role = economy_state()
         state.team_our.roles[0].health = 1500
         role.backpack = ['stone']*20 + ['Medicine', 'Bomb', 'WeaponUpgradeVoucher1']
-        self.assertEqual(sellable_ores(role, state), {'stone': 8})
+        # 墙目标是动态的，断言不变式：缺口所需的石头全部留着，只卖超出部分，道具永不出售。
+        from src.agent.brain import own_station
+        from src.agent.opening import staged_wall_plan
+        walls = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                 if r.role_type == 'wall' and r.health > 0}
+        missing = len(set(staged_wall_plan(state, own_station(state))) - walls)
+        self.assertEqual(sellable_ores(role, state), {'stone': 20 - missing})
 
     def test_day1_still_uses_small_stone_reserve(self):
         state, role = economy_state()
@@ -309,6 +316,20 @@ class EconomyTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(2, 1), 'copper'))
         self.assertIsNotNone(profitable_mine(role, state, blocked, set()))
         self.assertEqual(state.policy_memory['mine_targets'][str(role.id)], sticky)
+
+    def test_soft_cap_rotates_away_from_ore_above_eighty_percent(self):
+        state, role = economy_state()
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 8
+        state.map_info.zones = [
+            Zone(Pos(5, 5), 'vendor'),
+            Zone(Pos(2, 1), 'copper'),
+            Zone(Pos(3, 1), 'iron'),
+        ]
+        picked = pick_mine(role, state, build_blocked_set(state), set(),
+                           want_ores=('iron', 'copper'), purpose='income')
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked[0].neutral_type, 'iron')
 
     def test_trip_cap_prefers_near_iron_over_far_copper(self):
         state, role = economy_state()
@@ -555,25 +576,22 @@ class TacticalTests(unittest.TestCase):
         self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set(), allow_travel=False))
 
 
-class FunnelTests(unittest.TestCase):
-    def test_mirrored_outer_gap_is_open_and_not_a_movement_route(self):
+class WallLayoutTests(unittest.TestCase):
+    def test_single_layer_front_on_both_sides(self):
+        """规则不允许双层墙：迎敌方向只有一整列墙。"""
+        from src.agent.opening import attack_direction, defense_bounds
         for base_x in (10, 30):
             state = opening_state()
             base = state.team_our.roles[0]
             base.pos = Pos(base_x, 10)
-            gap = funnel_gap(state, base)
+            left, right, bottom, top = defense_bounds(state, base)
+            direction = attack_direction(state, base)
+            front = right if direction == 1 else left
             walls = set(wall_ring(state, base))
-            self.assertNotIn(gap, walls)
-            self.assertIn(gap, movement_avoid(state))
-            inner_x = base_x+3 if base_x == 10 else base_x-2
-            self.assertIn((inner_x, gap[1]), walls)
-            self.assertEqual(abs(gap[0]-inner_x), 2)
-
-    def test_map_edge_falls_back_to_one_layer(self):
-        state = opening_state()
-        state.map_info.width = 6
-        state.team_our.roles[0].pos = Pos(1, 10)
-        self.assertIsNone(funnel_gap(state, state.team_our.roles[0]))
+            self.assertTrue(all((front, y) in walls for y in range(bottom, top + 1)))
+            beyond = {p for p in walls if (p[0] - front) * direction > 0}
+            self.assertEqual(beyond, set())
+            self.assertEqual(primary_wall_plan(state, base), wall_ring(state, base))
 
     def test_wall_cannot_cut_off_only_vendor_route(self):
         state = opening_state()
@@ -585,3 +603,108 @@ class FunnelTests(unittest.TestCase):
         state.map_info.zones = [Zone(Pos(5, 2), 'vendor')]
         blocked = {(3, y) for y in range(7) if y != 2} | {(5, 2)}
         self.assertFalse(safe_wall(state, (3, 2), blocked, {}))
+
+
+def _spike_state(gold, copper):
+    from test_defense_priority import defended
+    state = defended()
+    state.round_no = 150
+    state.team_our.gold_num = gold
+    state.map_info.zones += [Zone(Pos(8, 9), 'weaponShop'), Zone(Pos(4, 12), 'vendor'),
+                             Zone(Pos(2, 14), 'copper')]
+    state.vendor_shop_list = [ShopItem('stone', 1), ShopItem('iron', 3), ShopItem('copper', 5)]
+    economist = next(r for r in state.team_our.roles if r.id == 2)
+    economist.pos = Pos(12, 9)
+    economist.back_pack_capability = 100
+    economist.backpack = ['copper'] * copper
+    return state, economist
+
+
+class SpikeAndDuskSaleTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def test_spike_day_economist_clears_pack_first(self):
+        from unittest import mock
+        state, economist = _spike_state(0, 20)
+        with mock.patch('src.agent.economy.price_spike_today', return_value={'copper'}):
+            self.decide(state)
+        codes = [e['code'] for e in state.decision_events if e.get('role_id') == economist.id]
+        self.assertIn('spike_day_cashout', codes)
+        self.assertIn(economist.id, state.policy_memory['selling_roles'])
+
+    def test_spike_day_economist_buys_upgrade_after_pack_is_empty(self):
+        from unittest import mock
+        state, economist = _spike_state(300, 0)
+        with mock.patch('src.agent.economy.price_spike_today', return_value={'copper'}):
+            self.decide(state)
+        self.assertEqual(state.policy_memory['spike_cashout'], {'1': 'upgrade'})
+        self.assertEqual(state.worker_item_jobs[economist.id]['kind'], 'weapon')
+
+    def test_spike_day_returns_to_mining_when_gold_is_spent(self):
+        from unittest import mock
+        state, economist = _spike_state(0, 0)
+        state.policy_memory['spike_cashout'] = {'1': 'upgrade'}
+        with mock.patch('src.agent.economy.price_spike_today', return_value={'copper'}):
+            self.decide(state)
+        self.assertEqual(state.policy_memory['spike_cashout'], {'1': 'done'})
+
+    def _dusk_sale(self, contacts):
+        from collections import Counter
+        from src.agent.economy import _sale_return_rounds, _vendor_choices
+        state, role = defended_state(gold=0)
+        role.backpack = ['copper'] * 30
+        blocked = build_blocked_set(state)
+        path = min(_vendor_choices(role, state, blocked, set()), key=lambda c: c[:3])[4]
+        sale_rounds = _sale_return_rounds(role, state, blocked, Counter({'copper': 30}), path)[0]
+        state.round_no = 130 * 2 + 70 - (sale_rounds - 2)  # 天黑前卖得完，但回炮会晚2回合
+        if contacts:
+            state.policy_memory['night_contact'] = contacts
+        return liquidate(role, state, blocked, set())
+
+    def test_dusk_sale_blocked_without_observed_night_contact(self):
+        self.assertEqual(self._dusk_sale(None), (False, None))
+
+    def test_dusk_sale_uses_observed_after_dark_grace(self):
+        handled, cmd = self._dusk_sale({'1': 16})
+        self.assertTrue(handled)
+        self.assertEqual(cmd['action'], 'move')
+
+    def test_night_contact_records_first_close_robot_round(self):
+        from src.agent.economy import after_dark_grace, note_night_contact
+        state, _role = defended_state(gold=0)
+        state.round_no = 130 + 70 + 9
+        base = state.team_our.roles[0]
+        state.robot.roles = [RobotRole(100, Pos(base.pos.x + 5, base.pos.y), 'smallRobot', 10)]
+        note_night_contact(state)
+        self.assertEqual(state.policy_memory['night_contact'], {'1': 9})
+        self.assertEqual(after_dark_grace(state), 5)
+
+    def test_night_worker_can_sell_after_wave_is_gone(self):
+        state, role = defended_state(gold=0)
+        state.round_no = 130 + 100
+        role.backpack = ['copper'] * 60
+        state.policy_memory['night_saw_threat'] = True
+        state.policy_memory['night_empty_streak'] = 1
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertTrue(handled)
+        self.assertIsNotNone(cmd)
+
+    def test_ore_rising_soon_is_held_even_when_weapon_voucher_is_short(self):
+        from unittest import mock
+        state, role = defended_state(gold=0)
+        role.backpack = ['copper'] * 30 + ['iron'] * 10
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            ores = sellable_ores(role, state)
+        self.assertEqual(ores['copper'], 30)
+        self.assertNotIn('iron', ores)
+
+    def test_opening_does_not_sell_ore_rising_soon(self):
+        from unittest import mock
+        from src.agent.opening_schedule import opening_sell_metal
+        state, role = defended_state(gold=0)
+        state.round_no = 30
+        role.backpack = ['iron'] * 10
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            cmd = opening_sell_metal(role, state, build_blocked_set(state), set(), 'fund')
+        self.assertIsNone(cmd)

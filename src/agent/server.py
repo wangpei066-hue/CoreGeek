@@ -16,6 +16,7 @@ from .news_memory import NewsMemory
 from .prompt_router import PromptRouter
 from .brain import V1Strategy, BasicActionValidator, is_day_round
 from .decision_log import snapshot, build_report, write_report, emit_console_report
+from .log_format import log_commit_banner
 
 
 def load_build_memory(state: "MatchState", state_dir: Path) -> None:
@@ -102,6 +103,7 @@ class GameServer:
         self.prompt_router = PromptRouter(self.news_memory)
         self.app = Flask(__name__)
         self._setup_routes()
+        log_commit_banner()
 
     def _setup_routes(self):
         @self.app.route("/", methods=["POST"])
@@ -141,7 +143,8 @@ class GameServer:
                 except FileExistsError:
                     continue
 
-            # 策略决策
+            # 若启动时 stderr 未被平台收集，首回合补打一次；已打过则跳过。
+            log_commit_banner(data.get("roundNo"))
             log_task_exchange('request', seq, data, self.task_solver.session, data.get('roundNo'))
             self.load_build_memory()
             self.match_state.update(data)

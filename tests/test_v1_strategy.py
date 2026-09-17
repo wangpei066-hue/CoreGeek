@@ -21,8 +21,9 @@ from src.agent.brain import (
     decide_self_heal,
     is_day_round,
     max_health,
-    pick_attack_target,
+
 )
+from src.agent.targeting import plan_attack
 
 FIXTURE = Path(__file__).parent / "fixtures/sample_match_state.json"
 
@@ -103,25 +104,25 @@ class CombatTargetingTests(unittest.TestCase):
     def test_no_target_out_of_range(self):
         weapon = make_role(10020, 0, 0, "gatling", attack_range=3, level=1)
         robots = [RobotRole(id=1, pos=Pos(10, 10), role_type="smallRobot", health=40)]
-        self.assertIsNone(pick_attack_target(weapon, robots))
+        self.assertIsNone(plan_attack(weapon, robots))
 
-    def test_prioritizes_boss_over_small(self):
+    def test_gatling_finishes_low_health_robot(self):
         weapon = make_role(10020, 0, 0, "gatling", attack_range=5, level=1)
         robots = [
             RobotRole(id=1, pos=Pos(1, 0), role_type="smallRobot", health=40),
-            RobotRole(id=2, pos=Pos(2, 0), role_type="bossRobot", health=800),
+            RobotRole(id=2, pos=Pos(0, 2), role_type="smallRobot", health=5),
         ]
-        target = pick_attack_target(weapon, robots)
-        self.assertEqual(target.id, 2)
+        positions, _ = plan_attack(weapon, robots)
+        self.assertEqual(positions, [{"x": 0, "y": 2}])
 
-    def test_finishes_lowest_health_within_same_tier(self):
+    def test_gatling_skips_target_hidden_behind_nearer_robot(self):
         weapon = make_role(10020, 0, 0, "gatling", attack_range=5, level=1)
         robots = [
             RobotRole(id=1, pos=Pos(1, 0), role_type="smallRobot", health=40),
-            RobotRole(id=2, pos=Pos(2, 0), role_type="smallRobot", health=5),
+            RobotRole(id=2, pos=Pos(3, 0), role_type="smallRobot", health=5),
         ]
-        target = pick_attack_target(weapon, robots)
-        self.assertEqual(target.id, 2)
+        positions, damage = plan_attack(weapon, robots)
+        self.assertEqual(damage, {1: 10})
 
 
 class V1StrategyDayTests(unittest.TestCase):
@@ -209,6 +210,19 @@ class V1StrategyNightTests(unittest.TestCase):
         state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
         commands = self.strategy.decide(state)
         self.assertNotIn(10040, commands)
+
+    def test_fighter_switches_to_adjacent_ready_rocket_when_assigned_rocket_cools_down(self):
+        state = minimal_state(round_no=75)
+        cooling = make_role(10040, 9, 10, "rocket", attack_range=10, level=1, cooldown=2)
+        ready = make_role(10041, 10, 10, "rocket", attack_range=10, level=1, cooldown=0)
+        worker = make_role(10010, 9, 11, "worker", backpack=[], back_pack_capability=100)
+        state.team_our.roles = [state.team_our.roles[0], cooling, ready, worker]
+        state.policy_memory["weapon_assignment"] = {"10010": 10040}
+        state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
+        commands = self.strategy.decide(state)
+        self.assertNotIn(10040, commands)
+        self.assertEqual(commands[10041]["action"], "attack")
+        self.assertEqual(commands[10041]["controllerId"], "10010")
 
     def test_multi_target_count_matches_weapon_level(self):
         state = minimal_state(round_no=75)

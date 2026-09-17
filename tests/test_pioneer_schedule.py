@@ -9,7 +9,7 @@ from pathlib import Path
 from src.agent.brain import BasicActionValidator, V1Strategy
 from src.agent.economy import defense_due, pick_weapon_voucher_buyer, solver_ready_to_submit
 from src.agent.grid import build_blocked_set
-from src.agent.opening import movement_avoid, station_return_detail, station_return_steps
+from src.agent.opening import station_return_detail, station_return_steps
 from src.agent.pioneer_schedule import (
     ESTIMATED_SOLVE_ROUNDS, SCHEDULER_VERSION, SHOP_PROGRESS_KEY,
     SHOP_STALL_ROUNDS, defense_snapshot, estimated_solve_rounds, evaluate_task_candidates,
@@ -156,7 +156,8 @@ class PioneerScheduleTests(unittest.TestCase):
         self.assertFalse(scheduler_task_session(state))
         self.assertFalse(solver_ready_to_submit(state))
         commands = self.decide(state)
-        self.assertIn('3', {c['controllerId'] for c in commands.values() if c.get('action') == 'attack'})
+        # 服务器上任务仍在进行（phaseTask 非空）：过期会话不影响，开拓者照样留在任务点。
+        self.assertNotIn('3', {c['controllerId'] for c in commands.values() if c.get('action') == 'attack'})
 
     def test_stale_task_session_does_not_leak_into_new_task(self):
         """phaseTask 换了新任务时，求解器必须重新开会话，不能把旧任务的"已可提交"状态带过来。"""
@@ -244,7 +245,7 @@ class PioneerScheduleTests(unittest.TestCase):
 
     def test_return_zero_only_when_already_at_post(self):
         state, pioneer = self.armed_day(pioneer_pos=Pos(11, 12))
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         detail = station_return_detail(pioneer, state, blocked)
         snap = defense_snapshot(pioneer, state, blocked)
         self.assertEqual(snap['travel'], detail['steps'])
@@ -268,7 +269,7 @@ class PioneerScheduleTests(unittest.TestCase):
         state, pioneer = self.armed_day(pioneer_pos=Pos(5, 5), task_pos=Pos(8, 8))
         state.team_our.roles = [r for r in state.team_our.roles
                                 if r.role_type not in ('rocket', 'gatling', 'railgun', 'station')]
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         detail = station_return_detail(pioneer, state, blocked)
         self.assertIsNone(detail['steps'])
         self.assertEqual(detail['reason'], 'no_station_or_weapon')
@@ -377,7 +378,7 @@ class PioneerScheduleTests(unittest.TestCase):
     def test_at_gun_without_pressure_does_not_muster_idle(self):
         from src.agent.economy import defense_occupancy, muster_for_night
         state, pioneer = self._post_task_home_state(stale_active=False)
-        blocked = build_blocked_set(state) | movement_avoid(state)
+        blocked = build_blocked_set(state)
         occupancy, snap = defense_occupancy(pioneer, state, blocked)
         self.assertEqual(occupancy, 'free')
         self.assertTrue(snap.get('atGun') or snap.get('alreadyAtPost'))

@@ -59,11 +59,46 @@ class OpeningTests(unittest.TestCase):
     def test_wall_plan_faces_right_and_leaves_rear_open(self):
         state = opening_state()
         ring = wall_ring(state, state.team_our.roles[0])
-        self.assertEqual(len(ring), 19)
+        self.assertEqual(len(ring), 16)  # 单层：正面一列 + 两翼延伸到院子后沿，无外层
         # 后方竖边保持开放；侧墙延伸到最靠后的短射程武器列。
         self.assertFalse(any(x == 9 and 7 < y < 12 for x, y in ring))
         self.assertTrue(all(x == 13 for x, y in ring[:6]))
         self.assertIn((13, 12), ring)
+
+    def test_wings_extend_front_to_back_before_rear_corners(self):
+        state = opening_state()
+        ring = wall_ring(state, state.team_our.roles[0])
+        wings = [p for p in ring[6:]]
+        xs = [x for x, _ in wings]
+        self.assertEqual(xs, sorted(xs, reverse=True))  # 基地朝右：两翼从靠前（x大）往后修
+        self.assertEqual({p[0] for p in wings[-2:]}, {8})  # 最后才是后沿两个角
+
+    def test_day_one_survival_walls_are_front_plus_wing_heads(self):
+        from src.agent.opening import survival_wall_plan
+        state = opening_state()
+        base = state.team_our.roles[0]
+        plan = survival_wall_plan(state, base)
+        self.assertEqual(len(plan), 8)
+        self.assertEqual(set(plan), set(wall_ring(state, base)[:8]))
+        self.assertNotIn((8, 7), plan)
+
+    def test_builder_keeps_collecting_until_batch_is_enough(self):
+        from src.agent.brain import V1Strategy, BasicActionValidator
+        state = opening_state()
+        state.round_no = 150
+        state.team_our.roles += [
+            make_role(20, 12, 8, 'rocket', level=1),
+            make_role(21, 11, 8, 'rocket', level=1),
+            make_role(22, 12, 11, 'railgun', level=1),
+        ]
+        builder = state.team_our.roles[1]
+        builder.pos = Pos(5, 9)  # 石矿 (6, 9) 旁
+        builder.backpack = ['stone'] * 3
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertEqual(commands[builder.id], {'action': 'collect', 'targetPos': [{'x': 6, 'y': 9}]})
+        builder.backpack = ['stone'] * 16
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotEqual(commands[builder.id]['action'], 'collect')
 
     def test_failed_wall_position_is_not_counted_as_completed(self):
         state = opening_state()
@@ -134,12 +169,15 @@ class OpeningTests(unittest.TestCase):
                             for e in state.decision_events))
 
     def test_two_weapons_on_rear_rank_one_cell_forward(self):
-        from src.agent.opening import weapon_slots
+        from src.agent.opening import weapon_slot_plan, weapon_slots
         state = opening_state()
+        plan = weapon_slot_plan(state, state.team_our.roles[0])
         slots = weapon_slots(state, state.team_our.roles[0])
         self.assertEqual(len(slots), 3)
+        self.assertEqual([name for name, _point in plan], ['rocket', 'railgun', 'rocket'])
         self.assertEqual(slots[0][0], slots[1][0])
-        self.assertEqual(slots[2][0], slots[0][0] + 1)
+        self.assertEqual(slots[2][0], slots[0][0] - 1)
+        self.assertEqual(slots[0][1], slots[2][1])
         self.assertNotEqual(slots[0][1], slots[1][1])
 
     def test_time_budget_blocks_sell_when_walls_would_miss_night(self):
@@ -174,7 +212,8 @@ class OpeningTests(unittest.TestCase):
         }
         ores.discard(None)
         self.assertTrue(ores)
-        self.assertEqual(ores, {'stone'})
+        self.assertIn('stone', ores)
+        self.assertIn('copper', ores)
         self.assertEqual(state.policy_memory.get('opening_stage'), 'BUILD_SURVIVAL_WALL')
         for rid in (1, 2):
             cmd = commands.get(rid) or {}
@@ -207,7 +246,7 @@ class OpeningTests(unittest.TestCase):
             for rid in (1, 2)
         }
         self.assertIn('stone', ores)
-        self.assertNotIn('copper', ores)
+        self.assertIn('copper', ores)
         self.assertNotIn('iron', ores)
 
     def test_day1_pioneer_can_buy_upgrade_while_workers_keep_walling(self):
@@ -273,7 +312,7 @@ class OpeningTests(unittest.TestCase):
         base = state.team_our.roles[0]
         base.pos = Pos(30, 8)
         line = wall_ring(state, base)
-        self.assertEqual(len(line), 19)
+        self.assertEqual(len(line), 16)
         self.assertFalse(any(x == 32 and 5 < y < 10 for x, y in line))
         self.assertTrue(all(x == 28 for x, y in line[:6]))
 
@@ -295,18 +334,46 @@ class OpeningTests(unittest.TestCase):
         target = commands[3]['targetPos'][0]
         self.assertNotIn((target['x'], target['y']), wall_ring(state, state.team_our.roles[0]))
 
-    def test_night_three_different_weapons_and_high_tier_target(self):
+    def test_night_three_different_weapons_share_damage_ledger(self):
         state = opening_state()
         state.round_no = 75
         for i, (kind, x) in enumerate([('gatling', 9), ('railgun', 12), ('rocket', 10)]):
             state.team_our.roles.append(make_role(20+i, x, 10 if i < 2 else 11, kind, level=1, attack_range=20))
         state.robot.roles = [RobotRole(100, Pos(15, 10), 'smallRobot', 1),
-                             RobotRole(101, Pos(16, 10), 'bossRobot', 800)]
+                             RobotRole(101, Pos(16, 12), 'bossRobot', 800)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
         attacks = [c for c in commands.values() if c['action'] == 'attack']
         self.assertEqual(len(attacks), 3)
         self.assertEqual(len({c['controllerId'] for c in attacks}), 3)
-        self.assertTrue(all(c['targetPos'] == [{'x': 16, 'y': 10}] for c in attacks))
+        # 1血小怪只需一发：火箭溅射已打死它，其余武器不再重复打它
+        weak_hits = [c for c in attacks if c['targetPos'] == [{'x': 15, 'y': 10}]]
+        self.assertLessEqual(len(weak_hits), 1)
+
+    def test_two_people_control_three_guns_by_switching_rockets(self):
+        state = opening_state()
+        state.round_no = 75
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.health = 0
+        front_rocket = make_role(20, 12, 8, 'rocket', cooldown=2, level=1, attack_range=20)
+        railgun = make_role(21, 12, 11, 'railgun', level=1, attack_range=20)
+        rear_rocket = make_role(22, 11, 8, 'rocket', cooldown=0, level=1, attack_range=20)
+        state.team_our.roles += [front_rocket, railgun, rear_rocket]
+        worker1 = next(r for r in state.team_our.roles if r.id == 1)
+        worker2 = next(r for r in state.team_our.roles if r.id == 2)
+        worker1.pos = Pos(11, 9)
+        worker2.pos = Pos(12, 10)
+        state.policy_memory['weapon_assignment'] = {
+            str(worker1.id): front_rocket.id,
+            str(worker2.id): railgun.id,
+        }
+        state.robot.roles = [RobotRole(101, Pos(16, 10), 'bossRobot', 800)]
+
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+
+        self.assertNotIn(front_rocket.id, commands)
+        self.assertEqual(commands[rear_rocket.id]['action'], 'attack')
+        self.assertEqual(commands[rear_rocket.id]['controllerId'], str(worker1.id))
+        self.assertEqual(commands[railgun.id]['controllerId'], str(worker2.id))
 
     def test_complete_opening_on_synthetic_buildable_map(self):
         state = opening_state()
@@ -352,7 +419,7 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(walls <= primary)
         # 攒够 STONE_BATCH(6) 再成片建墙后，同样的 70 回合窗口里完工数会比"采一块建一道"更少，
         # 这是批量搬运减少往返的预期代价，不是回归；只要求确实有墙建成。
-        self.assertGreaterEqual(len(walls), 8)
+        self.assertGreaterEqual(len(walls), 7)
 
 
     def _rockets(self, state):

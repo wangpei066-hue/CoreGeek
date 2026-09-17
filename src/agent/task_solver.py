@@ -993,7 +993,14 @@ def default_heritage_experience(task, documents):
     blob = '\n'.join(str(item.get('content') or '') for item in documents or [])
     urls = [clean_url(url) for url in URL_RE.findall(blob + '\n' + (task or ''))]
     parsed = urlparse(urls[0]) if urls else urlparse('http://localhost:8899/api/v1/heritage/search')
-    path = parsed.path or '/api/v1/heritage/search'
+    # Task briefs commonly provide only the service origin (for example
+    # ``http://localhost:8899``); treating its root path as the API endpoint
+    # causes an avoidable 404 when stale API_DOCS is intentionally skipped.
+    # Preserve an explicitly documented heritage endpoint, otherwise use the
+    # verified search route for this known heritage service.
+    explicit_path = parsed.path.rstrip('/')
+    path = (explicit_path if 'heritage' in explicit_path.lower() or '遗产' in explicit_path
+            else '/api/v1/heritage/search')
     if 'heritage' not in path.lower() and '遗产' not in blob:
         return None
     base = '%s://%s' % (parsed.scheme or 'http', parsed.netloc or 'localhost:8899')
@@ -1159,6 +1166,18 @@ class PioneerTaskSolver:
                     and item.get('requestId') == request_id
                     and item.get('event') in ('read_document', 'execute_tool', 'deploy_probe', 'api_fetch')):
                 return item
+        # Some real task runners return the raw stdout of a command instead
+        # of the PIONEER_TASK wrapper.  In particular, ./check may return
+        # ``[ OK ] ... TOKEN: ...`` directly.  Do not discard that result while
+        # waiting for an execute_tool response: it is the authoritative
+        # completion evidence for deployment tasks.
+        if self.session.get('stage') == 'wait_tool':
+            match = re.match(r'^\[exitCode:(-?\d+)\]\n?(.*)$',
+                             state.last_cmd_result or '', flags=re.DOTALL)
+            if match:
+                return dict(marker=MARKER, requestId=request_id,
+                            event='execute_tool', exitCode=int(match.group(1)),
+                            output=match.group(2), outputTail=match.group(2))
         status, payload, raw = parse_curl_output(state.last_cmd_result)
         if payload is not None and ('code' in payload or 'data' in payload):
             return dict(

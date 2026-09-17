@@ -13,6 +13,15 @@ from .news_logging import log_folk_plan, log_news_event, log_official_plan
 
 DAY_NIGHT_CYCLE = 130
 TREASURE_ACT_CONFIDENCE = 0.7
+# 已有宝藏假设置信度超过此值时，传闻 LLM 优先于官方矿价 LLM。
+FOLK_PRIORITY_CONFIDENCE = 0.5
+_CN_DAY = r'(?:[0-9]+|[一二三四五六七八九十]+)'
+_OPEN_TIME_IN_TEXT = re.compile(
+    rf'第\s*{_CN_DAY}\s*[天日].{{0,16}}(?:开|启|召唤|解开|可进|窗口)'
+    rf'|(?:开|启|召唤|解开|可进|窗口).{{0,16}}第\s*{_CN_DAY}\s*[天日]'
+    rf'|回合\s*\d+',
+    re.I,
+)
 COMBAT_ITEM_NAMES = {
     "Medicine", "DizzyWeapon", "Bomb", "WallFixer",
     "WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2",
@@ -42,6 +51,16 @@ _NEGATE_RE = re.compile(
     r"(?:未发生|并未发生|没有发生|不会发生).{0,8}(?:塌方|停工|矿难|停产)|"
     r"(?:不会|暂不|尚未|并未|未)(?:全面)?(?:停工|停产|禁采|停采|涨价)|"
     r"(?:不停工|未停工|不涨价|未涨价|无需停工)"
+)
+_RESUME_RE = re.compile(
+    r"(?:即日起|现已|已经|正式)恢复(?:开采|生产|作业)|"
+    r"已恢复(?:开采|生产)|结束停工|解除禁采|"
+    r"修复(?:工程)?完成"
+)
+# 首发停工里常出现「需要2天才能恢复开采」——这是未来时，不能当复工。
+_RESUME_FUTURE_RE = re.compile(
+    r"(?:才能|方可|预计|需要|需|待).{0,16}恢复(?:开采|生产)|"
+    r"(?:左右|上下).{0,8}(?:才能完成并)?恢复(?:开采|生产)"
 )
 
 
@@ -187,6 +206,102 @@ def heuristic_ore_effect(official_news: str, published_day: int) -> Optional[dic
     return effects[0] if effects else None
 
 
+def joined_legend_text(legends) -> str:
+    return " ".join(str(row.get("text") or "") for row in (legends or []) if isinstance(row, dict))
+
+
+def legend_mentions_open_time(text: str) -> bool:
+    """正文是否明确写了开启日/回合。听到传闻的那天、上古传说里的「开启」都不算。"""
+    return bool(text and _OPEN_TIME_IN_TEXT.search(text))
+
+
+def is_resume_official(text: str) -> bool:
+    """是否为「现在已恢复」通报。首发里的『N天才能恢复开采』不算。"""
+    if not text:
+        return False
+    if _RESUME_FUTURE_RE.search(text):
+        return False
+    return bool(_RESUME_RE.search(text))
+
+
+def _int_day_list(values) -> list:
+    days = []
+    for value in values or []:
+        if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+            days.append(int(value))
+    return sorted(set(days))
+
+
+def merge_ore_effect(previous: Optional[dict], incoming: dict, resume: bool) -> dict:
+    """进度确认与旧日程取并集；恢复开采则清空；空且非恢复则保留旧窗。"""
+    effect = dict(incoming)
+    if resume:
+        effect["mineBannedDays"] = []
+        effect["priceUpDays"] = []
+        return effect
+    new_banned = _int_day_list(effect.get("mineBannedDays"))
+    new_price = _int_day_list(effect.get("priceUpDays"))
+    if previous and not new_banned and not new_price:
+        effect["mineBannedDays"] = _int_day_list(previous.get("mineBannedDays"))
+        effect["priceUpDays"] = _int_day_list(previous.get("priceUpDays"))
+        return effect
+    if previous:
+        new_banned = sorted(set(_int_day_list(previous.get("mineBannedDays"))) | set(new_banned))
+        new_price = sorted(set(_int_day_list(previous.get("priceUpDays"))) | set(new_price))
+    effect["mineBannedDays"] = new_banned
+    effect["priceUpDays"] = new_price
+    return effect
+
+
+def _days_from_notes(notes: str) -> list:
+    """LLM 偶尔把日程只写在 notes 里，尝试捞回数字日（避开「工期2天」这类）。"""
+    text = notes or ""
+    found = []
+    for match in re.finditer(
+        r"(?:禁采|停工|涨价)(?:日|天)?[为是:：]\s*([0-9]+(?:\s*[、,，和及至\-–~到]+\s*[0-9]+)*)",
+        text,
+    ):
+        found.extend(int(x) for x in re.findall(r"[0-9]+", match.group(1)))
+    for match in re.finditer(r"第\s*([0-9]+)\s*[、,，和及]\s*([0-9]+)\s*天", text):
+        found.extend([int(match.group(1)), int(match.group(2))])
+    return sorted({d for d in found if 1 <= d <= 20})
+
+
+def fill_empty_ore_effect(effect: dict, official_text: str, published_day: int) -> dict:
+    """LLM 交空窗时的兜底：优先 notes 里的日，再跑启发式。"""
+    if effect.get("mineBannedDays") or effect.get("priceUpDays"):
+        return effect
+    if is_resume_official(official_text):
+        return effect
+    notes_days = _days_from_notes(str(effect.get("notes") or ""))
+    # notes「禁采日为3和4」常见；工期「需要2天」也会出现 2，过滤掉单独的工期数字需靠语境。
+    # 若 notes 同时出现 ≥2 个合理日，采用它们。
+    if len(notes_days) >= 2:
+        effect = dict(effect)
+        effect["mineBannedDays"] = notes_days
+        effect["priceUpDays"] = list(notes_days)
+        effect["notes"] = (effect.get("notes") or "") + " | filled_from_notes"
+        return effect
+    for weak in heuristic_ore_effects(official_text, published_day):
+        if weak.get("affectedOre") == effect.get("affectedOre"):
+            effect = dict(effect)
+            effect["mineBannedDays"] = list(weak.get("mineBannedDays") or [])
+            effect["priceUpDays"] = list(weak.get("priceUpDays") or [])
+            effect["notes"] = (effect.get("notes") or "") + " | filled_from_heuristic"
+            return effect
+    # 矿种对不上时，仍可用启发式第一条（同文通常只有一个矿）
+    weak = heuristic_ore_effect(official_text, published_day)
+    if weak and (weak.get("mineBannedDays") or weak.get("priceUpDays")):
+        effect = dict(effect)
+        if not effect.get("affectedOre"):
+            effect["affectedOre"] = weak["affectedOre"]
+        if effect.get("affectedOre") == weak.get("affectedOre"):
+            effect["mineBannedDays"] = list(weak.get("mineBannedDays") or [])
+            effect["priceUpDays"] = list(weak.get("priceUpDays") or [])
+            effect["notes"] = (effect.get("notes") or "") + " | filled_from_heuristic"
+    return effect
+
+
 class NewsMemory:
     """落盘 state/news_memory.json：官方消息效应、传闻列表、宝藏假设与 LLM 额度。"""
 
@@ -196,6 +311,7 @@ class NewsMemory:
             "context": None,
             "officialHash": None,
             "officialDay": None,
+            "officialHistory": [],
             "oreEffects": [],
             "officialPlan": {},
             "legends": [],
@@ -237,6 +353,7 @@ class NewsMemory:
             "context": None,
             "officialHash": None,
             "officialDay": None,
+            "officialHistory": [],
             "oreEffects": [],
             "officialPlan": {},
             "legends": [],
@@ -293,22 +410,30 @@ class NewsMemory:
             self.data["officialDay"] = day
             meaningful = official.strip() and "无重大新闻" not in official
             if meaningful:
-                effects = heuristic_ore_effects(official, day)
-                for weak in effects:
-                    self._upsert_ore_effect(weak)
-                # 机制命中则不申请矿价 LLM；只有匹配失败才送一次。
-                self.data["needOreParse"] = not bool(effects)
-                if effects and getattr(state, "decision_events", None) is not None:
-                    trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
-                          effects=effects)
-                weak = effects[0] if effects else None
+                # 暂时不用启发式：官方原文变化后固定走矿价 LLM（每天至多 1 次）。
+                # effects = heuristic_ore_effects(official, day)
+                # for weak in effects:
+                #     self._upsert_ore_effect(weak)
+                # self.data["needOreParse"] = not bool(effects)
+                # if effects and getattr(state, "decision_events", None) is not None:
+                #     trace(state, None, "ore_heuristic", "官方消息关键词启发式已写入矿价日程",
+                #           effects=effects)
+                # weak = effects[0] if effects else None
+                history = self.data.setdefault("officialHistory", [])
+                if not history or history[-1].get("text") != official:
+                    history.append({"day": day, "round": state.round_no, "text": official})
+                self.data["needOreParse"] = True
+                current = list(self.data.get("oreEffects") or [])
                 log_news_event(
                     event="official_ingested", roundNo=state.round_no,
                     title=f"【新闻】官方消息 | {headline(official)}",
-                    officialNews=official, oreEffect=weak, oreEffects=effects,
+                    officialNews=official,
+                    oreEffect=current[0] if current else None,
+                    oreEffects=current,
+                    officialHistory=[row.get("text") for row in history],
                 )
                 log_official_plan(state.round_no, self.store_official_plan(state.round_no),
-                                  source=(weak or {}).get("source") or "pending_llm")
+                                  source="pending_llm")
 
         if folk and folk.strip():
             legends = self.data.setdefault("legends", [])
@@ -339,17 +464,25 @@ class NewsMemory:
         ore = payload.get("affectedOre")
         if ore not in ORE_ALIASES:
             return
-        effect = {
+        previous = next(
+            (row for row in (self.data.get("oreEffects") or []) if row.get("affectedOre") == ore),
+            None,
+        )
+        incoming = {
             "affectedOre": ore,
-            "mineBannedDays": sorted({int(d) for d in payload.get("mineBannedDays", []) if isinstance(d, int) or str(d).isdigit()}),
-            "priceUpDays": sorted({int(d) for d in payload.get("priceUpDays", []) if isinstance(d, int) or str(d).isdigit()}),
+            "mineBannedDays": _int_day_list(payload.get("mineBannedDays")),
+            "priceUpDays": _int_day_list(payload.get("priceUpDays")),
             "notes": payload.get("notes", ""),
             "source": "llm",
             "publishedDay": published_day,
         }
-        # 兼容字符串数字
-        effect["mineBannedDays"] = [int(d) for d in effect["mineBannedDays"]]
-        effect["priceUpDays"] = [int(d) for d in effect["priceUpDays"]]
+        # 与旧日程取并集，避免「仍在修复」把 Day2 推出的 [3,4] 盖成 [3]。
+        official = self.data.get("officialHash") or ""
+        resume = is_resume_official(official)
+        effect = merge_ore_effect(previous, incoming, resume=resume)
+        # #651：LLM 把「禁采日为3和4」只写进 notes、数组交空 → 禁采/涨价/抢收全丢。
+        if not resume:
+            effect = fill_empty_ore_effect(effect, official, published_day)
         self._upsert_ore_effect(effect)
         self.data["needOreParse"] = False
         self.data["lastOreParseDay"] = published_day
@@ -385,9 +518,12 @@ class NewsMemory:
             hyp["altarPos"] = None
         if not hyp["altarPos"] or not hyp["items"] or confidence < TREASURE_ACT_CONFIDENCE:
             hyp["ready"] = False
+        if not legend_mentions_open_time(joined_legend_text(self.data.get("legends"))):
+            hyp["openFromRound"] = None
+            hyp["openToRound"] = None
         self.data["treasureHypothesis"] = hyp
-        # 置信度不够就等后续传闻再解，不要把低分结果当成定论。
-        self.data["needTreasureDecode"] = confidence < TREASURE_ACT_CONFIDENCE
+        # 这一批原文已经解过；等新传闻或召唤失败 2/3 再问，避免同一批低分重刷额度。
+        self.data["needTreasureDecode"] = False
         self.data["lastTreasureDecodeDay"] = self.data.get("llmDay")
         plan = self.store_folk_plan()
         self.save()
@@ -454,8 +590,21 @@ class NewsMemory:
     def folk_needs_prompt(self) -> bool:
         return bool(self.data.get("needTreasureDecode") and not self.data.get("treasureEmpty"))
 
+    def last_folk_confidence(self) -> float:
+        """上一轮（最近一次）宝藏 LLM 落地的置信度；尚无假设则为 0。"""
+        hyp = self.data.get("treasureHypothesis")
+        if not isinstance(hyp, dict):
+            hyp = self.data.get("folkPlan")
+        if not isinstance(hyp, dict):
+            return 0.0
+        return clamp_confidence(hyp.get("confidence", 0))
+
+    def folk_priority_over_official(self) -> bool:
+        """传闻待解且上次置信度已 >0.5 时，优先送推民间传闻。"""
+        return self.folk_needs_prompt() and self.last_folk_confidence() > FOLK_PRIORITY_CONFIDENCE
+
     def official_needs_prompt(self) -> bool:
-        """启发式未命中、且当天还没送过矿价 LLM。"""
+        """官方原文有变化待解，且当天还没送过矿价 LLM。"""
         return bool(self.data.get("needOreParse") and not self.data.get("orePromptSent"))
 
     def mark_pending(self, consumer: str, round_no: int, prompt: str) -> None:
