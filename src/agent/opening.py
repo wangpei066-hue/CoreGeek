@@ -1353,13 +1353,16 @@ def assign_weapons(state, excluded_ids=(), persist=False):
     from .brain import is_day_round
     from .opening_schedule import opening_worker_mode
     night_two_on_three = (not is_day_round(state.round_no)) and bool(dual_pairs)
-    # 首日白天三人各守一门时也让施工工先拿火箭：入夜经济工外出后他正好守双火箭，
-    # 不用天黑时和开拓者在院里对换炮位。
+    # 白天三人各守一门时按夜里两人三炮的布局分：开拓者守非火箭炮（夜里他固定开这门），
+    # 前两天施工工拿火箭（前两夜他守双火箭）。否则入夜重新分配时开拓者要穿院子换炮位，
+    # 头几回合电磁炮没人开。
     rockets_all = [w for w in weapons if w.role_type == 'rocket']
-    day1_builder_rockets = ((state.round_no or 0) < 70 and len(fighters) >= len(weapons)
-                            and any(dual_rocket_stands(state, a, b, static)
-                                    for a, b in combinations(rockets_all, 2)))
-    prefer_builder_rockets = night_two_on_three or day1_builder_rockets
+    day_layout = (is_day_round(state.round_no) and len(fighters) >= len(weapons)
+                  and any(dual_rocket_stands(state, a, b, static)
+                          for a, b in combinations(rockets_all, 2)))
+    early_days = (state.round_no or 0) // 130 < 2
+    prefer_builder_rockets = (night_two_on_three and early_days) or (day_layout and early_days)
+    prefer_pioneer_off_rockets = day_layout or night_two_on_three
     builder = next((f for f in fighters if f.role_type == 'worker'
                     and opening_worker_mode(state, f) == 'builder'), None)
 
@@ -1374,12 +1377,12 @@ def assign_weapons(state, excluded_ids=(), persist=False):
         return len(assigned | extra)
 
     def builder_off_rockets(pairs):
-        if not prefer_builder_rockets or builder is None:
-            return 0
-        weapon = next((w for f, w in pairs if f.id == builder.id), None)
-        miss = 1 if weapon is None or weapon.role_type != 'rocket' else 0
-        if day1_builder_rockets and any(w.role_type != 'rocket' for w in weapons):
-            # 首日按夜里的布局站：开拓者开非火箭炮，另一门火箭留给经济工（入夜他外出，施工工接双火箭）。
+        miss = 0
+        if prefer_builder_rockets and builder is not None:
+            weapon = next((w for f, w in pairs if f.id == builder.id), None)
+            if weapon is None or weapon.role_type != 'rocket':
+                miss += 1
+        if prefer_pioneer_off_rockets and any(w.role_type != 'rocket' for w in weapons):
             pioneer_weapon = next((w for f, w in pairs if f.role_type == 'pioneer'), None)
             if pioneer_weapon is not None and pioneer_weapon.role_type == 'rocket':
                 miss += 1
