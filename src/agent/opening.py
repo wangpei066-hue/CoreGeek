@@ -264,6 +264,22 @@ def _outside_stay_blockers(stay, width, height, here):
     return {(x, y) for x in range(width) for y in range(height) if (x, y) not in stay} - {here}
 
 
+def _yard_reaches_wall(entry, target, obstacles, yard, width, height):
+    """从院内 entry 出发、不出院，能否走到 target 的院内施工邻格（与 wall_approach_path 院内分支同一规则）。"""
+    if (entry.x, entry.y) not in yard:
+        return True
+    if chebyshev(entry, target) == 1:
+        return True
+    here = (entry.x, entry.y)
+    blockers = (set(obstacles) | {(target.x, target.y)}) - {here}
+    goals = {(c.x, c.y) for c in neighbors8(target, width, height)
+             if (c.x, c.y) in yard and (c.x, c.y) not in blockers}
+    if not goals:
+        return False
+    interior = blockers | _outside_stay_blockers(yard | {here}, width, height, here)
+    return path_to_any(entry, goals, interior, width, height) is not None
+
+
 def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     """从院子内侧接近墙。已经贴着施工格就地建造；在院内不许出院绕行。
 
@@ -282,6 +298,10 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     if yard and here not in yard:
         enter = enter_courtyard_path(role, obstacles, state, toward=target)
         if enter is not None:
+            # 进院后在院内（不许出院）够不到的缺口，院外也判不可达；
+            # 否则院外“迈进一步可达”、进院又“不可达”转身出去，在门口来回。
+            if enter and not _yard_reaches_wall(enter[-1], target, obstacles, yard, width, height):
+                return None
             return enter
     obstacles.add((target.x, target.y))
     direction = attack_direction(state, base)
@@ -1302,6 +1322,9 @@ def _assignment_score(pairs, distances, fighter_order, weapon_order):
     return (unreachable, parked, mismatch, travel)
 
 
+ASSIGNMENT_SWITCH_TOLERANCE = 3
+
+
 def assign_weapons(state, excluded_ids=(), persist=False):
     """两人三炮：人少炮多时一人守双火箭、另一人开其余炮；人够时一人一炮。把队友当障碍，里侧开里炮、外侧开外炮。"""
     fighters = sorted((r for r in state.team_our.roles if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id not in excluded_ids), key=lambda r: r.id)
@@ -1330,6 +1353,13 @@ def assign_weapons(state, excluded_ids=(), persist=False):
     from .brain import is_day_round
     from .opening_schedule import opening_worker_mode
     night_two_on_three = (not is_day_round(state.round_no)) and bool(dual_pairs)
+    # 首日白天三人各守一门时也让施工工先拿火箭：入夜经济工外出后他正好守双火箭，
+    # 不用天黑时和开拓者在院里对换炮位。
+    rockets_all = [w for w in weapons if w.role_type == 'rocket']
+    day1_builder_rockets = ((state.round_no or 0) < 70 and len(fighters) >= len(weapons)
+                            and any(dual_rocket_stands(state, a, b, static)
+                                    for a, b in combinations(rockets_all, 2)))
+    prefer_builder_rockets = night_two_on_three or day1_builder_rockets
     builder = next((f for f in fighters if f.role_type == 'worker'
                     and opening_worker_mode(state, f) == 'builder'), None)
 
@@ -1344,12 +1374,16 @@ def assign_weapons(state, excluded_ids=(), persist=False):
         return len(assigned | extra)
 
     def builder_off_rockets(pairs):
-        if not night_two_on_three or builder is None:
+        if not prefer_builder_rockets or builder is None:
             return 0
         weapon = next((w for f, w in pairs if f.id == builder.id), None)
-        if weapon is None or weapon.role_type != 'rocket':
-            return 1
-        return 0
+        miss = 1 if weapon is None or weapon.role_type != 'rocket' else 0
+        if day1_builder_rockets and any(w.role_type != 'rocket' for w in weapons):
+            # 首日按夜里的布局站：开拓者开非火箭炮，另一门火箭留给经济工（入夜他外出，施工工接双火箭）。
+            pioneer_weapon = next((w for f, w in pairs if f.role_type == 'pioneer'), None)
+            if pioneer_weapon is not None and pioneer_weapon.role_type == 'rocket':
+                miss += 1
+        return miss
 
     def score_of(pairs):
         base = _assignment_score(pairs, distances, fighter_order, weapon_order)
@@ -1382,7 +1416,11 @@ def assign_weapons(state, excluded_ids=(), persist=False):
             prev_pairs = []
         if prev_pairs:
             prev_score = score_of(prev_pairs)
-            if best is None or prev_score <= best:
+            # 沿用上回合分配：可达/覆盖不变差、总路程多得不多就不换。
+            # 里外层次、路程随人走动每回合都在变，严格比较会让分配来回跳，人跟着来回走。
+            if best is None or prev_score <= best or (
+                    prev_score[:3] <= best[:3]
+                    and prev_score[-1] <= best[-1] + ASSIGNMENT_SWITCH_TOLERANCE):
                 assignment = prev
     if persist:
         state.policy_memory['weapon_assignment'] = {str(fid): weapon.id for fid, weapon in assignment.items()}
@@ -1505,12 +1543,25 @@ def other_rocket(state, weapon):
 
 
 def control_stand_path(role, weapon, blocked, reserved, state):
-    """走到两门火箭共用操控位，以便冷却时切炮；没有共用格就走到另一门旁边。"""
+    """走到两门火箭共用操控位，以便冷却时切炮；没有共用格就走到另一门旁边。
+
+    共用位 = 同时挨着两门火箭、没人占、不在迎敌外侧的任何格（夜里不建墙，未砌的墙线格也算）。
+    已经站在这样的格上就不动。找路把队友当障碍：守在炮位上的队友整夜不会让开，
+    穿过他的路线实际走不通，会把人卡在半路、两门火箭都没人开。"""
     partner, stands = dual_rocket_partner(state, weapon, blocked)
     if partner is None:
         partner = other_rocket(state, weapon)
     here = (role.pos.x, role.pos.y)
-    walkable = mobile_walkable(state, blocked, reserved)
+    walkable = (set(blocked) | set(reserved)) - {here}
+    if partner is not None:
+        base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+        width, height = state.map_info.width, state.map_info.height
+        near_first = {(p.x, p.y) for p in neighbors8(weapon.pos, width, height)}
+        near_second = {(p.x, p.y) for p in neighbors8(partner.pos, width, height)}
+        common = {c for c in near_first & near_second
+                  if (c not in walkable or c == here)
+                  and not (base and attack_side_of_front(state, base, Pos(*c)))}
+        stands = set(stands) | common
     if stands:
         if here in stands:
             return []
@@ -1576,34 +1627,50 @@ def guns_covered_without(state, excluded_ids, blocked, max_travel=None, enemy_ti
 
 
 def weapon_approach_path(role, weapon, blocked, reserved, state):
-    """去开炮：已在炮旁就地开火；墙外先走后方开口进院，再绕开队友。"""
+    """去开炮：已在炮旁就地开火；墙外先走后方开口进院，再绕开队友。
+    进院前先确认从进院那一格能到炮位、且不用原路出院；否则直接走院外路线，
+    避免“迈进院子→院内够不着→出院→再迈进院子”的来回。"""
     own = {(role.pos.x, role.pos.y)}
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
     obstacles = ((blocked | reserved | failed_move_cells(state, role)) - own)
     at_gun = bool(weapon and chebyshev(role.pos, weapon.pos) <= 1 and role.pos != weapon.pos)
     if base is not None and not in_courtyard(state, base, role.pos) and not at_gun:
-        into = step_into_courtyard(role, obstacles, state)
-        if into:
-            return into
-        yard = courtyard_cells(state, base)
-        enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
-        ring = set(wall_ring(state, base)) - {(role.pos.x, role.pos.y)}
-        enter_off_ring = path_to_any(role.pos, yard, obstacles | ring, state.map_info.width, state.map_info.height)
-        if attack_side_of_front(state, base, role.pos):
-            retreat = rear_retreat_path(role, obstacles, state)
-            if retreat and (enter is None or len(enter) > 2):
-                return retreat
-            if enter is not None and len(enter) <= 2:
-                return enter
-        if enter_off_ring is not None and (
-                enter is None or len(enter_off_ring) <= len(enter) + 2
-                or (enter and (enter[0].x, enter[0].y) in ring)):
-            return enter_off_ring
+        enter = _weapon_courtyard_entry(role, obstacles, state, base)
         if enter:
-            return enter
+            entry = _actor_at(role, enter[-1])
+            inner = _weapon_path_from(entry, weapon, obstacles - {(entry.pos.x, entry.pos.y)},
+                                      blocked, reserved, state)
+            cells = [(p.x, p.y) for p in list(enter) + list(inner or [])]
+            if inner is not None and (role.pos.x, role.pos.y) not in cells and len(set(cells)) == len(cells):
+                return enter
+    return _weapon_path_from(role, weapon, obstacles, blocked, reserved, state)
+
+
+def _weapon_courtyard_entry(role, obstacles, state, base):
+    into = step_into_courtyard(role, obstacles, state)
+    if into:
+        return into
+    yard = courtyard_cells(state, base)
+    enter = path_to_any(role.pos, yard, obstacles, state.map_info.width, state.map_info.height)
+    ring = set(wall_ring(state, base)) - {(role.pos.x, role.pos.y)}
+    enter_off_ring = path_to_any(role.pos, yard, obstacles | ring, state.map_info.width, state.map_info.height)
+    if attack_side_of_front(state, base, role.pos):
         retreat = rear_retreat_path(role, obstacles, state)
-        if retreat:
+        if retreat and (enter is None or len(enter) > 2):
             return retreat
+        if enter is not None and len(enter) <= 2:
+            return enter
+    if enter_off_ring is not None and (
+            enter is None or len(enter_off_ring) <= len(enter) + 2
+            or (enter and (enter[0].x, enter[0].y) in ring)):
+        return enter_off_ring
+    if enter:
+        return enter
+    return rear_retreat_path(role, obstacles, state)
+
+
+def _weapon_path_from(role, weapon, obstacles, blocked, reserved, state):
+    at_gun = bool(weapon and chebyshev(role.pos, weapon.pos) <= 1 and role.pos != weapon.pos)
     if at_gun and weapon and weapon.role_type == 'rocket':
         dual = control_stand_path(role, weapon, obstacles, reserved, state)
         if dual:
@@ -1693,6 +1760,98 @@ def pioneer_wait_weapon_shop(role, state, blocked, reserved):
     return move_on_path(state, role, path, reserved, '升级资金已闭环，开拓者去武器商店买券')
 
 
+def _yard_components(cells):
+    seen, count = set(), 0
+    for start in cells:
+        if start in seen:
+            continue
+        count += 1
+        seen.add(start)
+        queue = deque([start])
+        while queue:
+            x, y = queue.popleft()
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    key = (x + dx, y + dy)
+                    if key in cells and key not in seen:
+                        seen.add(key)
+                        queue.append(key)
+    return count
+
+
+def missing_primary_walls(state, base):
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    return [p for p in primary_wall_plan(state, base) if p not in existing]
+
+
+def yard_wait_cells(state, base, blocked, weapon=None):
+    """墙没修完时白天可以站着等的院内格，按优先级排好：
+    不在墙线/炮位/别人的操炮位/双火箭共用位/后门入口上、不是院内通道的咽喉格（站上去会把院子隔成两半）、尽量不贴待建缺口、离自己的炮近。
+    队友会移动，算咽喉时不把他们当障碍。"""
+    movable = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type in ('worker', 'pioneer')}
+    construction = set(wall_ring(state, base)) | set(weapon_slots(state, base))
+    other_weapons = [r.pos for r in state.team_our.roles
+                     if r.role_type in ('gatling', 'railgun', 'rocket') and r.health > 0
+                     and (weapon is None or r.id != weapon.id)]
+    # 双火箭共用操控位是施工工/守双火箭的人冷却时轮流开火的位置，等待时任何情况下都不占。
+    rockets = [r for r in state.team_our.roles if r.role_type == 'rocket' and r.health > 0]
+    shared_stands = set()
+    for first, second in combinations(rockets, 2):
+        shared_stands |= dual_rocket_stands(state, first, second, blocked)
+    free = {c for c in courtyard_cells(state, base)
+            if c not in construction and (c not in blocked or c in movable)}
+    # 后方开口那一列是进出院子的门，工人采石回来都从这里迈进来，等待时不占。
+    gate = rear_gate_cells(state, base)
+    parts = _yard_components(free)
+    missing = missing_primary_walls(state, base)
+    rows = []
+    for cell in free:
+        if cell in shared_stands or cell in gate or _yard_components(free - {cell}) > parts:
+            continue
+        # 别的炮的操炮位留给队友。
+        if any(chebyshev(Pos(*cell), w) <= 1 for w in other_weapons):
+            continue
+        near_gap = any(max(abs(cell[0] - p[0]), abs(cell[1] - p[1])) == 1 for p in missing)
+        dist = chebyshev(Pos(*cell), weapon.pos) if weapon is not None else 0
+        rows.append(((near_gap, dist), cell))
+    return sorted(rows, key=lambda row: (row[0], row[1]))
+
+
+def pioneer_day_wait(role, state, blocked, reserved, weapon, reason):
+    """墙没修完时开拓者白天的等待位：不占墙线和院内咽喉，免得施工工进不去缺口。
+    返回 (handled, cmd)：handled=False 表示不适用，由调用方走原来的守炮逻辑；cmd=None 表示原地等。"""
+    from .brain import own_station
+    from .tactics import imminent_contact
+    from .economy import defense_due
+    base = own_station(state)
+    if base is None or role.role_type != 'pioneer' or imminent_contact(state):
+        return False, None
+    if not missing_primary_walls(state, base) or defense_due(role, state, blocked):
+        return False, None
+    here = (role.pos.x, role.pos.y)
+    ranked = yard_wait_cells(state, base, blocked, weapon)
+    if not ranked:
+        return False, None
+    # 只在当前格不合格（墙线/炮位/咽喉），或贴着缺口而院里还有不贴缺口的格时才挪；
+    # 排序不看队友此刻站哪，队友走动不会让开拓者跟着换位。
+    here_key = next((key for key, c in ranked if c == here), None)
+    clean_exists = not ranked[0][0][0]
+    if here_key is not None and (not here_key[0] or not clean_exists):
+        trace(state, role.id, 'pioneer_day_wait', '开拓者在不挡施工的院内格等待', position=list(here))
+        return True, None
+    others = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+              if r.role_type in ('worker', 'pioneer') and r.id != role.id}
+    free = [c for key, c in ranked if c not in others]
+    if not free:
+        return False, None
+    best = free[0]
+    obstacles = (blocked | reserved) - {here}
+    path = path_to_any(role.pos, {best}, obstacles, state.map_info.width, state.map_info.height)
+    if not path:
+        return False, None
+    return True, move_on_path(state, role, path, reserved, reason)
+
+
 def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
     """开拓者不能采集或建造；让开墙线和炮位，无任务时去已分配武器。"""
     from .brain import own_station
@@ -1702,6 +1861,14 @@ def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
     if base is None:
         trace(state, role.id, 'pioneer_stay_clear_no_station', '找不到基地，开拓者本回合无命令')
         return None
+    if assignments is None:
+        assignments = assign_weapons(state)
+    weapon = assignments.get(role.id)
+    # 墙没修完：站到不挡施工的院内格等，不再“让开墙线→走回炮旁墙格”来回换。
+    handled, cmd = pioneer_day_wait(role, state, blocked, reserved, weapon,
+                                    '开拓者让开墙线和院内通道，留给工人施工')
+    if handled:
+        return cmd
     here = (role.pos.x, role.pos.y)
     construction = set(wall_ring(state, base)) | set(weapon_slots(state, base))
     own = {here}
@@ -1714,9 +1881,6 @@ def pioneer_stay_clear(role, state, blocked, reserved, assignments=None):
         cmd = move_on_path(state, role, path, reserved, '开拓者让开墙线和炮位，留给工人施工')
         if cmd:
             return cmd
-    if assignments is None:
-        assignments = assign_weapons(state)
-    weapon = assignments.get(role.id)
     if weapon:
         return move_on_path(
             state, role, weapon_approach_path(role, weapon, blocked, reserved, state),

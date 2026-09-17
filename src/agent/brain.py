@@ -2323,8 +2323,15 @@ def plan_night(state: "MatchState") -> dict:
                             state.team_our.gold_num -= item_cost(cmd['name'], state) * cmd.get('num', 1)
                         commands[fighter.id] = cmd
                         continue
-                trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
-                      "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
+                in_range = any(max(abs(r.pos.x - weapon.pos.x), abs(r.pos.y - weapon.pos.y)) <= (weapon.attack_range or 0)
+                               for r in robots)
+                if not ready:
+                    code, text = "weapon_cooldown", "火箭冷却，原地守炮"
+                elif in_range:
+                    code, text = "targets_already_covered", "射程内目标本回合已被其它炮算定打死，不重复开火"
+                else:
+                    code, text = "no_target_in_range", "射程内无目标，原地守炮"
+                trace(state, fighter.id, code, text, weapon_id=weapon.id)
                 continue
         if weapon is None:
             trace(state, fighter.id, "no_free_weapon", "没有可分配的独立武器")

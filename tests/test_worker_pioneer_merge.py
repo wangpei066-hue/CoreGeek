@@ -888,6 +888,101 @@ class FixtureNightMinerTests(unittest.TestCase):
                 self.assertNotIn('emergency_front_seal', codes)
 
 
+class NightDualRocketRotationTests(unittest.TestCase):
+    """跑完第一天再打一夜：两门火箭就绪且射程内有敌人时必须开火（一人轮流开两门），
+    电磁炮只补刀（伤害都打在已受伤的机器人上）。"""
+
+    RANGES = {'rocket': (10, 5), 'railgun': (6, 2)}
+
+    def test_first_night_no_idle_rocket_and_railgun_finishes(self):
+        import contextlib
+        import io
+        from test_opening_fsm import _map, apply_opening_commands
+        from src.agent.grid import chebyshev
+        from src.agent.targeting import ROBOT_STATS, TargetContext, _robots_on_segment, _rocket_damage
+        state = _map(opening_state())
+        state.team_our.gold_num = 75
+        strategy = V1Strategy(BasicActionValidator())
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(70):
+                commands = strategy.decide(state)
+                apply_opening_commands(state, commands)
+                state.round_no += 1
+                state.last_round_role_action_results = {k: True for k in commands}
+        roles = state.team_our.roles
+        weapons = [r for r in roles if r.role_type in self.RANGES]
+        for w in weapons:
+            first, step = self.RANGES[w.role_type]
+            w.attack_range = first + step * ((w.level or 1) - 1)
+            w.cooldown = 0
+        people = [r for r in roles if r.role_type in ('worker', 'pioneer')]
+        base = next(r for r in roles if r.role_type == 'station')
+        state.robot.roles = []
+        idle, railgun_on_full, railgun_dealt, next_id = [], 0, 0, 5000
+        for t in range(40):
+            if t % 4 == 0 and t < 28:
+                for k in range(3):
+                    kind = 'middleRobot' if (t // 4 + k) % 3 == 0 else 'smallRobot'
+                    state.robot.roles.append(RobotRole(next_id, Pos(26 + k, 7 + (t // 4 * 3 + k * 2) % 7),
+                                                       kind, ROBOT_STATS[kind][0]))
+                    next_id += 1
+            robots = [r for r in state.robot.roles if r.health > 0]
+            for w in weapons:
+                w.cooldown = max(0, (w.cooldown or 0) - 1)
+            with contextlib.redirect_stderr(io.StringIO()):
+                commands = strategy.decide(state)
+            fired = {wid for wid, c in commands.items() if c.get('action') == 'attack'}
+            for w in weapons:
+                if w.role_type == 'rocket' and not w.cooldown and w.id not in fired and any(
+                        chebyshev(r.pos, w.pos) <= w.attack_range for r in robots):
+                    idle.append((state.round_no, (w.pos.x, w.pos.y), [(p.pos.x, p.pos.y) for p in people]))
+            ctx = TargetContext(state, robots)
+            for wid in fired:
+                w = next(x for x in weapons if x.id == wid)
+                target = commands[wid]['targetPos']
+                damage = {}
+                if w.role_type == 'rocket':
+                    for tp in target:
+                        for rid, d in _rocket_damage(ctx, tp['x'], tp['y']).items():
+                            damage[rid] = damage.get(rid, 0) + d
+                    w.cooldown = 4  # 本回合开火后冷却 3 回合，下回合开始时先减 1
+                else:
+                    energy = 10 * (w.level or 1)
+                    for hit in _robots_on_segment(ctx, w.pos, target[0]['x'], target[0]['y']):
+                        d = min(energy, hit.health)
+                        damage[hit.id] = d
+                        energy -= d
+                        if energy <= 0:
+                            break
+                for rid, d in damage.items():
+                    robot = ctx.by_id[rid]
+                    if w.role_type == 'railgun':
+                        railgun_dealt += min(d, robot.health)
+                        if robot.health >= ROBOT_STATS[robot.role_type][0]:
+                            railgun_on_full += min(d, robot.health)
+                    robot.health -= d
+            occupied = {(r.pos.x, r.pos.y) for r in roles if r.health > 0}
+            occupied |= {(x, y) for x in (base.pos.x, base.pos.x + 1) for y in (base.pos.y, base.pos.y - 1)}
+            for person in people:
+                cmd = commands.get(person.id)
+                if cmd and cmd.get('action') == 'move':
+                    cell = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+                    if cell not in occupied:
+                        person.pos = Pos(*cell)
+            for robot in state.robot.roles:
+                if robot.health <= 0:
+                    continue
+                nx = robot.pos.x + (base.pos.x > robot.pos.x) - (base.pos.x < robot.pos.x)
+                ny = robot.pos.y + (base.pos.y > robot.pos.y) - (base.pos.y < robot.pos.y)
+                if (nx, ny) not in occupied:
+                    robot.pos = Pos(nx, ny)
+            state.last_sent_command = commands
+            state.round_no += 1
+        self.assertEqual(idle, [])
+        self.assertGreater(railgun_dealt, 0)
+        self.assertLessEqual(railgun_on_full, railgun_dealt * 0.2, (railgun_on_full, railgun_dealt))
+
+
 class NightPressureRecallTests(unittest.TestCase):
     """敌人逼近时叫外出工人回防：前两夜不叫；第三夜起只有带着能在家用上的道具才叫。"""
 
