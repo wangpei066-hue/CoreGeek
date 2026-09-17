@@ -963,6 +963,9 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
         if chebyshev(role.pos, target) <= 1:
             job["awaiting_use"] = True
             return selected(state, role.id, {"action": "use", "name": item, "targetPos": [{"x": x, "y": y}]}, '执行维修/升级道具任务')
+        if job.get("kind") == "weapon" and worker_defers_voucher_use(role, state, blocked):
+            trace(state, role.id, "weapon_voucher_deferred", "券先拿着，背包有空继续干活，回防时顺路用掉", item=item)
+            return None
         path = route(target)
         if item != "WallFixer" and path is not None:
             from .economy import en_route_collect
@@ -1973,12 +1976,13 @@ def _night_worker_release(state, blocked, reserved):
     - 第三夜起：优先放施工工，经济工一人守双火箭、开拓者开另一门。
     - 偏好的人出不去（被炮位夹角堵住）或没事可做时，换另一名工人。
       有防守压力时先在家用升级券/修墙包给残墙回血（夜里不能建造），没墙可修就去后院采矿。
-      两人已守住三炮，外出的人不需要赶在敌人之前回来。"""
+      两人已守住三炮，外出的人不需要赶在敌人之前回来。
+    - 只放站在安全处（不在正面、机器人及其进攻路线上）的人；外出只走完全避险的路线。"""
     later_night = structure_priority_day(state)
     workers = [r for r in state.team_our.roles if r.role_type == "worker" and r.health > 0]
     if len(workers) < 2:
         return None, None
-    from .opening import guns_covered_without
+    from .opening import guns_covered_without, night_danger_cells
     from .opening_schedule import opening_worker_mode
     from .tactics import front_breached, pressure
     wanted = "builder" if later_night else "economist"
@@ -1990,7 +1994,12 @@ def _night_worker_release(state, blocked, reserved):
                                                 opening_worker_mode(state, w) != wanted,
                                                 -len(w.backpack or []), -w.id))
     released = cmd = reason = None
+    danger = night_danger_cells(state)
     for worker in candidates:
+        if (worker.pos.x, worker.pos.y) in danger:
+            # 还站在正面/机器人进攻路线上：先按守炮的人沿避险路线撤回基地，撤到安全处再放出去。
+            trace(state, worker.id, "night_worker_release_unsafe", "人还在危险区，先撤回基地再外出")
+            continue
         covered = (guns_covered_without(state, {worker.id}, blocked, max_travel=NIGHT_REPAIR_GUNNER_TRAVEL)
                    if under_pressure else guns_covered_without(state, {worker.id}, blocked))
         if not covered:
@@ -2250,10 +2259,23 @@ def command_actor_id(key, command):
     return key
 
 
+def worker_defers_voucher_use(role: Role, state: "MatchState", blocked: set) -> bool:
+    """工人白天拿到武器券先不专程去用：背包还有空、也没到回防时间，就继续采矿修墙，
+    回防时顺路到武器旁用掉（夜里守炮的人没目标时也会就地用）。开拓者夜里要开电磁炮，拿到就用。"""
+    if role.role_type != "worker" or not is_day_round(state.round_no):
+        return False
+    cap = role.back_pack_capability or 0
+    if cap and len(role.backpack or []) >= cap:
+        return False
+    from .economy import defense_due
+    return not defense_due(role, state, blocked)
+
+
 def enforce_held_vouchers(state: "MatchState", commands: dict) -> dict:
-    """白天兜底：手里有武器升级券的工人/开拓者，本回合就去用（走过去或直接 use），覆盖其它白天分支。
+    """白天兜底：手里有武器升级券的开拓者本回合就去用；工人身边就有对应武器时当场用，
+    要专门走过去的等背包满了或到了回防时间才去（顺路回家）。
     目标由 held_weapon_voucher_target 决定（顺序优先、否则任意同级），同一回合两人不升同一门。
-    不接管：紧急治疗、正在买武器券（批量买完再去）、开拓者任务进行中、没有同级武器。"""
+    不接管：紧急治疗、正在买武器券（批量买完再去）、开拓者任务进行中、没有同级武器、工人暂缓使用。"""
     if not state.team_our or not state.map_info or not is_day_round(state.round_no):
         return commands
     from .opening import adjacent_path, move_on_path
@@ -2273,6 +2295,8 @@ def enforce_held_vouchers(state: "MatchState", commands: dict) -> dict:
         if pick is None:
             continue
         name, weapon = pick
+        if chebyshev(role.pos, weapon.pos) > 1 and worker_defers_voucher_use(role, state, blocked):
+            continue  # 工人要专门走过去才能用：先干活，回防时顺路用
         target = (weapon.pos.x, weapon.pos.y)
         taken.add(target)
         if current.get("action") == "use" and current.get("name") == name:

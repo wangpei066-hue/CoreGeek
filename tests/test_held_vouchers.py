@@ -1,4 +1,4 @@
-"""持券必用：武器升级券到手就用，顺序只决定用在哪门，不会拿着等。"""
+"""持券：开拓者到手就用；工人身边有对应武器当场用，否则干完活回防时顺路用。"""
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy, upgrade_plan
@@ -44,12 +44,35 @@ class HeldVoucherTests(unittest.TestCase):
         self.assertEqual(commands[holder.id]['action'], 'use')
         self.assertEqual(commands[holder.id]['targetPos'], [{'x': first_rocket.pos.x, 'y': first_rocket.pos.y}])
 
-    def test_far_holder_walks_back_immediately_even_early_in_the_day(self):
+    def test_far_worker_keeps_working_early_and_uses_voucher_on_the_way_home(self):
+        from src.agent.protocol import Zone
         state, holder = voucher_state(140, Pos(16, 11), ['WeaponUpgradeVoucher2'])
+        state.map_info.zones.append(Zone(Pos(17, 11), 'copper'))
+        self.decide(state)
+        codes = [e['code'] for e in state.decision_events if e.get('role_id') == holder.id]
+        self.assertIn('weapon_voucher_deferred', codes)  # 背包有空，先干活
+        self.assertNotIn('held_voucher_use', codes)
+        state, holder = voucher_state(195, Pos(16, 11), ['WeaponUpgradeVoucher2'])  # 该回防了
         commands = self.decide(state)
         self.assertEqual(commands[holder.id]['action'], 'move')
         self.assertLess(abs(commands[holder.id]['targetPos'][0]['x'] - 9), abs(holder.pos.x - 9))
         self.assertEqual(state.worker_item_jobs[holder.id]['target'], (9, 11))
+
+    def test_worker_with_full_backpack_goes_to_use_voucher(self):
+        state, holder = voucher_state(140, Pos(16, 11), ['WeaponUpgradeVoucher2'])
+        holder.backpack += ['copper'] * (holder.back_pack_capability - 1)
+        commands = self.decide(state)
+        self.assertEqual(state.worker_item_jobs[holder.id]['target'], (9, 11))
+        self.assertEqual(commands[holder.id]['action'], 'move')
+
+    def test_pioneer_uses_voucher_immediately(self):
+        state, _holder = voucher_state(140, Pos(4, 4), [])
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        pioneer.pos = Pos(16, 11)
+        pioneer.backpack = ['WeaponUpgradeVoucher2']
+        commands = self.decide(state)
+        self.assertEqual(commands[pioneer.id]['action'], 'move')
+        self.assertEqual(state.worker_item_jobs[pioneer.id]['target'], (9, 11))
 
     def test_two_holders_do_not_upgrade_same_weapon_twice(self):
         state, holder = voucher_state(195, Pos(10, 11), ['WeaponUpgradeVoucher1'], levels=(1, 1))

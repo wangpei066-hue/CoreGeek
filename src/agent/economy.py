@@ -17,10 +17,8 @@ PRE_NIGHT_CASHOUT_LEAD = 12  # 卖掉之后还要留出买券/用券时间。
 PRE_NIGHT3_CASHOUT_LEAD = 20  # 第三晚压力大，更早把背包换成火力。
 MINE_TRIP_CAP = 6  # 本趟收益只按还能采的几下算，不用整包空位去抬远矿。
 MINE_TARGETS_KEY = 'mine_targets'
-NIGHT_CONTACT_RANGE = 6  # 机器人进入基地/武器6格内，记为当晚首次接敌。
-NIGHT_GRACE_BUFFER = 4  # 实测接敌回合再扣掉的安全余量。
-NIGHT_GRACE_CAP = 12  # 傍晚卖矿最多借用入夜后的回合数。
 SPIKE_CASHOUT_KEY = 'spike_cashout'
+NIGHT_SELL_AFTER = 30  # 入夜满这么多回合后，夜里外出的工人才允许去小贩卖矿。
 EN_ROUTE_SLACK = 2  # 顺路采矿后，回去用券还要再留的余量。
 
 
@@ -60,32 +58,6 @@ def en_route_collect(role, state, remaining_steps, reason):
                     {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]}, reason)
 
 
-def note_night_contact(state):
-    """记录每晚机器人首次逼近己方的夜间回合序号，供傍晚卖矿估算真实安全余量。"""
-    from .brain import DAY_NIGHT_CYCLE, DAY_ROUNDS, WEAPON_TYPES, is_day_round
-    from .tactics import threat_robots
-    if state.round_no is None or is_day_round(state.round_no) or not state.team_our:
-        return
-    contacts = state.policy_memory.setdefault('night_contact', {})
-    night = str(int(state.round_no) // DAY_NIGHT_CYCLE)
-    if night in contacts:
-        return
-    spots = [r.pos for r in state.team_our.roles
-             if r.health > 0 and (r.role_type == 'station' or r.role_type in WEAPON_TYPES)]
-    robots = threat_robots(state)
-    if any(chebyshev(spot, robot.pos) <= NIGHT_CONTACT_RANGE for spot in spots for robot in robots):
-        contacts[night] = int(state.round_no) % DAY_NIGHT_CYCLE - DAY_ROUNDS
-
-
-def after_dark_grace(state):
-    """入夜后机器人还打不到己方的回合数（取历史最早接敌再留余量）；没有实测时为0。"""
-    contacts = [v for v in (state.policy_memory.get('night_contact') or {}).values()
-                if isinstance(v, (int, float))]
-    if not contacts:
-        return 0
-    return max(0, min(NIGHT_GRACE_CAP, int(min(contacts)) - NIGHT_GRACE_BUFFER))
-
-
 def price_spike_today(state):
     """官方消息里今天涨价的矿种。"""
     try:
@@ -115,18 +87,16 @@ def set_spike_cashout_phase(state, phase):
 
 
 def _sale_fits(state, path, ores, sale_rounds, arrival):
-    """卖完回炮是否来得及。傍晚没有可见敌人时，可借用实测的入夜后安全回合，但必须在天黑前卖完。"""
+    """卖完回炮是否来得及：整趟（去小贩、卖、回炮位、留余量）必须早于敌人到达/天黑。
+    夜里只有入夜满 NIGHT_SELL_AFTER 回合后才允许外出卖矿，之前只在后院采矿。"""
     if arrival is None:
         return False
-    if sale_rounds < arrival:
-        return True
-    from .brain import is_day_round
-    from .tactics import threat_robots
-    if not is_day_round(state.round_no) or threat_robots(state):
-        return False
-    grace = after_dark_grace(state)
-    reach_and_sell = (len(path) if path else 0) + max(1, len(ores) if ores else 1)
-    return grace > 0 and sale_rounds < arrival + grace and reach_and_sell < arrival
+    from .brain import DAY_NIGHT_CYCLE, DAY_ROUNDS, is_day_round
+    if not is_day_round(state.round_no):
+        elapsed = int(state.round_no or 0) % DAY_NIGHT_CYCLE - DAY_ROUNDS
+        if elapsed < NIGHT_SELL_AFTER:
+            return False
+    return sale_rounds < arrival
 
 
 def live_pioneer(state):

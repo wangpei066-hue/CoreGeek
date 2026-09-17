@@ -37,8 +37,6 @@ def begin_round(state):
             state.policy_memory['night_empty_streak'] = int(state.policy_memory.get('night_empty_streak') or 0) + 1
         from .opening import update_wall_time_overrun
         update_wall_time_overrun(state)
-        from .economy import note_night_contact
-        note_night_contact(state)
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)
     if base:

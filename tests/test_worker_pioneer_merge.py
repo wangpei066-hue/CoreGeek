@@ -404,8 +404,18 @@ class EnRouteMiningTests(unittest.TestCase):
             'item': 'WeaponUpgradeVoucher1', 'target': (rocket.pos.x, rocket.pos.y), 'kind': 'weapon'}
         return decide_shop_item_job(worker, state, build_blocked_set(state), set())
 
-    def test_worker_mines_passing_ore_while_carrying_voucher(self):
-        self.assertEqual(self._worker_with_voucher(150),
+    def test_worker_holds_voucher_and_keeps_working_early_in_the_day(self):
+        self.assertIsNone(self._worker_with_voucher(150))  # 不专程回去用，交给后续分支继续干活
+
+    def test_passing_ore_is_collected_on_the_way_to_use_a_voucher(self):
+        from src.agent.economy import en_route_collect
+        from test_defense_priority import defended
+        state = defended()
+        state.round_no = 150
+        state.map_info.zones.append(Zone(Pos(4, 4), 'copper'))
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        worker.pos = Pos(4, 5)
+        self.assertEqual(en_route_collect(worker, state, 8, '顺路采矿'),
                          {'action': 'collect', 'targetPos': [{'x': 4, 'y': 4}]})
 
     def test_worker_goes_home_when_dusk_is_close(self):
@@ -670,3 +680,36 @@ class NightTwoOnThreeSimulationTests(unittest.TestCase):
                 steady = released[2:]
                 self.assertTrue(all(r is not None for r in steady), released)
                 self.assertEqual(len(set(steady)), 1, released)
+
+
+class NightMinerSafetyTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def _night(self):
+        state = _slot_layout_state(80)
+        state.map_info.zones.append(Zone(Pos(5, 10), 'iron'))
+        state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
+        return state
+
+    def test_economist_in_danger_zone_is_not_released(self):
+        state = self._night()
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(18, 10)  # 入夜时还在正面外、机器人来的方向上
+        self.decide(state)
+        codes = [e['code'] for e in state.decision_events if e.get('role_id') == economist.id]
+        self.assertIn('night_worker_release_unsafe', codes)
+        self.assertNotIn('night_worker_released_to_economy', codes)
+        self.assertIn(str(economist.id), state.policy_memory['weapon_assignment'])  # 按守炮的人撤回
+
+    def test_released_worker_never_takes_an_unsafe_route(self):
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import night_safe_path
+        state = self._night()
+        worker = next(r for r in state.team_our.roles if r.id == 2)
+        worker.pos = Pos(6, 10)
+        target = Pos(20, 10)  # 只能穿过正面才能到
+        blocked = build_blocked_set(state)
+        self.assertIsNotNone(night_safe_path(worker, target, blocked, state))  # 守炮的人会退回普通路线
+        state.night_released_ids = {worker.id}
+        self.assertIsNone(night_safe_path(worker, target, blocked, state))  # 外出的人不走危险路线

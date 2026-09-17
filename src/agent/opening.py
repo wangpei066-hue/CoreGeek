@@ -112,6 +112,9 @@ def night_safe_path(role, target, blocked, state):
     from .brain import is_day_round
     if is_day_round(state.round_no):
         return adjacent_path(role, target, blocked, state)
+    if role.id in (getattr(state, 'night_released_ids', None) or ()):
+        # 夜里被放出去的人只走完全避开正面和机器人的路线，找不到就不去。
+        return night_strict_path(role, target, blocked, state)
     here = {(role.pos.x, role.pos.y)}
     for include_front in (True, False):
         avoid = night_danger_cells(state, include_front=include_front) - here
