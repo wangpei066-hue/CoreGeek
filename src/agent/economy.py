@@ -498,16 +498,15 @@ def pioneer_should_hold_task(pioneer, state) -> bool:
 
 
 def muster_for_night(role, state, blocked, reserved):
-    """正在回防或必须留守时才接管；已到岗且无强制留守返回 False，让上层继续评估买券等事务。"""
+    """正在回防或必须要塞时才接管；已到岗且无强制留守返回 False，让上层继续评估买券等事务。"""
     from .opening import assign_weapons, station_path, move_on_path
     from .tactics import night_wave_cleared, pressure
-    from .opening import first_night_economy_open
     if night_wave_cleared(state):
         return False, None
     if role.id in (getattr(state, 'night_released_ids', None) or ()):
         return False, None  # 夜间已放出采矿的工人，回防时机由 plan_night 按敌人距离单独把关。
-    if ((state.round_no or 0) < 70 or first_night_economy_open(state)) and role.role_type == 'worker' and not pressure(state):
-        return False, None  # 首日由施工计划按实际武器返程时间集合。
+    if (state.round_no or 0) < 70 and role.role_type == 'worker' and not pressure(state):
+        return False, None  # 首日由 opening FSM 按个人回防截止点调度。
     occupancy, snap = defense_occupancy(role, state, blocked)
     if occupancy == 'free':
         if snap.get('alreadyAtPost') or snap.get('atGun'):
@@ -876,11 +875,11 @@ def trip_collect_limit(role, state, path_len=0, return_len=0, purpose='income'):
     if cap <= 0:
         return 0
     from .brain import is_day_round
-    from .opening import MUSTER_BUFFER, first_night_economy_open
+    from .opening import MUSTER_BUFFER
     from .tactics import night_wave_cleared, threat_eta_to_base
     if night_wave_cleared(state):
         return cap
-    if not is_day_round(state.round_no) and not first_night_economy_open(state):
+    if not is_day_round(state.round_no):
         return cap
     arrival = threat_eta_to_base(state, role)
     if arrival is None:

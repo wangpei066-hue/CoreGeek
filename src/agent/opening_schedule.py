@@ -24,6 +24,12 @@ MINE_CLEARLY_CLOSER_STEPS = 2
 CLAIMED_MINE_MAX_DETOUR = 3
 WORKER_GOALS_KEY = 'opening_worker_goals'
 WORKER_ROLES_KEY = 'opening_worker_roles'
+CASHOUT_COMMIT_KEY = 'opening_cashout_commit'
+ROLE_DUE_KEY = 'opening_role_due'
+# 最后一趟卖矿的出发窗口：剩余回合在 [绕路耗时, 绕路耗时 + 该值] 之间才出发，保证卖完还来得及回炮。
+CASHOUT_WINDOW = 2
+# 回炮时绕开队友的路线比直穿多出这么多步以上，就等队友让开。
+MUSTER_DETOUR_WAIT = 3
 
 
 def opening_cycle(state):
@@ -111,7 +117,8 @@ def resolve_opening_stage(state, remaining=None, muster_need=3, gold=None):
     return _set_opening_stage(state, STAGE_FUND if len(weapons) >= 3 else STAGE_BUILD_WEAPONS, 'recover')
 
 
-def flags_from_opening_stage(stage, gold, cost, has_voucher, cutoff=False):
+def flags_from_opening_stage(stage, gold, cost, has_voucher, cutoff=False, upgraded_count=0):
+    """诊断标志：与 FSM 真实允许的动作对齐（不单独门控 dispatch）。"""
     funded = has_voucher or gold >= cost
     log_phase = {
         STAGE_BUILD_WEAPONS: '武器',
@@ -121,15 +128,17 @@ def flags_from_opening_stage(stage, gold, cost, has_voucher, cutoff=False):
         STAGE_MUSTER: '就位',
     }.get(stage, stage)
     mining = stage == STAGE_FUND and not funded and not cutoff
+    need_first = upgraded_count < 1
     flags = {
         'opening_phase': log_phase,
         'allow_walls': stage in (STAGE_WALL, STAGE_APPLY) or (stage == STAGE_FUND and cutoff and funded),
-        'allow_upgrade': stage in (STAGE_FUND, STAGE_APPLY) and funded,
-        'allow_sell': stage == STAGE_FUND and not cutoff,
+        # WALL 会卖闲置铜铁 / 经济工筹资卖矿 / 夜前清包；与 opening_sell_metal 路径一致
+        'allow_sell': stage in (STAGE_FUND, STAGE_WALL),
         'allow_mine': mining,
         'allow_income_mine': mining,
         'allow_stone_mine': stage == STAGE_WALL,
-        'allow_first_upgrade': stage in (STAGE_FUND, STAGE_APPLY) and funded,
+        'allow_upgrade': False,
+        'allow_first_upgrade': False,
         'upgrade_funded': funded,
         'upgrade_safe': stage == STAGE_FUND and funded and not cutoff,
         'required_done': stage in (STAGE_WALL, STAGE_MUSTER),
@@ -138,9 +147,13 @@ def flags_from_opening_stage(stage, gold, cost, has_voucher, cutoff=False):
             'have_voucher' if has_voucher else 'gold_ready' if gold >= cost else 'unfunded'
         ),
     }
+    if stage in (STAGE_FUND, STAGE_APPLY) and funded and need_first:
+        flags['allow_upgrade'] = True
+        flags['allow_first_upgrade'] = True
     if stage == STAGE_WALL:
-        flags['allow_upgrade'] = has_voucher
-        flags['allow_first_upgrade'] = has_voucher
+        # 持券要去用；未升完第一门且有钱可买；已升完不买第二张
+        flags['allow_upgrade'] = has_voucher or (need_first and funded)
+        flags['allow_first_upgrade'] = flags['allow_upgrade']
     if stage == STAGE_MUSTER:
         flags.update(allow_walls=False, allow_upgrade=False, allow_sell=False,
                      allow_mine=False, allow_income_mine=False, allow_stone_mine=False)
@@ -271,15 +284,18 @@ def opening_move(state, role, path, reserved, target_pos, reason, goal_kind, goa
             trace(state, role.id, 'oscillation_detected', '检测到 A→B→A，保持原目标走当前 BFS 下一步',
                   oscillation_detected=True, current_position={'x': here[0], 'y': here[1]},
                   next_position={'x': nxt[0], 'y': nxt[1]}, target_position=target_pos)
-        dist_after = dist_before - 1
+        same_goal = bool(goal and goal.get('target_pos') == (list(target_pos) if target_pos else None))
+        # 距离只记实际观测：上回合同一目标时的路径长度 vs 本回合路径长度，不预估移动后的距离。
+        prev_distance = goal.get('last_distance') if same_goal else None
         trace(state, role.id, 'opening_step', '向目标前进一步',
               current_position={'x': here[0], 'y': here[1]},
               next_position={'x': nxt[0], 'y': nxt[1]},
               target_position={'x': target_pos[0], 'y': target_pos[1]} if target_pos else None,
-              distance_before=dist_before, distance_after=dist_after,
+              previous_distance=prev_distance, distance=dist_before,
               stage=stage, goal_type=goal_type, switch_reason=switch_reason)
-        if dist_after >= dist_before:
-            trace(state, role.id, 'opening_step_not_closer', '本步路径长度未下降，仍走完整 BFS 下一步')
+        if prev_distance is not None and dist_before >= prev_distance:
+            trace(state, role.id, 'opening_step_not_closer', '与上回合相比路径长度未下降',
+                  previous_distance=prev_distance, distance=dist_before)
     cmd = move_on_path(state, role, path, reserved, reason)
     stalled = 0
     if goal and goal.get('kind') == goal_kind and goal.get('target_pos') == (list(target_pos) if target_pos else None):
@@ -394,7 +410,12 @@ def choose_nearest_mine(role, state, blocked, reserved, want_ores):
         best = best_unclaimed
 
     if sticky_cand is not None and sticky_cand.get('attack_penalty') and any(not row['attack_penalty'] for row in candidates):
-        sticky_cand = None
+        # 粘性目标在迎敌外侧，改选院内侧矿：语义同“明显更近/更优”
+        set_mine_target(state, role.id, best['mine'])
+        reason = 'clearly_closer'
+        if best['relaxed_reserved']:
+            reason += '_relaxed_reserved'
+        return best['mine'], best['path'], reason
     if sticky_cand is not None:
         stalled = int((goal or {}).get('stalled_rounds') or 0)
         oscillating = bool((goal or {}).get('oscillation_detected'))
@@ -536,6 +557,18 @@ def opening_apply_voucher(role, state, blocked, reserved, stage):
     return None
 
 
+def use_voucher_now(role, state, blocked):
+    """与 enforce_held_vouchers 同一规则：开拓者拿到就用；工人身边有可升武器就用，
+    否则背包未满、未到回防时间时先继续干活，回防时顺路用。"""
+    if 'WeaponUpgradeVoucher1' not in (role.backpack or []):
+        return False
+    from .brain import WEAPON_TYPES, _pending_item_job_targets, _pick_upgradeable, worker_defers_voucher_use
+    if not worker_defers_voucher_use(role, state, blocked):
+        return True
+    weapon = _pick_upgradeable(state, WEAPON_TYPES, _pending_item_job_targets(state), max_current_level=1)
+    return weapon is not None and chebyshev(role.pos, weapon.pos) <= 1
+
+
 def day1_wall_floor_met(state, floor=7):
     if (state.round_no or 0) >= 70:
         return True
@@ -577,27 +610,52 @@ def opening_build_weapon(role, state, blocked, reserved, claimed, gold):
 
 
 def opening_muster(role, state, blocked, reserved, assignments, stage):
+    return opening_muster_step(role, state, blocked, reserved, assignments, stage)[1]
+
+
+def opening_muster_step(role, state, blocked, reserved, assignments, stage):
+    """回炮一步。返回 (handled, cmd)：已在炮位时 handled=True、cmd=None，表示本回合原地守炮，
+    调用方不能再把这个人派去干别的；handled=False 表示没有可用炮位/路径，由调用方继续安排。"""
     from .opening import builder_dual_rocket, weapon_approach_path
     weapon = assignments.get(role.id)
-    if opening_worker_mode(state, role) == 'builder':
+    if opening_worker_mode(state, role) == 'builder' and (weapon is None or weapon.role_type != 'rocket'):
+        # 分到火箭时 weapon_approach_path 本来就优先双火箭共用位；只有没分到火箭时才改去双火箭，
+        # 且不抢已经分给队友的那门，否则两人会去同一门炮来回让位。
         night_weapon = builder_dual_rocket(state, role)
-        if night_weapon is not None:
+        taken = {w.id for rid, w in assignments.items() if rid != role.id and w is not None}
+        if night_weapon is not None and night_weapon.id not in taken:
             weapon = night_weapon
     if weapon is None or weapon.health <= 0:
         trace(state, role.id, 'opening_muster_no_weapon', '回防时没有分配到存活武器，本回合无命令',
               stage=stage, assignment_found=weapon is not None,
               weapon_health=None if weapon is None else weapon.health)
-        return None
+        return False, None
     path = weapon_approach_path(role, weapon, blocked, reserved, state)
     target = (weapon.pos.x, weapon.pos.y)
+    if path != []:
+        # 队友只是路过：不把他们当墙绕出院子一大圈，挡在第一步就原地等一回合。
+        from .opening import mobile_walkable
+        # reserved 里是队友本回合的落点，同样是会让开的临时占位，直穿路线不看它。
+        mobile = weapon_approach_path(role, weapon, mobile_walkable(state, blocked), set(), state)
+        if mobile and (path is None or len(mobile) + MUSTER_DETOUR_WAIT <= len(path)):
+            first = (mobile[0].x, mobile[0].y)
+            teammates = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                         if r.role_type in ('worker', 'pioneer') and r.id != role.id}
+            if first in teammates or first in reserved:
+                trace(state, role.id, 'muster_wait_teammate', '回炮路上队友挡路，原地等一回合不绕远',
+                      blocked_by=list(first), detour=None if path is None else len(path), direct=len(mobile))
+                return True, _tick(state, role, stage, 'muster', 'weapon', target, len(mobile), 'hold',
+                                   'wait_teammate', None)
+            path = mobile
     if path is None:
         trace(state, role.id, 'opening_muster_unreachable', '找不到到分配武器的路径，本回合无命令',
               stage=stage, weapon_id=weapon.id, weapon_pos={'x': weapon.pos.x, 'y': weapon.pos.y})
-        return None
+        return False, None
     if path == []:
-        return _tick(state, role, stage, 'muster', 'weapon', target, 0, 'hold', 'at_post', None)
-    return opening_move(state, role, path, reserved, target, '前往分配武器就位',
-                        'muster', 'weapon', 'muster', stage)
+        return True, _tick(state, role, stage, 'muster', 'weapon', target, 0, 'hold', 'at_post', None)
+    cmd = opening_move(state, role, path, reserved, target, '前往分配武器就位',
+                       'muster', 'weapon', 'muster', stage)
+    return cmd is not None, cmd
 
 
 def planned_stone_batch(state, role, blocked, slots, critical):
@@ -666,13 +724,12 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
               stone_carried_to_day2=None if choice is None else choice['stone_carried_to_day2'])
 
     # BUILD_WALL_BATCH：手上有石、还有墙位就连续修，中途不跳回普通采矿/卖矿/等待。
-    # 人已经贴着缺口时不要为了凑批次再跑去矿上绕路。
-    at_gap = any(chebyshev(role.pos, Pos(*p)) == 1 for p in slots)
+    # 已进入墙线状态（GO_WALL_LINE/BUILD）时贴着缺口继续砌；刚从矿路过缺口旁且不够批次时仍去凑批，避免一块一跑。
     prefer_gather = choice is not None and choice['candidate'] == 'GATHER_ONLY' and stones <= 0
     build_now = bool(
         stones > 0 and slots and not prefer_gather
         and (pack_full or batch_ready or urgent_ready or mine_exhausted
-             or previous == 'BUILD_WALL_BATCH' or at_gap)
+             or previous in ('BUILD_WALL_BATCH', 'GO_WALL_LINE'))
     )
     if build_now:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
@@ -691,10 +748,10 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                 switch = 'mine_exhausted'
             else:
                 switch = 'build_batch'
-            wo.builder_state(state, role.id,
-                             'BUILD_WALL_BATCH' if cmd.get('action') == 'build' else 'GO_WALL_LINE')
+            wall_state = 'BUILD_WALL_BATCH' if cmd.get('action') == 'build' else 'GO_WALL_LINE'
+            wo.builder_state(state, role.id, wall_state)
             trace(state, role.id, 'builder_state', '建造工连续施工中',
-                  builder_state='BUILD_WALL_BATCH', builder_target=list(target) if target else None,
+                  builder_state=wall_state, builder_target=list(target) if target else None,
                   stone_carried=stones, stone_batch_target=batch,
                   inventory_capacity=wo.inventory_capacity(role),
                   inventory_used=wo.inventory_used(role), free_slots=free)
@@ -745,7 +802,8 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     if stones > 0 and slots:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
         if cmd:
-            wo.builder_state(state, role.id, 'BUILD_WALL_BATCH')
+            wo.builder_state(state, role.id,
+                             'BUILD_WALL_BATCH' if cmd.get('action') == 'build' else 'GO_WALL_LINE')
             return _tick(state, role, STAGE_WALL, 'wall', 'wall', None, 1, cmd.get('action'),
                          'build_batch_retry', cmd)
 
@@ -766,7 +824,7 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
 
 def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, claimed, assignments,
                       excluded_buyer_ids=(), stage_label=STAGE_FUND, preferred_buyer_id=None):
-    if 'WeaponUpgradeVoucher1' in (role.backpack or []):
+    if use_voucher_now(role, state, blocked):
         return opening_apply_voucher(role, state, blocked, reserved, stage_label)
     buyer = preferred_buyer_id if preferred_buyer_id is not None else _voucher_buyer_id(
         state, gold, cost, excluded_ids=excluded_buyer_ids)
@@ -781,7 +839,9 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
         if cmd:
             return cmd
     if gold >= cost:
-        if role.id == buyer:
+        from .brain import weapon_upgrade_due
+        # preferred_buyer 也不能绕过日程（首日第一门已升完不买第二张）
+        if role.id == buyer and weapon_upgrade_due(state):
             cmd = opening_shop_voucher(role, state, blocked, reserved, stage_label, 'gold_ready')
             if cmd:
                 return cmd
@@ -819,10 +879,21 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
     return None
 
 
-def _voucher_buyer_id(state, gold, cost, excluded_ids=()):
-    """excluded_ids：本回合被开拓者自进化任务接管、根本不会被 dispatch 的角色。
-    选中它们当买家等于没人买——它们在主循环里直接 continue，永远不会执行到这笔购买。"""
+def _voucher_buyer_id(state, gold, cost, excluded_ids=(), blocked=None):
+    """统一走 economy.pick_weapon_voucher_buyer（完整往返代价 + 跳过任务中开拓者）。
+    金币不够或不该再升时不派买家；excluded_ids 为被任务接管、本回合不会执行买券的角色。"""
     if gold < cost:
+        return None
+    from .brain import weapon_upgrade_due
+    from .economy import pick_weapon_voucher_buyer
+    from .grid import build_blocked_set
+    if blocked is None:
+        blocked = build_blocked_set(state)
+    buyer = pick_weapon_voucher_buyer(state, blocked)
+    if buyer is not None and buyer.id not in excluded_ids:
+        return buyer.id
+    # 日程上已不该买（如首日第一门已升完）时不要退化成最近人乱买
+    if not weapon_upgrade_due(state):
         return None
     candidates = [r for r in state.team_our.roles
                   if r.role_type in ('worker', 'pioneer') and r.health > 0 and r.id not in excluded_ids]
@@ -843,9 +914,9 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
     from .tactics import imminent_contact
     worker_mode = opening_worker_mode(state, role)
     if imminent_contact(state) and stage != STAGE_BUILD_WEAPONS:
-        cmd = opening_muster(role, state, blocked, reserved, assignments, STAGE_MUSTER)
-        if cmd:
-            return cmd
+        handled, cmd = opening_muster_step(role, state, blocked, reserved, assignments, STAGE_MUSTER)
+        if handled:
+            return cmd  # None 表示已在炮位守着，不再往下派外出工作
     if stage == STAGE_MUSTER:
         return opening_muster(role, state, blocked, reserved, assignments, stage)
     if stage == STAGE_BUILD_WEAPONS:
@@ -884,23 +955,31 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
             return opening_apply_voucher(role, state, blocked, reserved, STAGE_APPLY)
         if role.role_type == 'worker' and helper_walls:
             return opening_wall_work(role, state, blocked, reserved, claimed, assignments)
-        if role.role_type == 'worker' and gold >= cost:
+        from .brain import weapon_upgrade_due
+        if role.role_type == 'worker' and gold >= cost and weapon_upgrade_due(state):
             return opening_shop_voucher(role, state, blocked, reserved, STAGE_APPLY, 'gold_ready')
         return opening_muster(role, state, blocked, reserved, assignments, STAGE_APPLY)
     if stage == STAGE_WALL:
-        if 'WeaponUpgradeVoucher1' in (role.backpack or []):
+        if use_voucher_now(role, state, blocked):
             return opening_apply_voucher(role, state, blocked, reserved, STAGE_WALL)
+        buyer_id = _voucher_buyer_id(
+            state, gold, cost, excluded_ids=excluded_buyer_ids, blocked=blocked)
         if role.role_type != 'worker':
-            if gold >= cost and 'stone' not in (role.backpack or []):
-                trace(state, role.id, 'voucher_buyer_pick', '生存墙阶段开拓者空档并行购买火箭升级券',
+            if role.id == buyer_id and 'stone' not in (role.backpack or []):
+                trace(state, role.id, 'voucher_buyer_pick', '生存墙阶段由统一买家买火箭升级券',
                       available_gold=gold, required_gold=cost)
-                cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'pioneer_parallel_voucher')
+                cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'wall_stage_buyer')
                 if cmd:
                     return cmd
             elif gold < cost:
                 trace(state, role.id, 'pioneer_voucher_wait_gold',
                       '生存墙阶段金币不足，开拓者不抢工人采矿，只等待任务金币或墙后备用',
                       available_gold=gold, required_gold=cost)
+            from .opening import pioneer_day_wait
+            handled, cmd = pioneer_day_wait(role, state, blocked, reserved, assignments.get(role.id),
+                                            '墙没修完，开拓者让开墙线和院内通道等待')
+            if handled:
+                return cmd
             return opening_muster(role, state, blocked, reserved, assignments, STAGE_WALL)
         if (worker_mode == 'economist' and 'stone' not in (role.backpack or [])
                 and not economist_should_help_wall(state, remaining or 70, role)):
@@ -916,19 +995,40 @@ def dispatch_opening_role(role, state, stage, blocked, reserved, claimed, assign
                   '墙压迫或施工工不可用，经济工临时接管生存墙',
                   stage=stage, remaining=remaining, wall_floor_met=day1_wall_floor_met(state))
         wall_floor_met = day1_wall_floor_met(state)
-        if worker_mode != 'builder' and wall_floor_met and gold >= cost:
+        if role.id == buyer_id and wall_floor_met and gold >= cost:
             trace(state, role.id, 'worker_wall_stage_voucher_attempt',
-                  '生存墙阶段墙数已达标且金币够，尝试并行买券（无买家协调，可能多人同时去买）',
+                  '生存墙达标且金币够，由统一买家买券',
                   available_gold=gold, required_gold=cost)
-            cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'wall_floor_met_backup_voucher')
+            cmd = opening_shop_voucher(role, state, blocked, reserved, STAGE_WALL, 'wall_floor_met_buyer')
             if cmd:
                 return cmd
         else:
             trace(state, role.id, 'worker_wall_stage_voucher_wait',
-                  '生存墙阶段暂不买券，继续修墙' if not wall_floor_met else '金币不够，继续修墙不买券',
-                  available_gold=gold, required_gold=cost, wall_floor_met=wall_floor_met)
+                  '生存墙阶段暂不买券，继续修墙' if not wall_floor_met else '非指定买家或金币不够，继续修墙',
+                  available_gold=gold, required_gold=cost, wall_floor_met=wall_floor_met,
+                  buyer_id=buyer_id)
         return opening_wall_work(role, state, blocked, reserved, claimed, assignments)
     return None
+
+
+def role_rounds_before_due(role, state, blocked, remaining, own_travel):
+    """离个人回防截止还剩几回合（<=0 即该回防）。
+    同时看开局炮位估时和 defense_due 用的 defense_snapshot，取更早的那个，
+    保证这里放人外出的时候，enforce_held_vouchers 等兜底不会判成“该回防”把命令改掉。"""
+    from .opening import MUSTER_BUFFER
+    from .pioneer_schedule import defense_snapshot
+    # 找不到回炮路径时不按炮位估时强行回防（原来回防也会因无路而落空），交给 defense_snapshot 或继续干活。
+    own_left = remaining if own_travel is None else remaining - own_travel - MUSTER_BUFFER
+    snap = defense_snapshot(role, state, blocked)
+    detail = {'snapshot_travel': snap['travel'], 'threat_eta': snap['threatEta'],
+              'snapshot_due': snap['defenseDue'], 'own_rounds_left': own_left}
+    if snap['pressure']:
+        return 0, detail
+    if snap['travel'] is None or snap['threatEta'] is None or snap['nightWaveCleared']:
+        return own_left, detail
+    snap_left = snap['threatEta'] - snap['travel'] - MUSTER_BUFFER
+    detail['snapshot_rounds_left'] = snap_left
+    return min(own_left, snap_left), detail
 
 
 def plan_opening_fsm(state):
@@ -954,20 +1054,22 @@ def plan_opening_fsm(state):
     stage = resolve_opening_stage(state, remaining=remaining)
     commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
     if stage == STAGE_MUSTER:
+        # 进行中任务不能因回防离开任务点；仅剥离 approaching 预约并清掉，避免预约悬空。
+        from .pioneer_schedule import clear_reservation, has_task_reservation
+        keep = set()
+        if state.phase_task:
+            keep |= set(task_pioneers)
         for pid in list(task_pioneers):
+            if pid in keep:
+                continue
             commands.pop(pid, None)
-        task_pioneers.clear()
+        task_pioneers = keep
+        pioneer = next((r for r in fighters if r.role_type == 'pioneer' and r.health > 0), None)
+        if pioneer and has_task_reservation(state, pioneer) and not state.phase_task:
+            clear_reservation(state, 'muster_clears_approaching')
     assignments = assign_weapons(state, excluded_ids=task_pioneers, persist=True)
     travel = [weapon_approach_path(r, assignments[r.id], blocked, set(), state)
               for r in fighters if r.id in assignments]
-    reachable = [len(p) for p in travel if p is not None]
-    if travel and not reachable:
-        muster_need = remaining + MUSTER_BUFFER
-    else:
-        muster_need = max(reachable + [0]) + MUSTER_BUFFER
-    if imminent_contact(state):
-        muster_need = remaining
-    stage = resolve_opening_stage(state, remaining=remaining, muster_need=muster_need)
     reachable = [len(p) for p in travel if p is not None]
     if travel and not reachable:
         muster_need = remaining + MUSTER_BUFFER
@@ -983,6 +1085,7 @@ def plan_opening_fsm(state):
     flags = flags_from_opening_stage(
         stage, gold, cost, opening_has_voucher(state),
         cutoff=past_first_upgrade_cutoff(state, remaining),
+        upgraded_count=upgraded_count,
     )
     from . import work_orders as wo
     orders = wo.compute_work_orders(state, blocked, force=True)
@@ -1037,8 +1140,12 @@ def plan_opening_fsm(state):
         # 白天按当前炮位继续施工；只在走去双火箭位已经来得及的最后窗口才改用夜里估时。
         if night_travel is not None and remaining <= night_travel + MUSTER_BUFFER:
             role_travel[builder_role.id] = night_travel if day_travel is None else max(day_travel, night_travel)
+    cashout_commits = state.policy_memory.setdefault(CASHOUT_COMMIT_KEY, {})
+    due_latch = state.policy_memory.setdefault(ROLE_DUE_KEY, {})
+    holding = set()
     for role in sorted(fighters, key=lambda r: (r.role_type != 'pioneer', r.id)):
-        if role.id in task_pioneers and stage != STAGE_MUSTER:
+        # 回防阶段 task_pioneers 只剩进行中任务的开拓者：离开任务点即失败，同样不能派回炮。
+        if role.id in task_pioneers:
             continue
         heal = decide_emergency_heal(role, state)
         if heal:
@@ -1046,32 +1153,53 @@ def plan_opening_fsm(state):
             continue
         # 个人回防截止点：不用全队最远角色统一停工，基地附近的人可以继续干到自己的截止点。
         own_travel = role_travel.get(role.id)
-        role_deadline = remaining if own_travel is None else own_travel + MUSTER_BUFFER
-        role_due = stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER) and (
-            imminent_contact(state) or remaining <= role_deadline)
+        working_stage = stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER)
+        due_in, due_detail = (role_rounds_before_due(role, state, blocked, remaining, own_travel)
+                              if working_stage else (remaining, {}))
+        day_key = (state.round_no or 0) // 130
+        # 个人回防一旦触发，当天就锁定：否则走近炮位后估时变宽松又被放出去，来回空转。
+        latched = due_latch.get(str(role.id)) == day_key
+        role_due = working_stage and (latched or imminent_contact(state) or due_in <= 0)
+        if role_due and not latched:
+            due_latch[str(role.id)] = day_key
+        committed = bool(cashout_commits.get(str(role.id)))
+        if committed and (role_due or not working_stage or not _metal_count(role, state)):
+            cashout_commits.pop(str(role.id), None)
+            committed = False
         # 还没到硬截止点，但背包有铜铁、马上要进最后回防窗口了：这是最后能安全绕一趟小贩的时机，
         # 现在不卖，等 role_due 触发就只能直接回炮，铜铁只能烂在背包里过夜。
-        if (not role_due and stage not in (STAGE_BUILD_WEAPONS, STAGE_MUSTER)
-                and not imminent_contact(state) and _metal_count(role, state)):
+        # 一旦出发就锁定到卖完：越靠近小贩绕路越短，每回合重算会把人放回去干别的，来回空转。
+        if not role_due and working_stage and _metal_count(role, state):
             zone, vendor_path = _nearest_zone(role, state, blocked, reserved, 'vendor')
-            if zone is not None:
-                detour = 2 * len(vendor_path) + 1
-                if remaining <= role_deadline + detour:
-                    cmd = opening_sell_metal(role, state, blocked, reserved, stage,
-                                             'muster_cashout_before_night')
-                    if cmd:
-                        trace(state, role.id, 'muster_cashout_before_night',
-                              '快到个人回防截止点，最后一次绕去卖掉背包里的铜铁',
-                              own_travel=own_travel, remaining=remaining, role_deadline=role_deadline,
-                              detour=detour)
-                        commands[role.id] = cmd
-                        continue
+            detour = None if zone is None else 2 * len(vendor_path) + 1
+            # detour=来回路程+出售，是“去卖再回炮”相对原地回炮多花的回合上界；
+            # due_in 不足 detour 时去了也卖不完，直接回炮，不出发后再折返。
+            if committed or (detour is not None and detour <= due_in <= detour + CASHOUT_WINDOW):
+                cmd = opening_sell_metal(role, state, blocked, reserved, stage,
+                                         'muster_cashout_before_night')
+                if cmd:
+                    cashout_commits[str(role.id)] = True
+                    trace(state, role.id, 'muster_cashout_before_night',
+                          '快到个人回防截止点，最后一次绕去卖掉背包里的铜铁',
+                          own_travel=own_travel, remaining=remaining, rounds_before_due=due_in,
+                          detour=detour, committed=committed, **due_detail)
+                    commands[role.id] = cmd
+                    continue
+                cashout_commits.pop(str(role.id), None)
         if role_due:
-            cmd = opening_muster(role, state, blocked, reserved, assignments, STAGE_MUSTER)
-            if cmd:
+            handled, cmd = opening_muster_step(role, state, blocked, reserved, assignments, STAGE_MUSTER)
+            if handled:
                 trace(state, role.id, 'role_muster_early', '个人回防截止点已到，先于全队进入回炮',
-                      own_travel=own_travel, remaining=remaining, team_stage=stage)
-                commands[role.id] = cmd
+                      own_travel=own_travel, remaining=remaining, team_stage=stage,
+                      rounds_before_due=due_in, holding=cmd is None, **due_detail)
+                if cmd:
+                    commands[role.id] = cmd
+                else:
+                    # 已在炮位：原地守着，不能再往下派外出工作。
+                    holding.add(role.id)
+                    heal = decide_self_heal(role)
+                    if heal:
+                        commands[role.id] = selected(state, role.id, heal, '守炮时自救')
                 continue
         cmd = dispatch_opening_role(
             role, state, stage, blocked, reserved, claimed, assignments, gold, cost, helper_walls,
@@ -1099,7 +1227,7 @@ def plan_opening_fsm(state):
         if heal and role.id not in commands:
             commands[role.id] = selected(state, role.id, heal, '自救')
     for role in fighters:
-        if role.role_type != 'worker' or role.id in commands:
+        if role.role_type != 'worker' or role.id in commands or role.id in holding:
             continue
         if stage in (STAGE_FUND, STAGE_WALL) and not imminent_contact(state):
             trace(state, role.id, 'invariant_violation', '白天工人无命令',

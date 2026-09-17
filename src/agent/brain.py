@@ -650,24 +650,24 @@ def weapon_upgrade_due(state: "MatchState") -> bool:
 
 
 def should_upgrade_weapon(state: "MatchState") -> bool:
-    """按日程控制升级节奏。第一天只升第一门；第二天起沿用原日程。"""
-    from .opening import REQUIRED_OPENING_UPGRADES, day1_second_upgrade_fits, live_l2_weapon_count
-    from .opening_schedule import STAGE_APPLY, STAGE_FUND, current_opening_stage
+    """按日程控制升级节奏。与 weapon_upgrade_due 共用日程；首日 WALL 阶段也允许筹资买券。"""
+    from .opening import REQUIRED_OPENING_UPGRADES, live_l2_weapon_count
+    from .opening_schedule import (
+        STAGE_APPLY, STAGE_BUILD_WEAPONS, STAGE_FUND, STAGE_MUSTER, STAGE_WALL,
+        current_opening_stage,
+    )
     jobs = sum(1 for job in state.worker_item_jobs.values() if job.get("kind") == "weapon")
     day = (state.round_no or 0) // DAY_NIGHT_CYCLE
     if not weapon_upgrade_due(state):
         return False
     if day <= 0:
-        if current_opening_stage(state) not in (STAGE_FUND, STAGE_APPLY, None):
+        stage = current_opening_stage(state)
+        # 建炮中 / 回炮中不走全局卖矿催券；FUND/APPLY/WALL（首日墙先于升级）可买第一张。
+        if stage in (STAGE_BUILD_WEAPONS, STAGE_MUSTER):
             return False
-        l2 = live_l2_weapon_count(state)
-        if l2 >= REQUIRED_OPENING_UPGRADES:
+        if stage not in (STAGE_FUND, STAGE_APPLY, STAGE_WALL, None):
             return False
-        gold = state.team_our.gold_num if state.team_our else 0
-        if gold < item_cost('WeaponUpgradeVoucher1', state) and not any(
-            'WeaponUpgradeVoucher1' in (r.backpack or [])
-            for r in state.team_our.roles
-        ):
+        if live_l2_weapon_count(state) >= REQUIRED_OPENING_UPGRADES:
             return False
         return jobs == 0
     return jobs == 0
@@ -1569,6 +1569,15 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                   '施工工本回合没有可走的墙动作，留在防线任务上不转去采铜铁',
                   allow_build=allow_build, stones=worker.backpack.count('stone'))
             return None
+    # 经济工墙缺口：先清包（策略 4.3），再继续道具任务 / 买券。
+    if economist and (staged_walls_incomplete(state) or critical_wall_missing(state)):
+        from .economy import sellable_ores
+        if sellable_ores(worker, state, ignore_stockpile=True):
+            handled, cmd = liquidate(worker, state, blocked, reserved,
+                                     force_reason='第三天经济工先清空背包，再判断金币够不够升级',
+                                     keep_wall_stone=True)
+            if cmd:
+                return cmd
     continue_job = False
     if job:
         if job.get('kind') == 'station' and job.get('item') in worker.backpack:
@@ -1586,14 +1595,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         if cmd:
             return cmd
     if economist and (staged_walls_incomplete(state) or critical_wall_missing(state)):
-        # 墙有缺口时由施工工补墙；经济工先清空背包，再按到手金币决定买券升级还是帮墙。
-        from .economy import sellable_ores
-        if sellable_ores(worker, state, ignore_stockpile=True):
-            handled, cmd = liquidate(worker, state, blocked, reserved,
-                                     force_reason='第三天经济工先清空背包，再判断金币够不够升级',
-                                     keep_wall_stone=True)
-            if cmd:
-                return cmd
+        # 墙有缺口时由施工工补墙；经济工按到手金币决定买券升级还是采矿。
         maybe_start_shop_item_job(worker, state, allow_weapon=True, allow_structure_upgrade=True)
         eco_job = state.worker_item_jobs.get(worker.id)
         if eco_job and (eco_job.get('item') in worker.backpack
@@ -2160,8 +2162,15 @@ def plan_night(state: "MatchState") -> dict:
         return commands
     # 机器人未清完前固定"两人三炮 + 一名工人去后院采矿"：开拓者不接新任务，留在守炮名单。
     # 唯一例外：天黑前已开始的任务（离开任务点即失败）做完再回炮，这期间两名工人守炮、不放人。
-    # 机器人清完后走上面的清波分支，开拓者才恢复接任务。
+    # 白天留下的 approaching 预约不再去接，直接清掉，避免预约悬空；清波后开拓者才恢复接任务。
+    from .pioneer_schedule import clear_reservation, has_task_reservation
     commands, task_pioneers = {}, set()
+    pioneer = next((r for r in state.team_our.roles
+                    if r.role_type == 'pioneer' and r.health > 0), None)
+    if not state.phase_task and pioneer and has_task_reservation(state, pioneer):
+        clear_reservation(state, 'night_defense_clears_approaching')
+        trace(state, pioneer.id, "night_clear_reservation",
+              "未清波：开拓者守炮，清掉白天留下的任务预约")
     if state.phase_task:
         commands, task_pioneers = plan_pioneer_tasks(state, blocked, reserved)
         trace(state, None, "night_hold_active_task",
@@ -2175,6 +2184,9 @@ def plan_night(state: "MatchState") -> dict:
     if released_worker is not None:
         excluded.add(released_worker.id)
         commands[released_worker.id] = released_cmd
+        # 外出的人还在院里：把他出院要经过的格留给他，守炮的人本回合不先站上去把他堵住。
+        from .opening import yard_exit_cells
+        reserved |= yard_exit_cells(released_worker, state, blocked)
     assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
     fighters = [r for r in state.team_our.roles
                 if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]

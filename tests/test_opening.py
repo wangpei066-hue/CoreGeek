@@ -141,7 +141,8 @@ class OpeningTests(unittest.TestCase):
         state.vendor_shop_list = [ShopItem('copper', 5)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertFalse(any(c['action'] == 'sell' for c in commands.values()))
-        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_sell'] is False
+        # WALL 阶段允许卖闲置铜铁；本例工人背着石头优先建墙，所以本回合仍可不卖。
+        self.assertTrue(any(e['code'] == 'opening_time_budget' and e['allow_sell'] is True
                             for e in state.decision_events))
         self.assertTrue(any(e['code'] == 'opening_phase' and e['phase'] in ('围墙', 'SURVIVAL_WALL')
                             for e in state.decision_events))
@@ -188,8 +189,8 @@ class OpeningTests(unittest.TestCase):
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 0, False, build_blocked_set(state))
         self.assertTrue(budget['allow_walls'])
-        self.assertFalse(budget['allow_sell'])
-        self.assertFalse(budget['allow_upgrade'])
+        self.assertTrue(budget['allow_sell'])  # WALL 可卖闲置铜铁 / 夜前清包
+        self.assertFalse(budget['allow_upgrade'])  # 金币不够，未 funded
 
     def test_day1_mines_stone_before_upgrade(self):
         from src.agent.protocol import ShopItem
@@ -233,7 +234,7 @@ class OpeningTests(unittest.TestCase):
         self.assertTrue(budget['allow_walls'])
         self.assertTrue(budget['required_done'])
         self.assertFalse(budget['allow_mine'])
-        self.assertFalse(budget['allow_sell'])
+        self.assertTrue(budget['allow_sell'])
         state.map_info.zones = [
             Zone(Pos(6, 9), 'stone'),
             Zone(Pos(9, 6), 'copper'),
@@ -298,8 +299,8 @@ class OpeningTests(unittest.TestCase):
         self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
-        self.assertFalse(budget['allow_upgrade'])
-        self.assertFalse(budget['allow_sell'])
+        self.assertTrue(budget['allow_upgrade'])  # WALL + 金币够：统一买家可买券
+        self.assertTrue(budget['allow_sell'])
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(8, 9)
@@ -874,7 +875,7 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         from src.agent.brain import DAY_ROUNDS
         from src.agent.opening import (
             DAY1_L2_GUNNER_READY_CYCLE, DAY1_OTHER_READY_CYCLE,
-            defense_ready_cycle, defense_rounds_remaining, first_night_economy_open,
+            defense_ready_cycle, defense_rounds_remaining,
         )
         state = opening_state()
         self._rockets(state)
@@ -882,7 +883,6 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         self.assertEqual(day_rounds_remaining(69), 1)
         self.assertEqual(defense_ready_cycle(state), DAY_ROUNDS)
         self.assertEqual(defense_rounds_remaining(state), 1)
-        self.assertFalse(first_night_economy_open(state))
         self.assertGreater(DAY1_OTHER_READY_CYCLE, DAY_ROUNDS)
         self.assertGreater(DAY1_L2_GUNNER_READY_CYCLE, DAY_ROUNDS)
         next(r for r in state.team_our.roles if r.role_type == 'rocket').level = 2
@@ -932,7 +932,7 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         self._rockets(state)
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 15, 3, 130, False, build_blocked_set(state))
-        self.assertFalse(budget['allow_upgrade'])
+        self.assertTrue(budget['allow_upgrade'])  # 第一门未升完且金币够
         self.assertFalse(budget.get('allow_income_mine'))
         self.assertTrue(budget.get('upgrade_funded'))
         self.assertTrue(budget['allow_walls'])
@@ -944,7 +944,7 @@ class OpeningUpgradeEstimateTests(unittest.TestCase):
         missing = primary_wall_plan(state, state.team_our.roles[0])[:8]
         budget = opening_time_budget(state, missing, 8, 3, 0, False, build_blocked_set(state))
         self.assertFalse(budget['allow_mine'])
-        self.assertFalse(budget['allow_sell'])
+        self.assertTrue(budget['allow_sell'])
         self.assertTrue(budget['allow_walls'])
         self.assertFalse(budget.get('allow_income_mine'))
         self.assertEqual(budget.get('opening_phase'), 'SURVIVAL_WALL')

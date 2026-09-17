@@ -139,6 +139,8 @@ def illegal_switches(trail):
         # 建造工状态机：成批施工、夜前囤石到第二天、以及带原因的等待。
         'build_batch', 'build_batch_retry', 'stock_for_day2',
         'backpack_full_no_buildable_slot', 'stone_mine_exhausted', 'no_reachable_work',
+        # 回炮路上队友挡在第一步：原地等一回合，不绕出院子。
+        'wait_teammate',
     }
     return [row for row in trail if row.get('switch_reason') not in allowed]
 
@@ -160,6 +162,62 @@ def aba_oscillations(trail):
                     and c.get('goal_pos') and c.get('goal_pos') != a.get('goal_pos')):
                 count += 1
     return count
+
+
+def ping_pong_runs(positions, min_len=4):
+    """同一个人连续在两个格子间来回（A B A B ...）至少 min_len 回合的片段。"""
+    runs, start = [], None
+    for i in range(2, len(positions) + 1):
+        ok = i < len(positions) and positions[i] == positions[i - 2] and positions[i] != positions[i - 1]
+        if ok and start is None:
+            start = i - 2
+        if not ok and start is not None:
+            if i - start >= min_len:
+                runs.append((start, positions[start:i]))
+            start = None
+    return runs
+
+
+class OpeningThreeRoleIdleTests(unittest.TestCase):
+    def test_muster_does_not_pull_pioneer_off_active_task(self):
+        """回防阶段：正在做任务的开拓者离开任务点任务就失败，不能被派回炮。"""
+        state = _map(opening_state())
+        _rockets(state)
+        state.round_no = 68
+        state.policy_memory['opening_stage'] = STAGE_MUSTER
+        pioneer = next(r for r in state.team_our.roles if r.id == 3)
+        pioneer.pos = Pos(3, 3)
+        state.phase_task = '部署修复任务：工作区为 /srv/app/'
+        state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(3, 3), 0, 10, 10, True)]
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        self.assertNotEqual((commands.get(pioneer.id) or {}).get('action'), 'move', commands.get(pioneer.id))
+        self.assertFalse(any(e.get('code') == 'opening_worker_tick' and e.get('role_id') == pioneer.id
+                             for e in state.decision_events))
+
+    def test_full_day1_no_role_ping_pongs(self):
+        """回归：开拓者站在院内咽喉/墙格、院内外可达性不一致、卖矿阈值和回防分配来回跳，
+        曾让三人整天在两格之间往返。完整跑第一天：没人长时间往返，墙修得够，入夜前都到位。"""
+        state = _map(opening_state())
+        state.team_our.gold_num = 75
+        strategy = V1Strategy(BasicActionValidator())
+        tracks = {1: [], 2: [], 3: []}
+        for _ in range(70):
+            for rid in tracks:
+                role = next(r for r in state.team_our.roles if r.id == rid)
+                tracks[rid].append((role.pos.x, role.pos.y))
+            commands = strategy.decide(state)
+            apply_opening_commands(state, commands)
+            state.round_no += 1
+            state.last_round_role_action_results = {k: True for k in commands}
+        for rid, track in tracks.items():
+            self.assertEqual(ping_pong_runs(track), [], (rid, track))
+        walls = sum(1 for r in state.team_our.roles if r.role_type == 'wall')
+        self.assertGreaterEqual(walls, 9)
+        from src.agent.opening import assign_weapons
+        for rid, weapon in assign_weapons(state).items():
+            role = next(r for r in state.team_our.roles if r.id == rid)
+            self.assertLessEqual(max(abs(role.pos.x - weapon.pos.x), abs(role.pos.y - weapon.pos.y)), 1,
+                                 (rid, role.pos, weapon.pos))
 
 
 class OpeningFsmTrailTests(unittest.TestCase):
@@ -401,21 +459,23 @@ class OpeningFsmTrailTests(unittest.TestCase):
         self.assertEqual(tick.get('switch_reason'), 'wall_stage_metal_unused')
 
     def test_role_sells_metal_before_early_muster_when_time_allows(self):
-        """回归：到个人回防点时背包还有铜铁、且时间够，要先绕去卖掉再回炮，不能直接空转带进夜里。"""
+        """回归：到个人回防点时背包还有铜铁、且绕路仍来得及，要先卖掉再回炮。"""
         state = opening_state()
-        state.round_no = 60
+        # remaining=8；工人在炮位旁且贴着小贩 → detour≈1，due_in 落在清包窗口
+        state.round_no = 62
         state.team_our.gold_num = 0
         _rockets(state)
-        state.map_info.zones = [Zone(Pos(1, 11), 'vendor')]
+        state.map_info.zones = [Zone(Pos(11, 10), 'vendor')]
         state.vendor_shop_list = [ShopItem('iron', 3)]
         worker = next(r for r in state.team_our.roles if r.id == 1)
+        worker.pos = Pos(11, 10)
         worker.backpack = ['iron'] * 10
         state.policy_memory['opening_stage'] = STAGE_WALL
         commands = V1Strategy(BasicActionValidator()).decide(state)
         events = [e for e in state.decision_events
                   if e.get('code') == 'muster_cashout_before_night' and e.get('role_id') == worker.id]
-        self.assertTrue(events)
-        self.assertEqual(commands.get(worker.id, {}).get('action'), 'move')
+        self.assertTrue(events, [e.get('code') for e in state.decision_events if e.get('role_id') == worker.id])
+        self.assertIn(commands.get(worker.id, {}).get('action'), ('sell', 'move'))
 
     def test_pioneer_busy_does_not_block_day1_wall_work(self):
         """首日三炮齐后先修墙；开拓者忙任务也不能让工人卡在买券选择上。"""
@@ -428,7 +488,7 @@ class OpeningFsmTrailTests(unittest.TestCase):
         state.vendor_shop_list = [ShopItem('copper', 5), ShopItem('iron', 5), ShopItem('stone', 1)]
         state.weapon_shop_list = [ShopItem('WeaponUpgradeVoucher1', 100)]
         pioneer = next(r for r in state.team_our.roles if r.id == 3)
-        pioneer.pos = Pos(2, 9)  # 离商店比两名工人都近，是 _voucher_buyer_id 天然会选中的对象
+        pioneer.pos = Pos(2, 9)  # 离商店近；统一买家会跳过有 phaseTask 的开拓者
         state.phase_task = '部署修复任务：工作区为 /srv/app/'
         state.team_our.player_tasks = [PlayerTask('自进化类1', Pos(2, 9), 0, 10, 10, True)]
 
