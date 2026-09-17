@@ -238,27 +238,13 @@ def empty_experience(key=None):
 
 
 def record_duration_sample(experience, session, reason, round_no):
-    """归档时记下领取到就绪/结束的回合差；失败和超时也计入，避免只学成功快题。"""
-    if not session:
-        return
-    kind = session.get('taskKind') or 'unknown'
-    metrics = session.get('metrics') or {}
-    accepted = metrics.get('acceptedRound')
-    if accepted is None or round_no is None:
-        return
-    ready = metrics.get('answerReadyRound')
-    if ready is not None:
-        duration = max(1, int(ready) - int(accepted))
-        outcome = 'answer_ready'
-    else:
-        duration = max(1, int(round_no) - int(accepted))
-        outcome = reason or session.get('endReason') or 'incomplete'
-    bucket = experience.setdefault('durations', {}).setdefault(kind, [])
-    bucket.append(dict(
-        duration=duration, outcome=outcome, kind=kind,
-        timeoutRounds=metrics.get('timeoutRounds'), archivedRound=round_no,
-    ))
-    experience['durations'][kind] = bucket[-8:]
+    """Do not publish timing samples used as hard task-eligibility filters.
+
+    A single slow/incomplete API attempt previously inflated the scheduler's
+    solve estimate and caused later valid tasks to become ``idle`` (Issue #891).
+    Timing is diagnostic data, not permission to hide a platform task.
+    """
+    return
 
 
 def empty_metrics(round_no):
