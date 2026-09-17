@@ -142,43 +142,13 @@ def own_station(state: "MatchState"):
 def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: str = "weapon",
                       worker: Optional[Role] = None) -> Optional[Pos]:
     """在基地周围环形扩展搜索一个未阻挡、未被记录为建造失败的候选格。
-    墙：先正面后侧翼，同优先级选离施工工最近的格子，避免两端来回跑。"""
+    墙：沿计划从已有墙往外接，粘住当前格，不因为另一格离人更近就换。"""
     width, height = state.map_info.width, state.map_info.height
     if kind == "wall":
-        from .opening import (
-            safe_wall, assign_weapons, wall_priority, due_wall_gaps,
-        )
-        base = own_station(state)
-        if base is None:
-            return None
+        from .opening import due_wall_gaps, next_wall_gap
         plan = due_wall_gaps(state, worker)
-        existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
-        origin = worker.pos if worker is not None else base_pos
-        from .opening import wall_approach_path
-        ranked = []
-        for p in plan:
-            if p in blocked or (p[0], p[1], kind) in state.failed_build_spots:
-                continue
-            if not safe_wall(state, p, blocked, assign_weapons(state)):
-                if worker is None or chebyshev(worker.pos, Pos(*p)) != 1:
-                    continue
-            path = None
-            if worker is not None:
-                path = wall_approach_path(worker, Pos(*p), blocked, state)
-                if path is None:
-                    continue
-            adj_built = any(chebyshev(Pos(*p), Pos(*e)) == 1 for e in existing) if existing else True
-            here = chebyshev(origin, Pos(*p))
-            ranked.append((
-                wall_priority(state, base, p),
-                0 if here <= 1 else 1,
-                0 if adj_built else 1,
-                0 if path is None else len(path),
-                here,
-                p,
-            ))
-        ranked.sort()
-        return next((Pos(x, y) for *_rest, (x, y) in ranked), None)
+        point, _path = next_wall_gap(worker, state, plan, blocked)
+        return Pos(*point) if point else None
     from .opening import weapon_candidates
     base = own_station(state)
     if base is None:
@@ -1256,15 +1226,9 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
         elif (pending[0], pending[1], "wall") in state.failed_build_spots:
             del state.worker_build_targets[worker.id]
             pending = None
-        elif worker is not None:
-            better = pick_build_target(state, base.pos, (blocked | reserved) - {(worker.pos.x, worker.pos.y)},
-                                       "wall", worker=worker)
-            stuck = (pending[0], pending[1]) in failed_move_cells(state, worker)
-            if better is not None and (
-                    stuck
-                    or chebyshev(worker.pos, Pos(*pending[:2])) > chebyshev(worker.pos, better) + 1):
-                del state.worker_build_targets[worker.id]
-                pending = None
+        elif (pending[0], pending[1]) in failed_move_cells(state, worker):
+            del state.worker_build_targets[worker.id]
+            pending = None
     if pending:
         x, y, kind = pending
         if ((x, y, kind) in state.failed_build_spots
@@ -1310,7 +1274,7 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                         else:
                             name = "wall"
                             reserved.add((x, y))
-                            return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+                            return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '本回合目标：砌上计划墙缺口')
                 else:
                     del state.worker_build_targets[worker.id]
                     if state.team_our.gold_num < WEAPON_GOLD_COST:
@@ -1330,7 +1294,7 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                     del state.worker_build_targets[worker.id]
                     pending = None
                 else:
-                    cmd = move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
+                    cmd = move_on_path(state, worker, path, reserved, '本回合目标：沿墙线走到计划缺口')
                     if cmd:
                         return cmd
                     del state.worker_build_targets[worker.id]
@@ -1381,9 +1345,9 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             if "stone" not in worker.backpack:
                 return None
             reserved.add((target.x, target.y))
-            return selected(state, worker.id, {"action": "build", "name": "wall", "targetPos": [{"x": target.x, "y": target.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+            return selected(state, worker.id, {"action": "build", "name": "wall", "targetPos": [{"x": target.x, "y": target.y}]}, '本回合目标：砌上计划墙缺口')
         path = wall_approach_path(worker, target, blocked | reserved, state)
-        cmd = move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
+        cmd = move_on_path(state, worker, path, reserved, '本回合目标：沿墙线走到计划缺口')
         if cmd:
             return cmd
         from .opening import step_toward_wall_gap
@@ -2085,9 +2049,7 @@ def _night_worker_release(state, blocked, reserved):
     """两人三炮下第三个人（一名工人）的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
     不看任务点是否可接：未清波时开拓者不接新任务、留在守炮名单。
     开拓者在做天黑前已开始的任务时由 plan_night 直接不调用本函数。
-    - 前两夜：优先放经济工去后院采矿，施工工和开拓者守三炮。
-    - 第三夜起：优先放施工工，经济工一人守双火箭、开拓者开另一门。
-    - 偏好的人出不去（被炮位夹角堵住）或没事可做时，换另一名工人。
+    每晚施工工留守开双火箭，经济工外出。施工工出不去（被堵/没事可做）才换人。
     - 敌人逼近/有压力时叫人回防：前两夜一律不叫（火箭 3 回合冷却，空手回来改变不了什么），
       只要剩下两人结构上能覆盖三炮就继续在外面干活；第三夜起只有外出的人身上带着
       升级券、修墙道具或战斗道具时才按压力叫回，回来先在家用道具给残墙回血（夜里不能建造）。
@@ -2099,7 +2061,7 @@ def _night_worker_release(state, blocked, reserved):
     from .opening import carries_home_defense_item, guns_covered_without, night_danger_cells
     from .opening_schedule import opening_worker_mode
     from .tactics import front_breached, pressure
-    wanted = "builder" if later_night else "economist"
+    wanted = "economist"
     pressed = pressure(state) or front_breached(state)
     # 按分工偏好排序，但不死认一个人：偏好的人被堵在炮位夹角里出不去、没矿可去时，换另一名工人出去。
     # 上一回合放出去的人优先继续外出，避免两名工人来回换班。
@@ -2107,11 +2069,10 @@ def _night_worker_release(state, blocked, reserved):
     candidates = sorted(workers, key=lambda w: (w.id != previous,
                                                 opening_worker_mode(state, w) != wanted,
                                                 -len(w.backpack or []), -w.id))
-    if not later_night:
-        # 前两夜施工工必须留家开双火箭，只放经济工外出。
-        stay_home = [w for w in candidates if opening_worker_mode(state, w) != "builder"]
-        if stay_home:
-            candidates = stay_home
+    # 每晚施工工必须留家开双火箭，只放经济工外出。
+    stay_home = [w for w in candidates if opening_worker_mode(state, w) != "builder"]
+    if stay_home:
+        candidates = stay_home
     released = cmd = reason = None
     danger = night_danger_cells(state)
     for worker in candidates:
@@ -2132,14 +2093,14 @@ def _night_worker_release(state, blocked, reserved):
         try:
             if not later_night:
                 cmd = decide_worker_day(worker, state, blocked, reserved)
-                reason = "前两夜两人三炮：一名工人去后院采矿，另一名工人与开拓者守炮"
+                reason = "两人三炮：施工工守双火箭，经济工去后院采矿"
             else:
                 # 有压力且带着道具：先在家修残墙；否则照常去后院采矿。
                 cmd = maintain_front_wall_health(worker, state, blocked, reserved) if under_pressure else None
-                reason = "第三夜起有压力且带着道具：两人守三炮，另一名工人在家用道具修残墙（夜里不建造）"
+                reason = "第三夜起有压力且带着道具：施工工守双火箭，外出工人在家用道具修残墙（夜里不建造）"
                 if not cmd:
                     cmd = decide_worker_day(worker, state, blocked, reserved)
-                    reason = "第三夜起：两人守三炮，另一名工人先修残墙再去后院采矿"
+                    reason = "两人三炮：施工工守双火箭，经济工去后院采矿"
         finally:
             state.night_released_ids = set()
         if cmd:
@@ -2277,7 +2238,7 @@ def plan_night(state: "MatchState") -> dict:
                                                             ledger, target_ctx)
                 if alternate is not None:
                     trace(state, fighter.id, "weapon_assignment",
-                          "分配火箭冷却，切到相邻已冷却火箭炮开火", weapon_id=alternate.id,
+                          "本回合目标：切到共用位上已冷却的另一门火箭开火", weapon_id=alternate.id,
                           assigned_weapon_id=weapon.id)
                     trace(state, fighter.id, "selected", TARGETING_REASON,
                           weapon_id=alternate.id, target_pos=alt_plan[0], expected_damage=alt_plan[1])
@@ -2288,20 +2249,27 @@ def plan_night(state: "MatchState") -> dict:
                     continue
                 from .opening import control_stand_path
                 stand_path = control_stand_path(fighter, weapon, blocked, reserved | exit_hold, state)
-                need_stand = (weapon.cooldown or 0) > 0
-                if need_stand and stand_path:
+                # 这一发打不了：不论冷却还是没目标，都先站到共用位，不要贴着一门空转。
+                if stand_path:
+                    trace(state, fighter.id, "weapon_assignment",
+                          "本回合目标：走到双火箭共用操控位，轮流开两门", weapon_id=weapon.id)
                     cmd = move_on_path(state, fighter, stand_path, reserved,
-                                       '分配火箭暂时打不了，先站到双火箭共用操控位轮流开火')
+                                       '本回合目标：走到双火箭共用操控位，轮流开两门')
                     if cmd:
                         commands[fighter.id] = cmd
                         continue
-                if need_stand and stand_path == [] and not at_gun:
-                    trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-                    trace(state, fighter.id, "weapon_cooldown", "火箭冷却，留在另一门火箭旁轮流开火", weapon_id=weapon.id)
+                if stand_path == [] and not at_gun:
+                    trace(state, fighter.id, "weapon_assignment",
+                          "本回合目标：守在双火箭共用位轮流开火", weapon_id=weapon.id)
+                    if not ready:
+                        trace(state, fighter.id, "weapon_cooldown", "火箭冷却，留在共用位等下一门", weapon_id=weapon.id)
+                    else:
+                        trace(state, fighter.id, "no_target_in_range", "共用位上射程内无目标，原地等敌人", weapon_id=weapon.id)
                     continue
             if at_gun:
                 if plan:
-                    trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+                    trace(state, fighter.id, "weapon_assignment",
+                          "本回合目标：开分配的火箭", weapon_id=weapon.id)
                     trace(state, fighter.id, "selected", TARGETING_REASON,
                           weapon_id=weapon.id, target_pos=plan[0], expected_damage=plan[1])
                     ledger.add(plan[1])
@@ -2313,7 +2281,7 @@ def plan_night(state: "MatchState") -> dict:
                     commands[fighter.id] = heal_cmd
                     continue
                 trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-                if fighter.role_type == 'worker' and night_near_work_allowed(state) and not robots:
+                if fighter.role_type == 'worker' and weapon.role_type != "rocket" and night_near_work_allowed(state) and not robots:
                     from .opening import adjacent_critical_build
                     near = adjacent_critical_build(fighter, state, blocked, reserved)
                     if near:

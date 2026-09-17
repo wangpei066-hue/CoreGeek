@@ -63,7 +63,12 @@ class RegressionTests(unittest.TestCase):
         state.last_round_role_action_results = {1: False}
         learn_from_last_round(state)
         self.assertIn((13, 7, 'weapon'), state.failed_build_spots)
-        self.assertEqual(pick_build_target(state, Pos(10, 10), set(), 'wall'), Pos(13, 7))
+        from src.agent.opening import due_wall_gaps
+        gaps = due_wall_gaps(state)
+        self.assertIn((13, 7), gaps)
+        target = pick_build_target(state, Pos(10, 10), set(), 'wall')
+        self.assertIsNotNone(target)
+        self.assertIn((target.x, target.y), gaps)
         state.round_no += BUILD_RETRY_UNKNOWN
         state.last_sent_command = {}
         learn_from_last_round(state)

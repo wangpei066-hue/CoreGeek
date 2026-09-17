@@ -2425,50 +2425,88 @@ def release_stalled_opening_jobs(state, survival_mode):
                   stalled_rounds=snap['stalled_rounds'], job_stage=snap.get('stage'))
 
 
+def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sticky=None):
+    """沿计划从已有墙往外接。粘住当前格，不因为另一格离人更近就换。
+
+    本回合只认一个目标：sticky 仍在名单且走得到就继续；否则优先接在已有墙上的格子，
+    再按 `candidates` 的计划顺序取最早那格。返回 (point, path)；path==[] 表示已贴着可砌。
+    """
+    occupied = (set(blocked) | set(reserved) | set(claimed))
+    if role is not None:
+        occupied.discard((role.pos.x, role.pos.y))
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    order = {tuple(p): i for i, p in enumerate(candidates)}
+    assignments = assign_weapons(state)
+
+    def usable(point):
+        point = tuple(point)
+        if point not in order:
+            return None
+        if point in occupied or (*point, 'wall') in state.failed_build_spots:
+            return None
+        if not safe_wall(state, point, set(blocked) | set(claimed), assignments):
+            if role is None or chebyshev(role.pos, Pos(*point)) != 1:
+                return None
+        if role is None:
+            return []
+        path = wall_approach_path(role, Pos(*point), set(blocked) | set(reserved), state)
+        return path
+
+    if sticky:
+        sticky = tuple(sticky)
+        path = usable(sticky)
+        if path is not None:
+            return sticky, path
+
+    ranked = []
+    for point in candidates:
+        point = tuple(point)
+        path = usable(point)
+        if path is None:
+            continue
+        adj_exist = any(chebyshev(Pos(*point), Pos(*e)) == 1 for e in existing)
+        isolated = 0 if (not existing or adj_exist) else 1
+        ranked.append((isolated, order[point], point, path))
+    if not ranked:
+        return None, None
+    ranked.sort()
+    _iso, _idx, point, path = ranked[0]
+    return point, path
+
+
 def claim_opening_wall(role, state, candidates, blocked, reserved, claimed, assignments):
-    """选出本回合真正能接近或建造的墙位；失败不占用 claim。"""
+    """选出本回合真正能接近或建造的墙位；失败不占用 claim。一回合只追一个缺口。"""
     sticky = tuple(state.policy_memory.get('opening_wall_targets', {}).get(str(role.id), ()))
-    if sticky and sticky not in candidates:
+    if sticky and sticky not in {tuple(p) for p in candidates}:
         state.policy_memory.get('opening_wall_targets', {}).pop(str(role.id), None)
         sticky = ()
 
-    def wall_sort_key(point):
-        path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
-        unreachable = path is None
-        from .brain import own_station
-        base = own_station(state)
-        pri = 0 if base is None else wall_priority(state, base, point)
-        adjacent = 0 if path == [] else 1
-        return (unreachable, pri, adjacent, 0 if path is None else len(path),
-                0 if point == sticky else 1, point)
-
-    for point in sorted(candidates, key=wall_sort_key):
-        occupied = (blocked | reserved | claimed) - {(role.pos.x, role.pos.y)}
-        if point in occupied or (*point, 'wall') in state.failed_build_spots:
-            continue
-        if not safe_wall(state, point, blocked | claimed, assignments):
-            continue
-        path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
-        if path is None:
-            continue
+    skipped = set()
+    while True:
+        point, path = next_wall_gap(
+            role, state, candidates, blocked, reserved, claimed | skipped, sticky=sticky or None,
+        )
+        if point is None:
+            return None
         claimed.add(point)
         state.policy_memory.setdefault('opening_wall_targets', {})[str(role.id)] = list(point)
         if path:
-            cmd = move_on_path(state, role, path, reserved, '从院内接近迎敌墙缺口')
+            cmd = move_on_path(state, role, path, reserved, '本回合目标：沿墙线走到计划缺口')
             if not cmd:
                 claimed.discard(point)
                 state.policy_memory.get('opening_wall_targets', {}).pop(str(role.id), None)
+                skipped.add(point)
+                sticky = ()
                 continue
             return cmd
         cmd = selected(state, role.id, {
             'action': 'build', 'name': 'wall', 'targetPos': [{'x': point[0], 'y': point[1]}],
-        }, '建造迎敌防线')
+        }, '本回合目标：砌上计划墙缺口')
         reserved.add(point)
         blocked.add(point)
         state.policy_memory.get('opening_wall_targets', {}).pop(str(role.id), None)
         state.policy_memory['wall_work_attempted'] = True
         return cmd
-    return None
 
 
 def opening_yard_wait(role, state, blocked, reserved):

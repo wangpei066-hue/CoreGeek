@@ -168,9 +168,9 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(commands[freed.id]['action'], 'collect')
         self.assertFalse(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
 
-    def test_first_two_nights_builder_mans_dual_rockets(self):
-        """前两夜施工工留守开双火箭，经济工外出；施工工分到的必须是火箭。"""
-        for round_no in (80, 210):
+    def test_every_night_builder_mans_dual_rockets(self):
+        """每晚施工工留守开双火箭，经济工外出；施工工分到的必须是火箭。"""
+        for round_no in (80, 210, 340):
             with self.subTest(round_no=round_no):
                 state = self._dual_rocket_night()
                 state.round_no = round_no
@@ -193,6 +193,28 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 firing = any(c.get('controllerId') == str(builder.id) for c in commands.values())
                 walking = commands.get(builder.id, {}).get('action') == 'move'
                 self.assertTrue(firing or walking)
+
+    def test_builder_moves_to_shared_stand_when_assigned_rocket_has_no_target(self):
+        """分配火箭就绪但打不了时，也要去共用位，不能贴着一门空转。"""
+        state = self._dual_rocket_night()
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 9)
+        economist.pos = Pos(6, 9)
+        pioneer.pos = Pos(10, 12)
+        for rocket in (r for r in state.team_our.roles if r.role_type == 'rocket'):
+            rocket.cooldown = 0
+        state.policy_memory['weapon_assignment'] = {'1': 20, '3': 22}
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        state.robot.roles = []
+        commands = self.decide(state)
+        self.assertNotIn(20, commands)
+        self.assertNotIn(21, commands)
+        moved = commands.get(1, {})
+        self.assertEqual(moved.get('action'), 'move', commands)
+        dest = moved['targetPos'][0]
+        self.assertLessEqual(max(abs(dest['x'] - 9), abs(dest['y'] - 10)), 2)
 
     def test_builder_moves_to_shared_stand_instead_of_idling_on_cooling_rocket(self):
         """贴着冷却火箭但不在共用位时，要迈到共用位去切另一门，不能原地空转。"""
@@ -753,23 +775,29 @@ class ThirdNightRepairTests(unittest.TestCase):
         builder.backpack = ['WallUpgradeVoucher1']
         return state, builder
 
-    def test_builder_repairs_front_wall_from_inside_yard_under_pressure(self):
+    def test_builder_stays_on_dual_rockets_under_pressure(self):
+        """夜里有压力也先守双火箭，不用墙券把施工工从炮位拉开。"""
         state, builder = self._pressure_state((13, 10))
         builder.pos = Pos(12, 10)
         commands = self.decide(state)
-        self.assertEqual(commands[builder.id], {'action': 'use', 'name': 'WallUpgradeVoucher1',
-                                                'targetPos': [{'x': 13, 'y': 10}]})
-        self.assertFalse(any(c.get('controllerId') == str(builder.id) for c in commands.values()))
+        self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
+        self.assertIn(str(builder.id), state.policy_memory.get('weapon_assignment', {}))
+        firing = any(c.get('controllerId') == str(builder.id) for c in commands.values())
+        walking = commands.get(builder.id, {}).get('action') == 'move'
+        self.assertTrue(firing or walking, commands.get(builder.id))
 
-    def test_builder_goes_mining_when_damaged_wall_is_outside_yard_reach(self):
-        """院里够不着残墙时不回去当第三个炮手：两人已守住三炮，这名工人去后院采矿。"""
+    def test_economist_goes_mining_when_builder_is_on_guns(self):
+        """院里够不着残墙时不把施工工放出去：施工工守双火箭，经济工去后院采矿。"""
         state, builder = self._pressure_state((13, 7))  # 角落墙只能从墙外够到
         from src.agent.protocol import Zone
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 10)
         state.map_info.zones = [Zone(Pos(3, 10), 'iron')]
         commands = self.decide(state)
-        self.assertNotIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        self.assertIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        self.assertNotIn(str(economist.id), state.policy_memory['weapon_assignment'])
         released = [e['role_id'] for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
-        self.assertEqual(released, [builder.id])
+        self.assertEqual(released, [economist.id])
         self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
 
     def test_upgrade_chain_waits_for_station_after_first_level_three_rocket(self):

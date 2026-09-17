@@ -693,7 +693,8 @@ class OpeningTests(unittest.TestCase):
         self.assertFalse(any(e['code'] == 'night_wave_cleared' for e in state.decision_events))
         self.assertFalse(any(c['action'] in ('collect', 'acceptTask') for c in commands.values()))
 
-    def test_night_local_streak_builds_adjacent_front_wall(self):
+    def test_night_local_streak_rocket_operator_holds_shared_stand(self):
+        """空窗时双火箭操作员去共用位，不离开炮位去砌零散墙。"""
         from src.agent.tactics import WAVE_LOCAL_STREAK
         state = opening_state()
         state.round_no = 80
@@ -711,11 +712,12 @@ class OpeningTests(unittest.TestCase):
         state.policy_memory['night_saw_threat'] = True
         state.policy_memory['night_empty_streak'] = WAVE_LOCAL_STREAK - 1
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        builds = [c for c in commands.values() if c.get('action') == 'build' and c.get('name') == 'wall']
-        self.assertTrue(builds)
-        target = builds[0]['targetPos'][0]
-        self.assertEqual(target['x'], 13)
-        self.assertEqual(max(abs(target['x'] - 12), abs(target['y'] - 10)), 1)
+        self.assertFalse(any(c.get('action') == 'build' for c in commands.values()), commands)
+        assignment = state.policy_memory.get('weapon_assignment', {})
+        self.assertIn(str(state.team_our.roles[1].id), assignment)
+        firing = any(c.get('controllerId') == '1' for c in commands.values())
+        walking = commands.get(1, {}).get('action') == 'move'
+        self.assertTrue(firing or walking or 1 not in commands)
 
 
 class OpeningUpgradeEstimateTests(unittest.TestCase):
@@ -1303,6 +1305,37 @@ class SurvivalWallAndIdleTests(unittest.TestCase):
             worker, state, [(13, 10), (13, 9)], blocked, set(), set(), assign_weapons(state),
         )
         self.assertNotEqual(state.policy_memory.get('opening_wall_targets', {}).get('1'), [99, 99])
+
+    def test_wall_grows_from_existing_not_the_far_end(self):
+        """已有墙时下一格必须接上去，不能跳到对面另一头。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        state.team_our.roles.append(make_role(40, 13, 10, 'wall', level=1, health=1000))
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(10, 10)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        point, path = next_wall_gap(worker, state, gaps, blocked)
+        self.assertIsNotNone(point)
+        self.assertEqual(max(abs(point[0] - 13), abs(point[1] - 10)), 1, (point, gaps[:8]))
+
+    def test_wall_sticky_is_not_abandoned_for_a_nearer_gap(self):
+        """已经认准一格时，不因为旁边更近就换目标。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 8)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        sticky = (13, 12)
+        self.assertIn(sticky, {tuple(p) for p in gaps})
+        point, path = next_wall_gap(worker, state, gaps, blocked, sticky=sticky)
+        self.assertEqual(point, sticky)
+        self.assertIsNotNone(path)
 
     def test_full_metal_backpack_in_survival_goes_to_vendor(self):
         state = opening_state()
