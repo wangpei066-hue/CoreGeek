@@ -1202,6 +1202,15 @@ class PioneerTaskSolver:
             apiLimit=100 if ctx.get('taskKind') == 'api' else None,
             promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
             metrics=metrics, resendPending=False, **ctx)
+        # Keep the normal path deterministic and reserve the LLM for ambiguity
+        # or recovery.  This is deliberately stateful so traces can distinguish
+        # an automatic API/deployment pass from an LLM-generated command.
+        if ctx.get('taskKind') == 'api':
+            s['executionPolicy'] = 'deterministic_with_llm_fallback'
+        elif ctx.get('taskKind') == 'workspace':
+            s['executionPolicy'] = 'deterministic_repair_with_llm_fallback'
+        else:
+            s['executionPolicy'] = 'llm_guided'
         hit = None
         if hit and api_fetch_query(hit, state.phase_task, 'preview'):
             s['apiReplay'] = hit
@@ -1534,6 +1543,7 @@ class PioneerTaskSolver:
                 self._fact(s, '未查全，继续分页 offset=%s' % stats['nextOffset'])
                 return 'continue'
             if stats.get('error'):
+                s['llmFallbackReason'] = 'api_response_error'
                 self._record_failure(s, 'api_fetch', stats.get('path'), s.get('workspace'),
                                      classify_tool_error(stats))
             return 'ask'
@@ -1543,6 +1553,7 @@ class PioneerTaskSolver:
             s['_apiStats'] = result
             return 'done'
         if result.get('error') in ('auth_failed', 'records_not_list') or str(result.get('error') or '').startswith('business_code_'):
+            s['llmFallbackReason'] = 'api_contract_or_auth_error'
             self._record_failure(s, 'api_fetch', result.get('path'), s.get('workspace'),
                                  classify_tool_error(result))
             return 'ask'
@@ -1554,6 +1565,7 @@ class PioneerTaskSolver:
             self._fact(s, '未查全，继续分页 offset=%s' % got)
             return 'continue'
         if result.get('error'):
+            s['llmFallbackReason'] = 'api_incomplete_or_invalid_response'
             self._record_failure(s, 'api_fetch', result.get('path'), s.get('workspace'),
                                  classify_tool_error(result))
         return 'ask'
@@ -1741,6 +1753,7 @@ class PioneerTaskSolver:
                 s.setdefault('metrics', {})['checkPassed'] = True
                 return execute
             s['deployPhase'] = 'fix'
+            s['llmFallbackReason'] = 'deployment_probe_requires_llm'
             s['stage'] = 'ask'
             return execute
         if result.get('convertedCrlf'):
@@ -1749,6 +1762,8 @@ class PioneerTaskSolver:
             s.setdefault('metrics', {})['answerReadyRound'] = state.round_no
             s.setdefault('metrics', {})['checkPassed'] = True
             return execute
+        if s.get('taskKind') == 'workspace':
+            s['llmFallbackReason'] = 'deployment_check_failed'
         s['stage'] = 'ask'
         return execute
 
