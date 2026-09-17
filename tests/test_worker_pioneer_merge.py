@@ -321,6 +321,38 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             rockets = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'rocket'}
             self.assertNotIn(dest, rockets)
 
+    def test_builder_still_builds_after_staged_plan_is_done(self):
+        """阶段墙齐了但 16 段还缺：施工工必须继续砌，不能 should_build=False 原地空转。"""
+        from src.agent.opening import (
+            courtyard_cells, primary_wall_plan, staged_wall_plan, worker_should_build_walls,
+        )
+        state = self._day2_guns(opening_state())
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        primary = primary_wall_plan(state, base)
+        staged = set(staged_wall_plan(state, base))
+        extra = [p for p in primary if p not in staged]
+        if not extra:
+            extra = [primary[-1]]
+            staged = set(primary[:-1])
+        for i, p in enumerate(staged):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        gap = extra[0]
+        yard = courtyard_cells(state, base)
+        stand = next((Pos(x, y) for x, y in (
+            (gap[0] + dx, gap[1] + dy)
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if dx or dy
+        ) if (x, y) in yard), Pos(12, 10))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = stand
+        builder.backpack = ['stone'] * 4
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        self.assertTrue(worker_should_build_walls(state, builder), (stand, gap, extra))
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
     def test_night_pioneer_never_takes_new_task_and_one_worker_goes_out(self):
         """未清波的夜里开拓者不接新任务、留在守炮名单；是否放工人与任务点可不可接无关。"""
         for round_no in (80, 210, 340):

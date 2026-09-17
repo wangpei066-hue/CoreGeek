@@ -1102,9 +1102,26 @@ def worker_wall_muster_rounds(state, role, missing):
     return mine_travel + collect + gap_travel + share * WALL_STEP_SLACK + gun_travel + MUSTER_BUFFER + wall_overrun_margin(state)
 
 
+def defense_wall_missing(state):
+    """当前该补的墙：阶段目标没齐用阶段缺口，齐了继续补完整 16 段。
+
+    施工工按 primary 锁定修墙，若这里只用 staged，阶段一齐就会 should_build=False，
+    人被锁在防线上又不许砌、不许采矿，整段白天空转。
+    """
+    missing = staged_wall_missing(state)
+    if missing:
+        return missing
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return []
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    return [p for p in primary_wall_plan(state, base) if p not in existing]
+
+
 def worker_one_wall_rounds(state, role):
     """建完离自己最近的一段墙并回炮的估计，用来判断侧翼能不能开工。"""
-    missing = staged_wall_missing(state)
+    missing = defense_wall_missing(state)
     if not missing:
         return 0
     if role is None:
@@ -1133,7 +1150,7 @@ def full_wall_build_window(state, role=None):
     remaining = defense_rounds_remaining(state, role)
     if remaining <= 0:
         return False
-    missing = staged_wall_missing(state)
+    missing = defense_wall_missing(state)
     if not missing:
         return False
     if role is not None and "stone" in (role.backpack or []):
@@ -1157,8 +1174,12 @@ def worker_should_build_walls(state, role=None):
         return bool(night_near_work_allowed(state) and critical_wall_missing(state))
     if critical_wall_missing(state):
         return True
-    if not staged_wall_missing(state):
+    missing = defense_wall_missing(state)
+    if not missing:
         return False
+    if role is not None and "stone" in (role.backpack or []):
+        if any(chebyshev(role.pos, Pos(*point)) == 1 for point in missing):
+            return True
     return full_wall_build_window(state, role)
 
 
@@ -1738,8 +1759,24 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
     if "stone" in role.backpack:
         clear_mine_target(state, role.id)
         ranked = _buildable_wall_paths(role, state, blocked, reserved)
+        if not ranked:
+            existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+            for point in primary_wall_plan(state, base):
+                if point in existing or point in blocked | reserved:
+                    continue
+                if (point[0], point[1], 'wall') in state.failed_build_spots:
+                    continue
+                path = wall_approach_path(role, Pos(*point), blocked | reserved, state)
+                if path is None:
+                    continue
+                ranked.append((len(path), point, path))
+            ranked.sort()
         if ranked:
-            path = ranked[0][2]
+            _cost, point, path = ranked[0]
+            if not path and chebyshev(role.pos, Pos(*point)) == 1:
+                reserved.add(point)
+                return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': point[0], 'y': point[1]}]},
+                                '贴着可砌缺口，就地建造避免空转')
             cmd = move_on_path(state, role, path, reserved, '走向最近可砌墙缺口，避免站着空转')
             if cmd:
                 return cmd

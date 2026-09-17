@@ -147,7 +147,7 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
     if kind == "wall":
         from .opening import (
             staged_wall_plan, primary_wall_plan, safe_wall, assign_weapons,
-            full_wall_build_window, wall_priority,
+            full_wall_build_window, wall_priority, defense_wall_missing,
         )
         base = own_station(state)
         if base is None:
@@ -156,8 +156,15 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
         existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == "wall" and r.health > 0}
         if not set(plan) - existing:
             plan = primary_wall_plan(state, base)
+        adjacent = []
+        if worker is not None and "stone" in (worker.backpack or []):
+            adjacent = [p for p in defense_wall_missing(state)
+                        if chebyshev(worker.pos, Pos(*p)) == 1]
         if not full_wall_build_window(state, worker):
             plan = [p for p in plan if wall_priority(state, base, p) == 0]
+        for p in adjacent:
+            if p not in plan:
+                plan.append(p)
         origin = worker.pos if worker is not None else base_pos
         from .opening import wall_approach_path
         ranked = []
@@ -165,7 +172,8 @@ def pick_build_target(state: "MatchState", base_pos: Pos, blocked: set, kind: st
             if p in blocked or (p[0], p[1], kind) in state.failed_build_spots:
                 continue
             if not safe_wall(state, p, blocked, assign_weapons(state)):
-                continue
+                if worker is None or chebyshev(worker.pos, Pos(*p)) != 1:
+                    continue
             path = None
             if worker is not None:
                 path = wall_approach_path(worker, Pos(*p), blocked, state)
@@ -1295,23 +1303,27 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                     from .opening import worker_should_build_walls
                     if not worker_should_build_walls(state, worker):
                         del state.worker_build_targets[worker.id]
-                        return None
-                del state.worker_build_targets[worker.id]
-                if kind == "weapon":
+                        pending = None
+                    else:
+                        del state.worker_build_targets[worker.id]
+                        if "stone" not in worker.backpack:
+                            return None
+                        from .opening import safe_wall, assign_weapons
+                        if not safe_wall(state, (x, y), blocked | reserved, assign_weapons(state)):
+                            trace(state, worker.id, 'wall_route_blocked', '施工会截断通路，改选其它缺口')
+                            pending = None
+                        else:
+                            name = "wall"
+                            reserved.add((x, y))
+                            return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+                else:
+                    del state.worker_build_targets[worker.id]
                     if state.team_our.gold_num < WEAPON_GOLD_COST:
                         return None
                     name = pick_weapon_name(state)
-                else:
-                    if "stone" not in worker.backpack:
-                        return None
-                    from .opening import safe_wall, assign_weapons
-                    if not safe_wall(state, (x, y), blocked | reserved, assign_weapons(state)):
-                        trace(state, worker.id, 'wall_route_blocked', '施工会截断通路，重新规划')
-                        return None
-                    name = "wall"
-                reserved.add((x, y))
-                return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
-            if kind == "wall":
+                    reserved.add((x, y))
+                    return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
+            elif kind == "wall":
                 from .opening import wall_approach_path, move_on_path
                 path = wall_approach_path(worker, target, blocked | reserved, state)
                 if path is None:
@@ -1356,17 +1368,26 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
     state.worker_build_targets[worker.id] = (target.x, target.y, kind)
     reserved.add((target.x, target.y))
     if kind == "wall":
-        from .opening import wall_approach_path, move_on_path
-        if chebyshev(worker.pos, target) == 1:
+        from .opening import wall_approach_path, move_on_path, step_off_construction
+        dist = chebyshev(worker.pos, target)
+        if dist == 0:
+            cmd = step_off_construction(worker, state, blocked, reserved)
+            if cmd:
+                return cmd
+            del state.worker_build_targets[worker.id]
+            return None
+        if dist == 1:
             del state.worker_build_targets[worker.id]
             if "stone" not in worker.backpack:
                 return None
-            from .opening import safe_wall, assign_weapons
-            if not safe_wall(state, (target.x, target.y), blocked | reserved, assign_weapons(state)):
-                return None
+            reserved.add((target.x, target.y))
             return selected(state, worker.id, {"action": "build", "name": "wall", "targetPos": [{"x": target.x, "y": target.y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
         path = wall_approach_path(worker, target, blocked | reserved, state)
-        return move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
+        cmd = move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
+        if cmd:
+            return cmd
+        del state.worker_build_targets[worker.id]
+        return None
     step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
     if step:
         reserved.add((step.x, step.y))
@@ -1554,6 +1575,7 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             return cmd
         if handled:
             from .opening import builder_move_to_dual_rockets, builder_unjam_walls
+            from .economy import go_mine
             cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=True)
             if cmd:
                 return cmd
@@ -1562,13 +1584,24 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                     worker, state, blocked, reserved, '入夜前不够再建一段，施工工去双火箭位待命')
                 if cmd:
                     return cmd
+            if 'stone' not in (worker.backpack or []):
+                cmd = go_mine(
+                    worker, state, blocked, reserved, want_ores=('stone',), purpose='stone',
+                    travel_reason='防线尚未完成，专程采石',
+                    collect_reason='采集下一段城墙所需石料',
+                )
+                if cmd:
+                    return cmd
+                cmd = profitable_mine(worker, state, blocked, reserved)
+                if cmd:
+                    return cmd
             heal = decide_self_heal(worker) or decide_buy_medicine(worker, state)
             if heal:
                 return heal
             trace(state, worker.id, 'builder_waiting_on_walls',
-                  '施工工本回合没有可走的墙动作，留在防线任务上不转去采铜铁',
+                  '施工工本回合墙动作发不出，改走后续采矿/经济，避免原地空转',
                   allow_build=allow_build, stones=worker.backpack.count('stone'))
-            return None
+            # 不要 return None：后面 profitable_mine 还能干活。
     continue_job = False
     if job:
         if job.get('kind') == 'station' and job.get('item') in worker.backpack:
