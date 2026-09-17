@@ -45,6 +45,11 @@ class TaskSolverHelperTests(unittest.TestCase):
         stats = summarize_heritage_records(records, total=3, complete=True)
         self.assertEqual(stats['oldestEraName'], '鸡鸣寺')
 
+    def test_extract_city_from_prose_task_brief(self):
+        from src.agent.task_solver import extract_city
+        self.assertEqual(extract_city('从 API 查询南京市的全部文化遗产记录'), '南京')
+        self.assertEqual(extract_city('location=北京'), '北京')
+
     def test_clean_url_removes_markdown_and_chinese_trailing_punctuation(self):
         self.assertEqual(clean_url('http://localhost:8899`）'), 'http://localhost:8899')
         self.assertEqual(clean_url('http://localhost:8899/api/v1/search。'),
