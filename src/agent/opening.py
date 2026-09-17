@@ -1479,6 +1479,36 @@ def dual_rocket_path(role, weapon, blocked, state):
     return path_to_any(role.pos, stands, blocked, state.map_info.width, state.map_info.height)
 
 
+def other_rocket(state, weapon):
+    if not weapon or weapon.role_type != 'rocket':
+        return None
+    others = [r for r in state.team_our.roles
+              if r.role_type == 'rocket' and r.health > 0 and r.id != weapon.id]
+    if not others:
+        return None
+    return min(others, key=lambda r: (chebyshev(weapon.pos, r.pos), r.id))
+
+
+def control_stand_path(role, weapon, blocked, reserved, state):
+    """走到两门火箭共用操控位，以便冷却时切炮；没有共用格就走到另一门旁边。"""
+    partner, stands = dual_rocket_partner(state, weapon, blocked)
+    if partner is None:
+        partner = other_rocket(state, weapon)
+    here = (role.pos.x, role.pos.y)
+    walkable = mobile_walkable(state, blocked, reserved)
+    if stands:
+        if here in stands:
+            return []
+        path = path_to_any(role.pos, stands, walkable, state.map_info.width, state.map_info.height)
+        if path is not None:
+            return path
+    if partner is None:
+        return None
+    if chebyshev(role.pos, partner.pos) <= 1 and role.pos != partner.pos:
+        return []
+    return adjacent_path(role, partner.pos, walkable, state)
+
+
 def guns_covered_without(state, excluded_ids, blocked, max_travel=None):
     """两人三炮规则：排除指定角色后，剩下的人（一人站双火箭共同邻格轮流开火）能否及时覆盖全部武器。"""
     weapons = {r.id for r in state.team_our.roles
@@ -1544,14 +1574,14 @@ def weapon_approach_path(role, weapon, blocked, reserved, state):
         if retreat:
             return retreat
     if at_gun and weapon and weapon.role_type == 'rocket':
-        dual = dual_rocket_path(role, weapon, obstacles, state)
-        if dual is not None:
+        dual = control_stand_path(role, weapon, obstacles, reserved, state)
+        if dual:
             return dual
         return []
     if at_gun:
         return []
     if weapon and weapon.role_type == 'rocket':
-        dual = dual_rocket_path(role, weapon, obstacles, state)
+        dual = control_stand_path(role, weapon, obstacles, reserved, state)
         if dual is not None:
             return dual
     strict = adjacent_path(role, weapon.pos, obstacles, state)
@@ -1800,6 +1830,34 @@ def _buildable_wall_paths(role, state, blocked, reserved):
     return ranked
 
 
+def step_toward_wall_gap(role, point, blocked, reserved, state):
+    """BFS 接近失败时，朝缺口走一步，避免有石空转。"""
+    if not state.map_info:
+        return None
+    target = Pos(*point)
+    if chebyshev(role.pos, target) <= 1:
+        return None
+    base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
+    yard = courtyard_cells(state, base) if base else set()
+    here_attack = bool(base and attack_side_of_front(state, base, role.pos))
+    best = None
+    for step in neighbors8(role.pos, state.map_info.width, state.map_info.height):
+        key = (step.x, step.y)
+        if key in blocked | reserved:
+            continue
+        if base and not here_attack and attack_side_of_front(state, base, step):
+            continue
+        closer = chebyshev(step, target)
+        if closer >= chebyshev(role.pos, target):
+            continue
+        rank = (closer, 0 if key in yard else 1, 1 if base and attack_side_of_front(state, base, step) else 0, key)
+        if best is None or rank < best[0]:
+            best = (rank, step)
+    if best is None:
+        return None
+    return [best[1]]
+
+
 def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
     """施工工缺墙却没发出建造时：丢铜铁、贴院迈进、走向可砌缺口或去采石。"""
     from .brain import own_station
@@ -1841,6 +1899,25 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
             path = interior_retreat_path(role, blocked | reserved, state)
             if path:
                 return move_on_path(state, role, path, reserved, '墙外空转，先回院子再施工')
+        existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+        greedy_best = None
+        for point in due_wall_gaps(state, role):
+            if point in existing or point in blocked | reserved:
+                continue
+            if chebyshev(role.pos, Pos(*point)) == 1:
+                reserved.add(point)
+                return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': point[0], 'y': point[1]}]},
+                                '贴着缺口且寻路失败，就地建造避免空转')
+            greedy = step_toward_wall_gap(role, point, blocked, reserved, state)
+            if not greedy:
+                continue
+            rank = (chebyshev(role.pos, Pos(*point)), point)
+            if greedy_best is None or rank < greedy_best[0]:
+                greedy_best = (rank, greedy)
+        if greedy_best:
+            cmd = move_on_path(state, role, greedy_best[1], reserved, 'BFS接近失败，朝缺口迈一步避免空转')
+            if cmd:
+                return cmd
         return None
     if not in_courtyard(state, base, role.pos):
         # 没石头时先去采石，不要空手走回家再出门。

@@ -1295,8 +1295,18 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                             return None
                         from .opening import safe_wall, assign_weapons
                         if not safe_wall(state, (x, y), blocked | reserved, assign_weapons(state)):
-                            trace(state, worker.id, 'wall_route_blocked', '施工会截断通路，改选其它缺口')
-                            pending = None
+                            other = pick_build_target(
+                                state, base.pos, (blocked | reserved | {(x, y)}) - {(worker.pos.x, worker.pos.y)},
+                                "wall", worker=worker)
+                            if other is not None:
+                                trace(state, worker.id, 'wall_route_blocked', '施工会截断通路，改选其它缺口')
+                                pending = None
+                            else:
+                                reserved.add((x, y))
+                                return selected(
+                                    state, worker.id,
+                                    {"action": "build", "name": "wall", "targetPos": [{"x": x, "y": y}]},
+                                    '贴着缺口且没有别的可砌格，先封上避免空转')
                         else:
                             name = "wall"
                             reserved.add((x, y))
@@ -1309,9 +1319,14 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                     reserved.add((x, y))
                     return selected(state, worker.id, {"action": "build", "name": name, "targetPos": [{"x": x, "y": y}]}, '执行建造计划：补足武器优先，其次用石头建墙')
             elif kind == "wall":
-                from .opening import wall_approach_path, move_on_path
+                from .opening import wall_approach_path, move_on_path, step_toward_wall_gap
                 path = wall_approach_path(worker, target, blocked | reserved, state)
                 if path is None:
+                    greedy = step_toward_wall_gap(worker, (x, y), blocked, reserved, state)
+                    if greedy:
+                        cmd = move_on_path(state, worker, greedy, reserved, 'BFS接近失败，朝缺口迈一步避免空转')
+                        if cmd:
+                            return cmd
                     del state.worker_build_targets[worker.id]
                     pending = None
                 else:
@@ -1371,6 +1386,12 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
         cmd = move_on_path(state, worker, path, reserved, '从院内接近城墙缺口')
         if cmd:
             return cmd
+        from .opening import step_toward_wall_gap
+        greedy = step_toward_wall_gap(worker, (target.x, target.y), blocked, reserved, state)
+        if greedy:
+            cmd = move_on_path(state, worker, greedy, reserved, 'BFS接近失败，朝缺口迈一步避免空转')
+            if cmd:
+                return cmd
         del state.worker_build_targets[worker.id]
         return None
     step = traced_move(state, worker.id, worker.pos, target, blocked | reserved, state.map_info.width, state.map_info.height)
@@ -2218,13 +2239,15 @@ def plan_night(state: "MatchState") -> dict:
                 commands[fighter.id] = cmd
                 continue
         weapon = assignments.get(fighter.id)
-        if weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1:
+        at_gun = weapon is not None and chebyshev(fighter.pos, weapon.pos) <= 1
+        if weapon is not None:
             ready = weapon.role_type != "rocket" or (weapon.cooldown or 0) == 0
-            plan = plan_attack(weapon, robots, state, ledger, target_ctx) if ready else None
-            upgrade = night_voucher_use(fighter, state, plan)
-            if upgrade:
-                commands[fighter.id] = upgrade
-                continue
+            plan = plan_attack(weapon, robots, state, ledger, target_ctx) if (at_gun and ready) else None
+            if at_gun:
+                upgrade = night_voucher_use(fighter, state, plan)
+                if upgrade:
+                    commands[fighter.id] = upgrade
+                    continue
             if plan is None and weapon.role_type == "rocket":
                 alternate, alt_plan = adjacent_ready_rocket(fighter, weapon, state, robots, commands,
                                                             ledger, target_ctx)
@@ -2239,37 +2262,51 @@ def plan_night(state: "MatchState") -> dict:
                         "action": "attack", "controllerId": str(fighter.id), "targetPos": alt_plan[0],
                     }
                     continue
-            if plan:
+                from .opening import control_stand_path
+                stand_path = control_stand_path(fighter, weapon, blocked, reserved, state)
+                need_stand = (weapon.cooldown or 0) > 0
+                if need_stand and stand_path:
+                    cmd = move_on_path(state, fighter, stand_path, reserved,
+                                       '分配火箭暂时打不了，先站到双火箭共用操控位轮流开火')
+                    if cmd:
+                        commands[fighter.id] = cmd
+                        continue
+                if need_stand and stand_path == [] and not at_gun:
+                    trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+                    trace(state, fighter.id, "weapon_cooldown", "火箭冷却，留在另一门火箭旁轮流开火", weapon_id=weapon.id)
+                    continue
+            if at_gun:
+                if plan:
+                    trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
+                    trace(state, fighter.id, "selected", TARGETING_REASON,
+                          weapon_id=weapon.id, target_pos=plan[0], expected_damage=plan[1])
+                    ledger.add(plan[1])
+                    commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
+                                           "targetPos": plan[0]}
+                    continue
+                heal_cmd = try_station_upgrade_during_cooldown(fighter, state, blocked, reserved, weapon)
+                if heal_cmd:
+                    commands[fighter.id] = heal_cmd
+                    continue
                 trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-                trace(state, fighter.id, "selected", TARGETING_REASON,
-                      weapon_id=weapon.id, target_pos=plan[0], expected_damage=plan[1])
-                ledger.add(plan[1])
-                commands[weapon.id] = {"action": "attack", "controllerId": str(fighter.id),
-                                       "targetPos": plan[0]}
+                if fighter.role_type == 'worker' and night_near_work_allowed(state) and not robots:
+                    from .opening import adjacent_critical_build
+                    near = adjacent_critical_build(fighter, state, blocked, reserved)
+                    if near:
+                        commands[fighter.id] = near
+                        continue
+                    cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
+                    if cmd:
+                        if cmd['action'] == 'buy':
+                            from .treasure import shop_buy_allowed
+                            if not shop_buy_allowed(cmd['name'], state, emergency=urgent):
+                                continue
+                            state.team_our.gold_num -= item_cost(cmd['name'], state) * cmd.get('num', 1)
+                        commands[fighter.id] = cmd
+                        continue
+                trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
+                      "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
                 continue
-            heal_cmd = try_station_upgrade_during_cooldown(fighter, state, blocked, reserved, weapon)
-            if heal_cmd:
-                commands[fighter.id] = heal_cmd
-                continue
-            trace(state, fighter.id, "weapon_assignment", "两人三炮分配；里侧开里炮、外侧开外炮", weapon_id=weapon.id)
-            if fighter.role_type == 'worker' and night_near_work_allowed(state) and not robots:
-                from .opening import adjacent_critical_build
-                near = adjacent_critical_build(fighter, state, blocked, reserved)
-                if near:
-                    commands[fighter.id] = near
-                    continue
-                cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
-                if cmd:
-                    if cmd['action'] == 'buy':
-                        from .treasure import shop_buy_allowed
-                        if not shop_buy_allowed(cmd['name'], state, emergency=urgent):
-                            continue
-                        state.team_our.gold_num -= item_cost(cmd['name'], state) * cmd.get('num', 1)
-                    commands[fighter.id] = cmd
-                    continue
-            trace(state, fighter.id, "weapon_cooldown" if not ready else "no_target_in_range",
-                  "火箭冷却，原地守炮" if not ready else "射程内无目标，原地守炮", weapon_id=weapon.id)
-            continue
         if weapon is None:
             trace(state, fighter.id, "no_free_weapon", "没有可分配的独立武器")
             from .economy import muster_for_night
