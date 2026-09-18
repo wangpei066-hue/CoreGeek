@@ -816,7 +816,7 @@ class PioneerTaskSolver:
             endReason=reason or s.get('endReason'), deadlineRound=metrics.get('deadlineRound'),
             deadlineEstimated=metrics.get('deadlineEstimated'), stage=s.get('stage'),
             codeVersion=PROMPT_VERSION, taskInstance=s.get('instanceId'),
-            memoryMatched=bool(s.get('apiReplay') or metrics.get('memoryMatched') or s.get('experienceHit')),
+            memoryMatched=bool(metrics.get('memoryMatched') or s.get('experienceHit')),
             memoryInjected=bool(metrics.get('memoryInjected') or s.get('experienceHit')),
             recordsCollected=metrics.get('recordsCollected'), expectedTotal=metrics.get('expectedTotal'),
             checkPassed=bool(metrics.get('checkPassed')), answerReady=bool(s.get('answer')),
@@ -1122,7 +1122,6 @@ class PioneerTaskSolver:
                         s['stage'] = 'ask'
                         return
                     if s.get('taskKind') == 'api':
-                        s['apiReplayConfirmed'] = True
                         s['apiConfirmationRequired'] = False
                     if self._is_duplicate_failure(s, 'execute', command, s.get('workspace'), 'nonzero_exit'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
@@ -1399,7 +1398,7 @@ class PioneerTaskSolver:
             title='【自进化】回合 %s %s' % (s.get('instanceId') or '', s.get('stage')),
             codeVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
             taskInstance=s.get('instanceId'), stage=s.get('stage'),
-            memoryMatched=bool(s.get('apiReplay') or s.get('experienceHit')),
+            memoryMatched=bool(s.get('experienceHit')),
             memoryInjected=bool(s.get('experienceHit') or metrics.get('memoryInjected')),
             requestSent=bool(execute or prompt or submission),
             responseConsumed=bool(s.get('consumedFeedback')),
