@@ -6,9 +6,10 @@
 第三天起有大型/BOSS 时分工（离线夜战模拟得出，见 docs/strategy.md 9.3）：
 - 锚定火箭（存活火箭里 id 最小的一门）只在能打到大型/BOSS 的落点里选；大型按威胁高估价值，
   溅射到的中小型照常计分，所以会选“大型 + 周围一圈中小”的落点；
-- 另一门火箭在大型/BOSS 还在路上时按原收益清数量；一旦有大型/BOSS 贴建筑开打
-  （距墙/炮/基地 ≤3），两门火箭都锁这些攻城目标——破墙比漏打中小堆更糟，
-  且贴墙时周围通常有小怪，溅射不至于全空；
+- 另一门火箭按原收益清数量；只有全队手里已没有修墙包、又有大型/BOSS 贴建筑开打
+  （距墙/炮/基地 ≤3）时，两门火箭才都锁这些攻城目标。离线夜战模拟：有修墙包兜底时
+  两门都锁守得住但漏掉大量中小怪（第六/七夜少 8/18 分）；没有修墙包时两门都锁更能保住
+  电磁炮和基地；
 - 电磁炮只在弹道能打到大型/BOSS 的落点里选收益最高的。
 射程够不着锁定目标时都退回原收益。BOSS 远距离威胁系数不低于 BOSS_MIN_URGENCY。
 """
@@ -77,6 +78,10 @@ class TargetContext:
         self.value = {}
         self.big_value = {}
         self.siege_ids = set()
+        # 有修墙包就由墙边待命的人保墙，火箭照常分工；用光后贴墙大型才让两门火箭都锁。
+        self.fixers_on_hand = any('WallFixer' in (r.backpack or [])
+                                  for r in (state.team_our.roles if state and state.team_our else [])
+                                  if r.role_type in ('worker', 'pioneer') and r.health > 0)
         for r in self.robots:
             hp_max, score, atk = ROBOT_STATS.get(r.role_type, (max(r.health, 1), 0, 0))
             dist = _distance_to_buildings(r.pos, buildings)
@@ -104,7 +109,10 @@ class TargetContext:
         return [r for r in self.robots if r.id in self.big_value and ledger.remaining(r) > 0]
 
     def siege_big_alive(self, ledger: DamageLedger):
-        """正在打建筑的大型/BOSS。贴墙后破口比漏清中小堆更糟，两门火箭都改打它们。"""
+        """正在打建筑的大型/BOSS；全队还有修墙包时返回空（墙由修墙包保，火箭照常分工）。
+        修墙包用光后破口比漏清中小堆更糟，两门火箭都改打它们。"""
+        if self.fixers_on_hand:
+            return []
         return [r for r in self.big_alive(ledger) if r.id in self.siege_ids]
 
     def gain(self, damage: dict, ledger: DamageLedger, big_focus: bool = False) -> float:

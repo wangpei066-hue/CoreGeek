@@ -494,16 +494,63 @@ class TacticalTests(unittest.TestCase):
         role.pos = Pos(5, 4)
         self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set()))
 
-    def test_offense_purchase_preserves_defense_budget(self):
-        state, role = defended_state()
-        state.round_no = 400
+    def _summon_ready(self, round_no, enemy_level=1, gold=400):
+        """我方满足召唤前提（三炮≥2级、墙≥6、修墙包已囤够）；开拓者站在商店旁；敌方基地可见。"""
+        state, worker = defended_state(gold)
+        state.round_no = round_no
         for building in state.team_our.roles:
             if building.role_type in ('gatling', 'railgun', 'rocket'):
                 building.level = 2
-        role.pos = Pos(5, 4)
-        cmd = tactical_action(role, state, build_blocked_set(state), set())
-        self.assertEqual(cmd['name'], 'LargeRobotSummonOrder')
-        self.assertGreaterEqual(state.team_our.gold_num-item_cost(cmd['name'], state), 100)
+        worker.backpack = ['WallFixer'] * 8
+        pioneer = make_role(3, 5, 4, 'pioneer', health=200, back_pack_capability=40)
+        state.team_our.roles.append(pioneer)
+        state.team_enemy.roles = [make_role(900, 30, 20, 'station', level=enemy_level, health=1500)]
+        return state, pioneer
+
+    def test_offense_purchase_preserves_defense_budget(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10)  # 第七天，敌方基地1级
+        cmd = tactical_action(pioneer, state, build_blocked_set(state), set())
+        self.assertEqual(cmd, {'action': 'buy', 'name': 'BossRobotSummonOrder', 'num': 1})
+        self.assertGreaterEqual(state.team_our.gold_num - item_cost(cmd['name'], state), 100)
+
+    def test_no_summon_on_day_four_or_against_level3_base(self):
+        state, pioneer = self._summon_ready(3 * 130 + 10)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=3)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+
+    def test_level2_base_needs_two_bosses_or_nothing(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=2, gold=400)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))  # 只够1张：不买半套
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=2, gold=600)
+        self.assertEqual(tactical_action(pioneer, state, build_blocked_set(state), set()),
+                         {'action': 'buy', 'name': 'BossRobotSummonOrder', 'num': 2})
+
+    def test_cheap_large_only_against_weak_level1_front_late(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10, gold=250)  # 可用150，买不起BOSS；敌方没有墙=墙弱
+        self.assertEqual(tactical_action(pioneer, state, build_blocked_set(state), set()),
+                         {'action': 'buy', 'name': 'LargeRobotSummonOrder', 'num': 1})
+
+    def test_never_buys_small_or_middle_summons(self):
+        for gold in (130, 150, 180):
+            state, pioneer = self._summon_ready(6 * 130 + 10, gold=gold)
+            cmd = tactical_action(pioneer, state, build_blocked_set(state), set())
+            self.assertFalse(cmd and cmd.get('name', '').startswith(('Small', 'Middle')), cmd)
+
+    def test_no_summon_before_fixers_stocked(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10)
+        next(r for r in state.team_our.roles if r.role_type == 'worker').backpack = ['WallFixer'] * 3
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+
+    def test_enemy_base_night_loss_tracked(self):
+        state, pioneer = self._summon_ready(4 * 130 + 75, enemy_level=2)
+        enemy = state.team_enemy.roles[0]
+        for rnd, hp in ((4 * 130 + 75, 3000), (4 * 130 + 100, 2400), (4 * 130 + 120, 2000)):
+            state.round_no, enemy.health = rnd, hp
+            begin_round(state)
+        state.round_no = 5 * 130
+        begin_round(state)
+        self.assertEqual(state.policy_memory.get('enemy_last_night_loss'), 1000)
 
     def test_decide_does_not_buy_luxury_items_before_day_four(self):
         state, role = defended_state(gold=400)

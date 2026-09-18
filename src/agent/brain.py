@@ -44,9 +44,9 @@ WALL_FIXER_GOLD_COST = 10
 WALL_REPAIR_RATIO = 0.8  # 「墙是否够健康」的判断阈值，不再用来派修墙包。
 WALL_CRITICAL_RATIO = 0.15  # 没有近敌时，血量低于满血 15% 才视为即将摧毁。
 WALL_CRITICAL_ABS = 80  # 约两次 BOSS 击或四次大型击；没有官方「下一击摧毁」表。
-# 第五天起经济工夜里不外出，贴正面墙待命修墙（离线夜战模拟：墙一破电磁炮/基地就被拆，
-# 修墙包 10 金回满血，入夜 15 回合内就位、带 6~8 个即可守住第 5~7 夜）。
-WALL_WATCH_DAY = 5
+# 第四天起经济工白天囤修墙包、夜里不外出，贴正面墙待命修墙（离线夜战模拟：墙一破电磁炮/基地就被拆，
+# 修墙包 10 金回满血，入夜 15 回合内就位、带 6~8 个即可守住第 5~7 夜；实测第四夜城墙压力已很大）。
+WALL_WATCH_DAY = 4
 WALL_WATCH_FIX_RATIO = 0.35  # 挨打的墙低于满血这个比例就用修墙包
 FIXER_STOCK_TARGET = 8
 FIXER_MIN_STOCK = 4          # 手里少于这个数时，买修墙包不给武器券预留金币
@@ -769,7 +769,7 @@ def economist_stocking_fixer(state: "MatchState", role: Role) -> bool:
         return False
     from .news_memory import game_day
     from .opening_schedule import opening_worker_mode
-    return opening_worker_mode(state, role) == 'economist' and game_day(state.round_no) >= 5
+    return opening_worker_mode(state, role) == 'economist' and game_day(state.round_no) >= WALL_WATCH_DAY
 
 
 def wall_upgrade_jobs_allowed(state: "MatchState", role: Role) -> bool:
@@ -941,8 +941,9 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
 
 
 def _night_stock_item(role: Role, state: "MatchState", minimum_only: bool) -> Optional[str]:
-    """经济工白天该囤的夜战道具：先修墙包（前 FIXER_MIN_STOCK 个不给武器券让钱），
-    补满 FIXER_STOCK_TARGET 后第六天起再囤炸弹；都给下一张武器券留钱。"""
+    """经济工白天该囤的夜战道具，按顺序：修墙包到 FIXER_MIN_STOCK（不给武器券让钱）→ 第六天起先保证
+    1 个炸弹（同样不让钱，第六夜压力太大）→ 修墙包补满 FIXER_STOCK_TARGET → 炸弹补到 BOMB_STOCK_TARGET；
+    后两步给下一张武器券留钱。"""
     if not economist_stocking_fixer(state, role):
         return None
     from .economy import next_weapon_voucher_cost
@@ -951,13 +952,16 @@ def _night_stock_item(role: Role, state: "MatchState", minimum_only: bool) -> Op
     fixers = (role.backpack or []).count('WallFixer')
     if fixers < FIXER_MIN_STOCK:
         return 'WallFixer' if gold >= WALL_FIXER_GOLD_COST else None
+    bomb_day = game_day(state.round_no) >= BOMB_STOCK_DAY
+    bombs = _team_item_count(state, 'Bomb')
+    if bomb_day and bombs < 1:
+        return 'Bomb' if gold >= BOMB_GOLD_COST else None
     if minimum_only:
         return None
     reserved_gold = next_weapon_voucher_cost(state) if weapon_upgrade_due(state) else 0
     if fixers < FIXER_STOCK_TARGET:
         return 'WallFixer' if gold >= reserved_gold + WALL_FIXER_GOLD_COST else None
-    if (game_day(state.round_no) >= BOMB_STOCK_DAY
-            and _team_item_count(state, 'Bomb') < BOMB_STOCK_TARGET
+    if (bomb_day and bombs < BOMB_STOCK_TARGET
             and gold >= reserved_gold + BOMB_GOLD_COST):
         return 'Bomb'
     return None
@@ -1133,8 +1137,11 @@ def _night_stock_quantity(role: Role, state: "MatchState", item: str) -> int:
     gold = state.team_our.gold_num or 0
     reserved_gold = next_weapon_voucher_cost(state) if weapon_upgrade_due(state) else 0
     if item == "Bomb":
-        want = BOMB_STOCK_TARGET - _team_item_count(state, "Bomb")
-        return min(want, max(0, gold - reserved_gold) // BOMB_GOLD_COST)
+        have = _team_item_count(state, "Bomb")
+        want = BOMB_STOCK_TARGET - have
+        first = 1 if have == 0 and gold >= BOMB_GOLD_COST else 0  # 第一个炸弹不为武器券留钱
+        extra = max(0, gold - first * BOMB_GOLD_COST - reserved_gold) // BOMB_GOLD_COST
+        return min(want, first + extra)
     own = (role.backpack or []).count("WallFixer")
     urgent = max(0, FIXER_MIN_STOCK - own)
     extra = max(0, FIXER_STOCK_TARGET - own - urgent)
@@ -1335,6 +1342,17 @@ def _night_repair_reachable(role: Role, state: "MatchState", blocked: set, reser
     return bool(shop and night_strict_path(role, shop.pos, walkable, state) is not None)
 
 
+def _shop_trip_fits(role: Role, state: "MatchState", slack: int = 5) -> bool:
+    """白天从当前位置去武器商店、买完再回基地，能否在入夜前完成（切比雪夫下界 + 余量）。"""
+    from .opening import day_rounds_remaining
+    shop = find_zone(state, "weaponShop")
+    base = own_station(state)
+    if shop is None or base is None:
+        return True
+    need = chebyshev(role.pos, shop.pos) + chebyshev(shop.pos, base.pos) + slack
+    return day_rounds_remaining(state.round_no) > need
+
+
 def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, reserved: set):
     """第三天起由专职修墙工保持前排墙半血以上；低于半血优先升级回血。"""
     if role.role_type != "worker" or not state.team_our:
@@ -1343,6 +1361,12 @@ def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, re
         return None
     night = not is_day_round(state.round_no)
     job = state.worker_item_jobs.get(role.id)
+    if (not night and job and job.get("kind") == "wall" and job.get("item") not in (role.backpack or [])
+            and not _shop_trip_fits(role, state)):
+        # 道具还没买：去商店再回家已赶不上入夜，不出发（原先傍晚会被派去商店，入夜时不在双火箭位）。
+        trace(state, role.id, 'wall_job_shop_too_late', '买修墙/升墙道具的往返赶不上入夜，留到明天',
+              item=job.get("item"))
+        return None
     if job and job.get("kind") == "wall":
         # 已有修墙任务就接着做；夜里那面墙从院子里够不着了就放弃。
         wall = next((r for r in state.team_our.roles
@@ -1390,6 +1414,9 @@ def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, re
               "前排墙低于半血但金币不足，无法立刻购买升级/修复道具",
               wall_id=wall.id, wall_health=wall.health, wall_level=level,
               item=item, gold=state.team_our.gold_num)
+        return None
+    if item not in role.backpack and not night and not _shop_trip_fits(role, state):
+        trace(state, role.id, 'wall_job_shop_too_late', '买修墙/升墙道具的往返赶不上入夜，留到明天', item=item)
         return None
     state.worker_item_jobs[role.id] = {
         "item": item, "target": (wall.pos.x, wall.pos.y), "kind": "wall",
@@ -1865,6 +1892,10 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             allow_weapon = False  # 施工工防线没修完不专程去买券；人在商店边顺手买、手里有券照常用
     from .opening_schedule import opening_worker_mode
     eco_mode = opening_worker_mode(state, worker) == 'economist'
+    # 第二天起施工工的空闲经济只在基地附近做（economy.builder_home_economy），不去远矿/专程卖小包。
+    late_builder = (opening_worker_mode(state, worker) == 'builder'
+                    and (state.round_no or 0) >= DAY_NIGHT_CYCLE
+                    and sum(1 for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0) >= 2)
     # 第三天起经济工清包买券；第一晚后经济工就不接普通补墙，只在正面关键缺口时帮一把。
     economist = eco_mode and structure_priority_day(state)
     guns_ready = sum(1 for r in state.team_our.roles if r.role_type in WEAPON_TYPES and r.health > 0) >= MAX_WEAPONS
@@ -1948,7 +1979,8 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                 )
                 if cmd:
                     return cmd
-                cmd = profitable_mine(worker, state, blocked, reserved)
+                cmd = (_builder_home_economy(worker, state, blocked, reserved) if late_builder
+                       else profitable_mine(worker, state, blocked, reserved))
                 if cmd:
                     return cmd
             heal = decide_self_heal(worker) or decide_buy_medicine(worker, state)
@@ -2038,9 +2070,10 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         handled, cmd = replenish_walls(worker, state, blocked, reserved, primary_only=True, allow_build=allow_build)
         if cmd:
             return cmd
-    handled, cmd = liquidate(worker, state, blocked, reserved)
-    if cmd:
-        return cmd
+    if not late_builder:
+        handled, cmd = liquidate(worker, state, blocked, reserved)
+        if cmd:
+            return cmd
     defer_upgrades = (weapon_upgrade_due(state)
                       or ((state.round_no or 0) >= 70 and staged_walls_incomplete(state)))
     if structure_priority_day(state):
@@ -2074,7 +2107,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
             if build_cmd:
                 return build_cmd
 
-    final_cmd = profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
+    if late_builder:
+        final_cmd = _builder_home_economy(worker, state, blocked, reserved)
+    else:
+        final_cmd = profitable_mine(worker, state, blocked, reserved)
+    final_cmd = final_cmd or decide_self_heal(worker) or decide_buy_medicine(worker, state)
     if not final_cmd:
         final_cmd = _worker_avoid_day_idle(worker, state, blocked, reserved)
     if not final_cmd:
@@ -2085,6 +2122,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
               gold=state.team_our.gold_num if state.team_our else None,
               backpack=list(worker.backpack or []), position={'x': worker.pos.x, 'y': worker.pos.y})
     return final_cmd
+
+
+def _builder_home_economy(worker: Role, state: "MatchState", blocked: set, reserved: set):
+    from .economy import builder_home_economy
+    return builder_home_economy(worker, state, blocked, reserved)
 
 
 def _worker_avoid_day_idle(worker: Role, state: "MatchState", blocked: set, reserved: set):
@@ -2112,6 +2154,18 @@ def _worker_avoid_day_idle(worker: Role, state: "MatchState", blocked: set, rese
             worker, state, blocked, reserved, '白天无其它合法动作，施工工回双火箭位')
         if cmd:
             return cmd
+    if (opening_worker_mode(state, worker) == 'builder' and (state.round_no or 0) >= DAY_NIGHT_CYCLE
+            and sum(1 for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0) >= 2):
+        cmd = _builder_home_economy(worker, state, blocked, reserved)
+        if cmd:
+            return cmd
+        cmd = builder_move_to_dual_rockets(
+            worker, state, blocked, reserved, '基地附近没矿可采也没墙可修，施工工回双火箭位待命，不跑远矿')
+        if cmd:
+            return cmd
+        # 已在双火箭位旁：原地待命，不再“迈进院子”，否则和回岗位两个兜底来回拉扯。
+        trace(state, worker.id, 'builder_home_idle', '基地附近没矿可采也没墙可修，施工工在双火箭位待命')
+        return None
     want = ('stone',) if gaps else ('copper', 'iron', 'stone')
     cmd = go_mine(
         worker, state, blocked, reserved, want_ores=want,
@@ -2537,7 +2591,7 @@ def economist_should_home_use(role, state):
         return False
     from .news_memory import game_day
     from .tactics import front_breached, pressure
-    if game_day(state.round_no) < 5:
+    if game_day(state.round_no) < WALL_WATCH_DAY:
         return False
     if pressure(state) or front_breached(state):
         return True

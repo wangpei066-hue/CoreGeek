@@ -11,6 +11,7 @@ from tests.test_worker_pioneer_merge import _slot_layout_state
 
 DAY5_NIGHT = 4 * 130 + 75
 DAY4_NIGHT = 3 * 130 + 75
+DAY3_NIGHT = 2 * 130 + 75
 DAY5_DAY = 4 * 130 + 20
 DAY6_DAY = 5 * 130 + 20
 
@@ -50,10 +51,17 @@ class NightWallWatchTests(unittest.TestCase):
             step = Pos(cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
             self.assertLess(min(chebyshev(step, w.pos) for w in front), chebyshev(econ.pos, far.pos) + 1)
 
-    def test_day4_economist_not_watching(self):
-        state = _slot_layout_state(DAY4_NIGHT, levels=(3, 3, 3), station_level=3)
+    def test_day3_economist_not_watching(self):
+        state = _slot_layout_state(DAY3_NIGHT, levels=(3, 3, 3), station_level=3)
         _economist(state).backpack = ['WallFixer'] * 6
         self.assertIsNone(night_wall_watcher(state, build_blocked_set(state)))
+
+    def test_day4_economist_watches(self):
+        """第四夜城墙压力已很大：带修墙包的经济工第四夜起就墙边待命。"""
+        state = _slot_layout_state(DAY4_NIGHT, levels=(3, 3, 3), station_level=3)
+        econ = _economist(state)
+        econ.backpack = ['WallFixer'] * 6
+        self.assertEqual(night_wall_watcher(state, build_blocked_set(state)).id, econ.id)
 
     def test_no_items_no_watch(self):
         state = _slot_layout_state(DAY5_NIGHT, levels=(3, 3, 3), station_level=3)
@@ -148,6 +156,27 @@ class NightStockTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job['item'], 'Bomb')
         self.assertEqual(_batch_buy_quantity(econ, state, job), BOMB_STOCK_TARGET)
+
+    def test_day4_starts_stocking_fixers(self):
+        state = _slot_layout_state(3 * 130 + 20, levels=(3, 3, 3), station_level=3)
+        state.team_our.gold_num = 50
+        econ = _economist(state)
+        econ.backpack = []
+        state.worker_item_jobs.pop(econ.id, None)
+        maybe_start_shop_item_job(econ, state)
+        self.assertEqual((state.worker_item_jobs.get(econ.id) or {}).get('item'), 'WallFixer')
+
+    def test_day6_first_bomb_before_topping_fixers(self):
+        """第六天：修墙包到最低库存后先保证一个炸弹，再补满修墙包。"""
+        state = _slot_layout_state(DAY6_DAY, levels=(3, 3, 3), station_level=3)
+        state.team_our.gold_num = 150
+        econ = _economist(state)
+        econ.backpack = ['WallFixer'] * 4
+        state.worker_item_jobs.pop(econ.id, None)
+        maybe_start_shop_item_job(econ, state)
+        job = state.worker_item_jobs.get(econ.id)
+        self.assertEqual(job['item'], 'Bomb')
+        self.assertEqual(_batch_buy_quantity(econ, state, job), 1)
 
     def test_day5_no_bombs_yet(self):
         state = _slot_layout_state(DAY5_DAY, levels=(3, 3, 3), station_level=3)

@@ -128,7 +128,7 @@ DAY5_NIGHT = 4 * 130 + 80
 
 
 class BigRobotSplitTests(unittest.TestCase):
-    """第三天起：id 最小的火箭锚定大型/BOSS（算溅射）；另一门在大型上路时清数量，贴墙开打后也锁大型。电磁炮必须带上大型。"""
+    """第三天起：id 最小的火箭锚定大型/BOSS（算溅射）；另一门清数量，修墙包用光且大型贴墙开打后也锁大型。电磁炮必须带上大型。"""
 
     def _front(self):
         # 两段墙前各有一堆怪：一堆是大型带三只小怪，另一堆是一整块 3×3 中型
@@ -161,8 +161,19 @@ class BigRobotSplitTests(unittest.TestCase):
         self.assertNotIn(1, damage)
         self.assertTrue(all(16 <= p["x"] <= 18 for p in positions), positions)
 
+    def test_other_rocket_keeps_clearing_swarm_while_fixers_on_hand(self):
+        """大型贴墙开打但全队还有修墙包：墙由修墙包保，另一门火箭照常清另一侧中型堆。"""
+        wall, robots = self._front()
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        keeper = make_role(10011, 5, 5, "worker", backpack=["WallFixer"], back_pack_capability=100)
+        state = night_state([anchor, other, keeper] + wall, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(other, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertTrue(all(30 <= p["x"] <= 32 for p in positions), positions)
+
     def test_other_rocket_locks_large_when_sieging_wall(self):
-        """大型已经贴墙开打：另一门火箭也锁大型（周围小怪吃溅射），不再去打另一侧中型堆。"""
+        """大型已经贴墙开打、全队没有修墙包：另一门火箭也锁大型（周围小怪吃溅射），不再去打另一侧中型堆。"""
         wall, robots = self._front()
         anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
         other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)

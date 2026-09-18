@@ -1465,23 +1465,24 @@ class WeaponRebuildAndFixerTests(unittest.TestCase):
         maybe_start_shop_item_job(worker, state)
         self.assertEqual(state.worker_item_jobs[1]['kind'], 'station')
 
-    def test_economist_stocks_fixer_from_day_five_not_day_four(self):
+    def test_economist_stocks_fixer_from_day_four_not_day_three(self):
+        """实测第四夜城墙压力已很大：修墙包从第四天起囤。"""
         from src.agent.brain import maybe_start_shop_item_job
         economist_id = 2
+        day3 = _slot_layout_state(270, levels=(3, 3, 3), station_level=3)
+        day3.team_our.gold_num = 200
+        economist = next(r for r in day3.team_our.roles if r.id == economist_id)
+        maybe_start_shop_item_job(economist, day3)
+        job3 = day3.worker_item_jobs.get(economist_id) or {}
+        self.assertNotEqual(job3.get('item'), 'WallFixer')
+
         day4 = _slot_layout_state(400, levels=(3, 3, 3), station_level=3)
         day4.team_our.gold_num = 200
         economist = next(r for r in day4.team_our.roles if r.id == economist_id)
         maybe_start_shop_item_job(economist, day4)
-        job4 = day4.worker_item_jobs.get(economist_id) or {}
-        self.assertNotEqual(job4.get('item'), 'WallFixer')
-
-        day5 = _slot_layout_state(530, levels=(3, 3, 3), station_level=3)
-        day5.team_our.gold_num = 200
-        economist = next(r for r in day5.team_our.roles if r.id == economist_id)
-        maybe_start_shop_item_job(economist, day5)
-        job5 = day5.worker_item_jobs[economist_id]
-        self.assertEqual(job5['item'], 'WallFixer')
-        self.assertTrue(job5.get('stock_for_night'))
+        job4 = day4.worker_item_jobs[economist_id]
+        self.assertEqual(job4['item'], 'WallFixer')
+        self.assertTrue(job4.get('stock_for_night'))
 
     def test_economist_holds_fixer_by_day_and_uses_at_night(self):
         from src.agent.brain import decide_shop_item_job, economist_night_home_use

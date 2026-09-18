@@ -27,6 +27,13 @@ PRICE_RISE_KEEP = 3  # 入夜窗口对待涨价矿至少留这么多。
 DAY_MINE_PATH_CAP = 10  # 白天新选收入矿的去程上限；已粘住的不因这个换矿。
 SHOP_TRANSFER_STEPS = 6  # 持单人还要走这么多步、店边已有人时转单。
 NIGHT_FULL_PACK_DUSK_FILL = 40  # 入夜前占用达到这个才可能夜里采满，才考虑严格安全卖路。
+# 施工工第二天起没有砌墙活时：只采基地附近的铜铁（墙缺石才采石），攒够一包再卖，不跑远矿，
+# 保证入夜第一回合就在双火箭位。离线白天推进：原逻辑一天约 50 回合在走路、只采 12 下，还囤十几块石头。
+BUILDER_HOME_RADIUS = 12    # 优先只采离基地（切比雪夫）这么多格内的矿
+BUILDER_WIDE_RADIUS = 16    # 近处没矿、且离入夜还早（够来回 + BUILDER_WIDE_SLACK）时才放宽到这么远
+BUILDER_WIDE_SLACK = 15
+BUILDER_SELL_VALUE = 100    # 背包铜铁按报价值这么多才专程去小贩（白天推进：60→100 少跑一趟，采矿值 +24%）
+BUILDER_STONE_SPARE = 2     # 墙全齐时也留这么多石头，夜里被拆的墙第二天能马上补
 
 
 def en_route_collect(role, state, remaining_steps, reason):
@@ -784,15 +791,17 @@ def sellable_ores(role, state, dump_extra_stone=False, ignore_stockpile=False):
     return +ores
 
 
-def liquidate(role, state, blocked, reserved, force_reason=None, keep_wall_stone=False):
+def liquidate(role, state, blocked, reserved, force_reason=None, keep_wall_stone=False,
+              respect_stockpile=False):
     """返回(是否接管, 指令)。往返时间不足时停止外出，转入原有防守流程。
-    force_reason 表示强制清包：连同囤货一起卖；keep_wall_stone=False 时多余石头也卖掉。"""
+    force_reason 表示强制清包：连同囤货一起卖（respect_stockpile=True 时仍留新闻预告要涨价/禁采的囤货）；
+    keep_wall_stone=False 时多余石头也卖掉。"""
     from .brain import max_health
     from .opening import move_on_path
     from .tactics import night_wave_cleared
     committed = state.policy_memory.setdefault('selling_roles', [])
     ores = sellable_ores(role, state, dump_extra_stone=bool(force_reason) and not keep_wall_stone,
-                         ignore_stockpile=bool(force_reason))
+                         ignore_stockpile=bool(force_reason) and not respect_stockpile)
     vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor'] if state.map_info else []
     adjacent = any(chebyshev(role.pos, z.pos) <= 1 for z in vendors)
     choices = _vendor_choices(role, state, blocked, reserved)
@@ -1243,7 +1252,7 @@ def go_mine(role, state, blocked, reserved, want_ores, purpose='income',
 
 def profitable_mine(role, state, blocked, reserved):
     """按本趟真正采得完的数量估算收益，并粘住已占矿点。仅工人可 collect。"""
-    from .opening import stones_cover_wall_plan
+    from .opening import staged_walls_incomplete, stones_cover_wall_plan
     if role.role_type != 'worker':
         trace(state, role.id, 'pioneer_cannot_collect', '采集仅工人可用，开拓者不采矿、不建墙')
         return None
@@ -1255,7 +1264,9 @@ def profitable_mine(role, state, blocked, reserved):
         clear_mine_target(state, role.id)
         trace(state, role.id, 'backpack_full', '背包已满，停止采矿')
         return None
-    skip_stone = stones_cover_wall_plan(state)
+    # 墙阶段已齐（没有缺口）时 stones_cover_wall_plan 返回 False，原先会因此把石头当收入矿去采，
+    # 墙修满后反而越囤越多；没有缺口就不采石。
+    skip_stone = stones_cover_wall_plan(state) or not staged_walls_incomplete(state)
     want = {'iron', 'copper'}
     try:
         from .news_memory import game_day
@@ -1280,3 +1291,141 @@ def profitable_mine(role, state, blocked, reserved):
               '官方消息预告后续禁采/涨价，今天优先抢收对应矿石',
               ores=sorted(priority), banned=sorted(banned))
     return go_mine(role, state, blocked, reserved, want_ores=want, purpose='income')
+
+
+def _news_ore_filters(state):
+    """(今天该抢收的矿, 今天禁采的矿)，读不到新闻时都为空。"""
+    try:
+        from .news_memory import game_day
+        memory = getattr(state, "news_memory", None)
+        if memory is not None:
+            day = game_day(state.round_no)
+            return set(memory.ores_to_stockpile(day)), set(memory.banned_ores(day))
+        from .world_intel import ore_blocked, ores_to_stockpile
+        return (set(ores_to_stockpile(state)),
+                {ore for ore in ('iron', 'copper', 'stone') if ore_blocked(state, ore)})
+    except Exception:
+        return set(), set()
+
+
+def builder_stone_need(state):
+    """墙线还缺几块石头：整圈缺口 + BUILDER_STONE_SPARE，减去两名工人已带的石头。"""
+    from .brain import own_station
+    from .opening import primary_wall_plan
+    base = own_station(state)
+    if base is None:
+        return 0
+    standing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    missing = len(set(primary_wall_plan(state, base)) - standing)
+    held = sum((r.backpack or []).count('stone') for r in state.team_our.roles
+               if r.role_type == 'worker' and r.health > 0)
+    return max(0, missing + BUILDER_STONE_SPARE - held)
+
+
+def _prices_with_default(state):
+    """小贩报价缺失时退回默认价（石1/铁3/铜5），不把铜铁估成 0 金。"""
+    from .news_memory import DEFAULT_ORE_PRICES
+    prices = dict(DEFAULT_ORE_PRICES)
+    prices.update({k: v for k, v in ore_prices(state).items() if v > 0})
+    return prices
+
+
+def builder_metal_value(role, state):
+    prices = _prices_with_default(state)
+    return sum(prices.get(i, 0) for i in (role.backpack or []) if i in ('iron', 'copper'))
+
+
+def builder_home_mine(role, state, blocked, reserved):
+    """先在基地 BUILDER_HOME_RADIUS 格内选矿；没有且离入夜够远时放宽到 BUILDER_WIDE_RADIUS。
+    都只选迎敌墙内侧；铜铁按报价/路程，墙缺石时才要石头。"""
+    from .opening import day_rounds_remaining
+    cmd = _builder_mine_within(role, state, blocked, reserved, BUILDER_HOME_RADIUS, None)
+    if cmd is None:
+        cmd = _builder_mine_within(role, state, blocked, reserved, BUILDER_WIDE_RADIUS,
+                                   day_rounds_remaining(state.round_no))
+    return cmd
+
+
+def _builder_mine_within(role, state, blocked, reserved, radius, rounds_left):
+    from .brain import own_station
+    from .opening import adjacent_path, attack_side_of_front, move_on_path
+    base = own_station(state)
+    if base is None or state.map_info is None:
+        return None
+    if len(role.backpack or []) >= (role.back_pack_capability or 0):
+        return None
+    stockpile, banned = _news_ore_filters(state)
+    want = {'iron', 'copper'}
+    if builder_stone_need(state) > 0:
+        want.add('stone')
+    want -= banned
+    if stockpile & want:
+        want = stockpile & want
+    prices = _prices_with_default(state)
+    # 同一矿多人可同时采、每人每回合各得一个（任务书4.4），所以家门口的矿不因经济工占着就放弃，只是排在后面。
+    occupied = claimed_mines(state, exclude_role_id=role.id)
+    sticky = get_mine_target(state, role.id)
+    candidates = []
+    for mine in state.map_info.zones:
+        if mine.neutral_type not in want:
+            continue
+        home = chebyshev(mine.pos, base.pos)
+        if home > radius or attack_side_of_front(state, base, mine.pos):
+            continue
+        path = adjacent_path(role, mine.pos, blocked | reserved, state)
+        if path is None:
+            continue
+        if rounds_left is not None and rounds_left < len(path) + home + BUILDER_WIDE_SLACK:
+            continue  # 放宽半径只在去程 + 回家 + 余量来得及时
+        value = prices.get(mine.neutral_type, 1) or 1
+        # 粘住当前矿：同一矿采完前不因别的矿略优而来回换
+        stay = bool(sticky and (sticky.get('x'), sticky.get('y')) == (mine.pos.x, mine.pos.y))
+        shared = (mine.pos.x, mine.pos.y) in occupied
+        candidates.append((0 if stay else 1, -value / (len(path) + 2 + (4 if shared else 0)), len(path), mine, path))
+    if not candidates:
+        return None
+    _, _, path_len, mine, path = min(candidates, key=lambda c: c[:3])
+    set_mine_target(state, role.id, mine, path_len=path_len, batch=MINE_TRIP_CAP)
+    if path:
+        trace(state, role.id, 'builder_home_mine', '施工工只采基地附近的矿，不跑远',
+              mineral=mine.neutral_type, path_len=path_len,
+              home_distance=chebyshev(mine.pos, base.pos))
+        return move_on_path(state, role, path, reserved, '施工工去基地附近的矿')
+    return selected(state, role.id, {'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}]},
+                    '施工工在基地附近采矿')
+
+
+def builder_home_economy(role, state, blocked, reserved):
+    """施工工第二天起的空闲经济：攒够一包（或附近已无矿可采）且往返来得及才去卖，否则在家附近采矿。
+    返回 None 表示附近没活可干（由调用方让他回双火箭位待命，不去远处）。"""
+    from .brain import is_day_round
+    from .opening import dusk_must_return
+    if role.role_type != 'worker' or not is_day_round(state.round_no):
+        return None
+    if dusk_must_return(state, role):
+        return None
+    metal_value = builder_metal_value(role, state)
+    cap = role.back_pack_capability or 0
+    nearly_full = bool(cap) and len(role.backpack or []) >= cap * BATCH_FILL_RATIO
+    vendors = [z for z in state.map_info.zones if z.neutral_type == 'vendor'] if state.map_info else []
+    if metal_value > 0 and any(chebyshev(role.pos, z.pos) <= 1 for z in vendors):
+        # 人就在小贩旁边：不用走路，顺手卖掉
+        handled, cmd = liquidate(role, state, blocked, reserved, force_reason='施工工就在小贩旁，顺手卖掉铜铁',
+                                 keep_wall_stone=True, respect_stockpile=True)
+        if cmd:
+            return cmd
+    mine_cmd = None
+    if metal_value < BUILDER_SELL_VALUE and not nearly_full:
+        mine_cmd = builder_home_mine(role, state, blocked, reserved)
+        if mine_cmd:
+            return mine_cmd
+    if metal_value > 0:
+        handled, cmd = liquidate(role, state, blocked, reserved,
+                                 force_reason='施工工在家附近攒够一包（或附近已无矿），去小贩变现',
+                                 keep_wall_stone=True, respect_stockpile=True)
+        if cmd:
+            return cmd
+    if mine_cmd is None and (metal_value >= BUILDER_SELL_VALUE or nearly_full):
+        # 卖不了（来不及）但背包还有空：继续在附近采
+        return builder_home_mine(role, state, blocked, reserved)
+    return None
