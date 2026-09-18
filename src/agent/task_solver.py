@@ -113,12 +113,6 @@ def path_basename(path):
     return normalize_target(path).rsplit('/', 1)[-1]
 
 
-def path_refers_to_other_city(path, city):
-    # Kept as a compatibility helper; API documents are task-local and must
-    # not be filtered by a hard-coded domain vocabulary.
-    return False
-
-
 def relevant_md_paths(task):
     return extract_md_paths(task)
 
@@ -529,37 +523,6 @@ def parse_curl_output(text):
     if not isinstance(payload, dict):
         return status, None, body
     return status, payload, body
-
-
-def curl_api_command(query):
-    """沙盒只跑 curl；中文参数由 --data-urlencode 编码，分页由求解器续发。"""
-    if not query or not query.get('baseUrl') or not query.get('path'):
-        return ''
-    url = query['baseUrl'].rstrip('/') + query['path']
-    args = ['curl', '-sS', '-G', '--max-time', '8', '-w', 'HTTPSTATUS:%{http_code}']
-    token = query.get('token')
-    if token:
-        auth = query.get('authStyle') or ''
-        if auth == 'Authorization: Bearer':
-            args += ['-H', 'Authorization: Bearer %s' % token]
-        elif auth:
-            # Persist the documented header name, while keeping the secret out
-            # of experience records and logs handled by the caller.
-            args += ['-H', '%s: %s' % (auth, token)]
-    params = dict(query.get('extraParams') or {})
-    for key in list(params):
-        if key in PAGE_PARAM_KEYS:
-            params.pop(key, None)
-    if query.get('cityParam') and query.get('city'):
-        params[query['cityParam']] = query['city']
-    if query.get('offset') is not None:
-        params['offset'] = str(query['offset'])
-    if query.get('limit') is not None:
-        params['limit'] = str(query['limit'])
-    for key, value in params.items():
-        args += ['--data-urlencode', '%s=%s' % (key, value)]
-    args.append(url)
-    return ' '.join(shlex.quote(part) for part in args)
 
 
 def _page_records(payload):
