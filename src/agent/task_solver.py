@@ -115,30 +115,6 @@ def extract_token(text):
     return match.group(1).rstrip('.,;，。；\"\'`') if match else None
 
 
-def deployment_repair_command(session):
-    """Build the single deterministic repair pass once spec.md is read."""
-    if session.get('taskKind') != 'workspace' or not session.get('workspace'):
-        return None
-    spec = '\n'.join(str(item.get('content') or '') for item in session.get('documents') or [])
-    port = re.search(r'第\s*3\s*行：`?([^`\n]+)`?', spec)
-    name = re.search(r'第\s*6\s*行：`?([^`\n]+)`?', spec)
-    app = re.search(r'(?:logs|config)/([A-Za-z0-9_-]+)', spec)
-    if not (port and name and app):
-        return None
-    workspace = shlex.quote(session['workspace'])
-    app_name = app.group(1)
-    config = shlex.quote(f'config/{app_name}.conf')
-    return (
-        f"cd {workspace} && set -eu; "
-        "tr -d '\\r' < check > check.tmp && mv check.tmp check; chmod 755 check; "
-        f"mkdir -p logs/{app_name}; chmod 755 logs/{app_name}; "
-        f"awk -v p={shlex.quote(port.group(1).strip())} -v n={shlex.quote(name.group(1).strip())} "
-        f"'NR==3{{$0=p}} NR==6{{$0=n}} {{print}}' {config} > {config}.tmp && mv {config}.tmp {config}; "
-        "mkdir -p bin; test -f bin/start.sh || printf '#!/bin/sh\\n' > bin/start.sh; "
-        "chmod 755 bin/start.sh; ./check"
-    )
-
-
 def extract_city(task):
     filename_city = re.search(r'task_[^_]+_(beijing|nanjing|chengdu)\.md', task or '', re.IGNORECASE)
     if filename_city:
@@ -1490,14 +1466,6 @@ class PioneerTaskSolver:
                                  classify_tool_error(result))
         return 'ask'
 
-    def _finish_from_tool(self, s, result, task, stats=None):
-        # Completion is a model decision.  The solver must not extract a
-        # TOKEN or synthesize an API answer from a task-specific schema: doing
-        # so bypasses the exploration and skill formation required by the
-        # competition.  The complete tool result is included in the next
-        # prompt, where the model can verify it and choose submit.
-        return False
-
     def _consume_waiting(self, state, s):
         execute = ''
         result = self._parse_sandbox(state, s.get('requestId'))
@@ -1595,7 +1563,6 @@ class PioneerTaskSolver:
         s['history'].append(redacted)
         # Tool output is evidence for the model.  It is deliberately not
         # parsed into a type-specific answer by the solver.
-        stats = None
         if result.get('error') or (result.get('exitCode') not in (None, 0) and result.get('event') == 'execute_tool'):
             self._record_failure(
                 s, 'execute', command, s.get('workspace'), classify_tool_error(result) or 'nonzero_exit')
@@ -1605,20 +1572,12 @@ class PioneerTaskSolver:
                 self._fact(s, '已转换CRLF: %s' % ','.join(result['convertedCrlf']))
             if result.get('precheckOnly') and not (result.get('checkExitCode') == 0 and extract_token(result.get('checkTail') or '')):
                 self._fact(s, '部署预检完成，尚未最终验收')
-            if self._finish_from_tool(s, result, state.phase_task, stats):
-                s.setdefault('metrics', {})['answerReadyRound'] = state.round_no
-                s.setdefault('metrics', {})['checkPassed'] = True
-                return execute
             s['deployPhase'] = 'fix'
             s['llmFallbackReason'] = 'deployment_probe_requires_llm'
             s['stage'] = 'ask'
             return execute
         if result.get('convertedCrlf'):
             self._fact(s, '执行前已转换CRLF: %s' % ','.join(result['convertedCrlf']))
-        if self._finish_from_tool(s, result, state.phase_task, stats):
-            s.setdefault('metrics', {})['answerReadyRound'] = state.round_no
-            s.setdefault('metrics', {})['checkPassed'] = True
-            return execute
         if s.get('taskKind') == 'workspace':
             s['llmFallbackReason'] = 'deployment_check_failed'
         s['stage'] = 'ask'
