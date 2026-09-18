@@ -915,6 +915,17 @@ class PioneerTaskSolver:
                 state.phase_task,
                 result.get('content') or '',
             )))
+            # Follow explicitly referenced local documents automatically. This
+            # is a generic document traversal rule, not a task-type workflow;
+            # it removes an avoidable LLM round while preserving the model's
+            # responsibility for interpreting their contents.
+            base_dir = Path(s.get('documentDir') or Path(result.get('path') or '.').parent)
+            known = set(s.get('paths') or [])
+            for ref in extract_md_paths(result.get('content') or ''):
+                candidate = ref if path_is_abs(ref) else str(base_dir / ref)
+                if candidate not in known and Path(candidate).is_file():
+                    s.setdefault('paths', []).append(candidate)
+                    known.add(candidate)
             if result.get('more') and result['nextOffset'] < 60000:
                 s['offset'] = result['nextOffset']
                 s['paths'][s['index']] = result['path']
