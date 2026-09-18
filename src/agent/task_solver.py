@@ -820,6 +820,7 @@ class PioneerTaskSolver:
             'successfulRoundSpan': max(0, int(s.get('round') or 0) - int((s.get('metrics') or {}).get('acceptedRound') or 0)),
             'learnedAt': s.get('round'),
             'procedure': [self._redact_procedure(x, s) for x in (s.get('procedure') or [])[-6:]],
+            'facts': [self._redact_procedure(x, s) for x in (s.get('facts') or [])[-8:]],
         }
         items = [x for x in self.experience.get('skills') or [] if x.get('taskKind') != record['taskKind']]
         items.append(record)
