@@ -1017,6 +1017,8 @@ class PioneerTaskSolver:
                 if answer['action'] == 'read':
                     path = answer['path']
                     current_docs = extract_md_paths(state.phase_task)
+                    if not current_docs:
+                        current_docs = re.findall(r'(/[^\s"<>]+\.md)', state.phase_task or '')
                     if current_docs and Path(path).name.startswith('task_') and Path(path).name != Path(current_docs[0]).name:
                         s['history'].append({'blocked': '读取了其他任务文档', 'path': path})
                         self._fact(s, '已拦截跨任务文档读取；请只读取 currentTaskDocument 或其明确引用的资料。')
