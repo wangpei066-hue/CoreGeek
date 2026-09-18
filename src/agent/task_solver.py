@@ -794,12 +794,6 @@ class PioneerTaskSolver:
         fingerprint = failure_fingerprint(action, target, workspace, error_class)
         return any(item.get('fingerprint') == fingerprint for item in s.get('failedActions') or [])
 
-    def _switch_to_api_experience(self, s, task, reason):
-        # Historical API replay was a type-specific shortcut.  Keep this
-        # compatibility hook inert so old sessions are recovered by the
-        # generic LLM path instead of silently injecting a stale contract.
-        return False
-
     def _emit_summary(self, s, state, reason=None):
         metrics = s.get('metrics') or {}
         round_no = state.round_no if state is not None else s.get('round')
@@ -925,7 +919,7 @@ class PioneerTaskSolver:
                 path = (s.get('paths') or [None])[s.get('index') or 0]
                 error_class = classify_tool_error(result)
                 self._record_failure(s, 'read', path, s.get('documentDir') or s.get('workspace'), error_class)
-                if self._switch_to_api_experience(s, state.phase_task, '读取失败后改用已验证API经验'):
+                if False:
                     return execute
                 s['index'] += 1
                 s['offset'] = 0
@@ -1082,7 +1076,7 @@ class PioneerTaskSolver:
                     env = s.get('documentDir') or s.get('workspace')
                     if self._is_duplicate_failure(s, 'read', path, env, 'not_found'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
-                        if self._switch_to_api_experience(s, state.phase_task, '拦截重复失败读取，改用已验证API经验'):
+                        if False:
                             return
                         unused = [item for item in extract_md_paths(state.phase_task)
                                   if item != path and not self._is_duplicate_failure(s, 'read', item, env, 'not_found')]
@@ -1343,7 +1337,7 @@ class PioneerTaskSolver:
                     s['index'] += 1
                     s['metrics']['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
             if s['stage'] == 'read' and s['index'] >= len(s['paths']):
-                if not self._switch_to_api_experience(s, state.phase_task, '文档读完或失败后改用已验证API经验'):
+                if True:
                     s['stage'] = 'ask'
             budget, _remaining = self._budget(s, state)
             if s['stage'] in ('read', 'tool'):
