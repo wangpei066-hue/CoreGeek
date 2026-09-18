@@ -1198,3 +1198,102 @@ class NightMinerSafetyTests(unittest.TestCase):
         self.assertIsNotNone(night_safe_path(worker, target, blocked, state))  # 守炮的人会退回普通路线
         state.night_released_ids = {worker.id}
         self.assertIsNone(night_safe_path(worker, target, blocked, state))  # 外出的人不走危险路线
+
+
+class WeaponRebuildAndFixerTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def test_day_rebuilds_missing_railgun_before_mining(self):
+        from src.agent.opening import courtyard_cells, weapon_slot_plan
+        state = _slot_layout_state(150)
+        state.team_our.gold_num = 80
+        state.team_our.player_tasks = []
+        state.team_our.roles = [r for r in state.team_our.roles if r.role_type != 'railgun']
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        slot = next(p for name, p in weapon_slot_plan(state, base) if name == 'railgun')
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.id != worker.id}
+        stand = next(
+            c for c in sorted(courtyard_cells(state, base))
+            if max(abs(c[0] - slot[0]), abs(c[1] - slot[1])) == 1 and c not in occupied
+        )
+        worker.pos = Pos(*stand)
+        commands = self.decide(state)
+        self.assertTrue(
+            any(c.get('action') == 'build' and c.get('name') == 'railgun' for c in commands.values())
+            or any(e.get('code') == 'rebuild_missing_weapon' for e in state.decision_events)
+            or any(
+                c.get('action') == 'move' and c.get('targetPos')
+                and max(abs(c['targetPos'][0]['x'] - slot[0]), abs(c['targetPos'][0]['y'] - slot[1])) <= 1
+                for c in commands.values()
+            ),
+            (commands, [e.get('code') for e in state.decision_events if e.get('role_id') in (1, 2, 3)]),
+        )
+
+    def test_rebuilt_l1_jumps_upgrade_queue(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = _slot_layout_state(150, levels=(3, 1, 3), station_level=1)
+        state.team_our.gold_num = 1000
+        state.policy_memory['weapon_rebuild_pending'] = True
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        self.assertEqual(job['kind'], 'weapon')
+        self.assertEqual(job['item'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(tuple(job['target']), (railgun.pos.x, railgun.pos.y))
+
+    def test_intact_l1_railgun_does_not_jump_station_step(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = _slot_layout_state(150, levels=(3, 1, 2), station_level=1)
+        state.team_our.gold_num = 1000
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]['kind'], 'station')
+
+    def test_economist_stocks_fixer_from_day_five_not_day_four(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        economist_id = 2
+        day4 = _slot_layout_state(400, levels=(3, 3, 3), station_level=3)
+        day4.team_our.gold_num = 200
+        economist = next(r for r in day4.team_our.roles if r.id == economist_id)
+        maybe_start_shop_item_job(economist, day4)
+        job4 = day4.worker_item_jobs.get(economist_id) or {}
+        self.assertNotEqual(job4.get('item'), 'WallFixer')
+
+        day5 = _slot_layout_state(530, levels=(3, 3, 3), station_level=3)
+        day5.team_our.gold_num = 200
+        economist = next(r for r in day5.team_our.roles if r.id == economist_id)
+        maybe_start_shop_item_job(economist, day5)
+        job5 = day5.worker_item_jobs[economist_id]
+        self.assertEqual(job5['item'], 'WallFixer')
+        self.assertTrue(job5.get('stock_for_night'))
+
+    def test_economist_holds_fixer_by_day_and_uses_at_night(self):
+        from src.agent.brain import decide_shop_item_job, economist_night_home_use
+        from src.agent.grid import build_blocked_set
+        day = _slot_layout_state(530, levels=(3, 3, 3), station_level=3)
+        economist = next(r for r in day.team_our.roles if r.id == 2)
+        economist.backpack = ['WallFixer']
+        wall = next(r for r in day.team_our.roles if r.role_type == 'wall')
+        day.worker_item_jobs[economist.id] = {
+            'item': 'WallFixer',
+            'target': (wall.pos.x, wall.pos.y),
+            'kind': 'wall',
+            'stock_for_night': True,
+        }
+        cmd = decide_shop_item_job(economist, day, build_blocked_set(day), set())
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e['code'] == 'fixer_held_for_night' for e in day.decision_events))
+
+        night = _slot_layout_state(600, levels=(3, 3, 3), station_level=3)
+        economist = next(r for r in night.team_our.roles if r.id == 2)
+        economist.backpack = ['WallFixer']
+        damaged = next(r for r in night.team_our.roles if r.role_type == 'wall')
+        damaged.health = 200
+        night.robot.roles = [RobotRole(100 + i, Pos(16, 8 + i), 'smallRobot', 10) for i in range(4)]
+        cmd = economist_night_home_use(economist, night, build_blocked_set(night), set())
+        self.assertIsNotNone(cmd)
+        self.assertIn(cmd['action'], ('move', 'use'))
+        self.assertNotEqual(cmd.get('action'), 'collect')

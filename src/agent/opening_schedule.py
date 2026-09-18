@@ -501,10 +501,11 @@ def opening_shop_voucher(role, state, blocked, reserved, stage, switch_reason='g
     target = (shop.pos.x, shop.pos.y)
     if chebyshev(role.pos, shop.pos) <= 1:
         if len(role.backpack or []) >= (role.back_pack_capability or 0):
-            for name in ('copper', 'iron', 'stone'):
-                if name in (role.backpack or []):
-                    cmd = selected(state, role.id, {'action': 'drop', 'name': name}, '腾出背包买券')
-                    return _tick(state, role, stage, 'shop', 'weaponShop', target, 0, 'drop', switch_reason, cmd)
+            from .economy import liquidate, sellable_ores
+            if sellable_ores(role, state):
+                cmd = opening_sell_metal(role, state, blocked, reserved, stage, 'backpack_full')
+                if cmd:
+                    return cmd
             return None
         from .brain import item_cost, upgrade_batch_size
         cost = item_cost('WeaponUpgradeVoucher1', state)
@@ -869,11 +870,19 @@ def opening_fund_work(role, state, blocked, reserved, gold, cost, helper_walls, 
         elif helper_walls and role.role_type == 'worker':
             return opening_wall_work(role, state, blocked, reserved, claimed, assignments)
         elif role.role_type == 'worker':
-            from .opening import opening_yard_wait
-            wait = opening_yard_wait(role, state, blocked, reserved)
-            if wait:
-                return _tick(state, role, STAGE_FUND, 'shop', 'hold', None, 0, 'move', 'gold_ready', wait)
-            return _tick(state, role, STAGE_FUND, 'shop', 'hold', None, 0, 'hold', 'gold_ready', None)
+            # 金币够但自己不是买家：继续采铜铁，不要在院子里 hold。
+            mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('copper', 'iron'))
+            if mine is not None:
+                target = (mine.pos.x, mine.pos.y)
+                if path:
+                    return opening_move(state, role, path, reserved, target, '金币已够但不是买家，继续采矿',
+                                        'mine', mine.neutral_type, 'gold_ready', stage_label)
+                cmd = selected(state, role.id, {
+                    'action': 'collect', 'targetPos': [{'x': mine.pos.x, 'y': mine.pos.y}],
+                }, '金币已够但不是买家，继续采矿')
+                return _tick(state, role, stage_label, 'mine', mine.neutral_type, target, 0, 'collect',
+                             'gold_ready', cmd)
+            trace(state, role.id, 'gold_ready_no_mine', '金币已够且不是买家，但没有可达铜铁')
     from .economy import ore_prices, team_metal_inventory_value
     prices = ore_prices(state)
     known = any(prices.get(n, 0) > 0 for n in ('copper', 'iron'))

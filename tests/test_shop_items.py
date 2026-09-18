@@ -579,12 +579,18 @@ class MultiRoundRepairIntegrationTest(unittest.TestCase):
         from src.agent.opening import staged_wall_plan
         from src.agent.brain import own_station
         state = minimal_state(gold_num=1000)
+        state.team_our.roles[0].level = 3
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
         base = own_station(state)
         for i, (x, y) in enumerate(staged_wall_plan(state, base)):
             state.team_our.roles.append(make_role(500 + i, x, y, "wall", health=400, level=1))
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles.append(worker)
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=3, health=1000),
+            make_role(22, 12, 8, "rocket", level=3, health=1000),
+            make_role(23, 12, 12, "railgun", level=3, health=1000),
+        ]
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()
