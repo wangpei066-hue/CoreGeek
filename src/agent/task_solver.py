@@ -52,16 +52,10 @@ API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验
 PROMPT_CORE = '''你是自动解题器，目标是在12轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
-PROMPT_DEPLOY = DEPLOYMENT_SOP
-PROMPT_API = API_SOP
 CLASSIFICATION_RULES = (
     'taskKind=workspace 时注入部署SOP；taskKind=api 时注入API SOP；unknown 仅保留通用求解能力。'
     '分类只是启发式，路径、验证和答案格式以本题为准。'
 )
-# API responses and business calculations are intentionally not interpreted by
-# the solver.  Keep the legacy constant name for compatibility with imports,
-# but ensure prompts always use the generic, task-driven SOP above.
-PROMPT_API = API_SOP
 PROMPT_HASH = hashlib.sha256(
     (BASE_PROMPT + DEPLOYMENT_SOP + API_SOP + CLASSIFICATION_RULES + PROMPT_VERSION).encode()
 ).hexdigest()[:16]
@@ -1726,16 +1720,10 @@ class PioneerTaskSolver:
         s['submitStatus'] = 'unknown'
 
     def _relevant_experience(self, s, task):
-        relevant = dict(api=[], deploy=[])
-        if s.get('taskKind') == 'api':
-            hit = matching_api_experience(self.experience, task)
-            relevant['api'] = [hit] if hit else list(self.experience.get('api') or [])[:3]
-        if s.get('taskKind') == 'workspace':
-            env = s.get('workspace')
-            for item in self.experience.get('deploy') or []:
-                if not env or not item.get('environment') or item.get('environment') == env or item.get('kind') == 'crlf':
-                    relevant['deploy'].append(item)
-        return relevant
+        # Do not inject old type-specific contracts.  The only reusable
+        # material is the bounded, answer-free skill evidence recorded after
+        # a confirmed task; the model still reads the current task materials.
+        return {'skills': (self.experience.get('skills') or [])[-3:]}
 
     def _budget(self, s, state):
         metrics = s.get('metrics') or {}
