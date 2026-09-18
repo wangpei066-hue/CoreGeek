@@ -47,7 +47,7 @@ BASE_PROMPT = '''你是比赛自进化任务解题器，根据phaseTask、文档
 或 {"action":"submit","taskAnswer":"本题要求的最终答案字符串"}
 若答案要求JSON，将其序列化为taskAnswer字符串；提交必须有充分依据，需要执行或验证时应先取得真实结果。
 '''
-DEPLOYMENT_SOP = '''部署类任务的经验只来自已经读取过的本题规范和真实工具结果。SOP 应记录发现文件、修改规则、验收命令和提交格式，但每题必须重新绑定工作区、参数和成功凭据。不要假设存在 spec.md、check、TOKEN 或固定行号；不要修改验收器或无关文件。'''
+DEPLOYMENT_SOP = '''部署类任务的经验只来自已经读取过的本题规范和真实工具结果。SOP 应记录发现文件、修改规则、验收命令和提交格式，但每题必须重新绑定工作区、参数和成功凭据。不要假设存在 spec.md、check、TOKEN 或固定行号；不要修改验收器或无关文件。命令必须兼容 POSIX/Linux：严禁 macOS 写法 `sed -i ''`，修改文本优先使用一次 Python 脚本完成并立即运行验收。'''
 API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。读完任务和 API 文档后，优先在一次 execute 中写一个参数化脚本：先处理一次错误响应并修正契约，然后循环所有分页、去重、统计并只输出最终 JSON；不要把“请求第1页、请求第2页”拆成多个回合。English constraint: perform the complete API collection and calculation in ONE execute command; never issue the same endpoint once per page across rounds. If a response contains pagination, write a loop in the current command and print only the final answer object.'''
 PROMPT_CORE = '''你是自动解题器，目标是在12轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
