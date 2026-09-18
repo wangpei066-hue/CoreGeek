@@ -13,7 +13,7 @@ MARKER = 'PIONEER_TASK'
 EMPTY_WAIT_LIMIT = 2
 ARCHIVE_LIMIT = 8
 MIN_TASK_TIMEOUT_ROUNDS = 4
-PROMPT_VERSION = '20260916-solver6'
+PROMPT_VERSION = '20260918-generic-skill1'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
 TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
@@ -49,7 +49,7 @@ BASE_PROMPT = '''你是比赛自进化任务解题器，根据phaseTask、文档
 '''
 DEPLOYMENT_SOP = '''部署类任务的经验只来自已经读取过的本题规范和真实工具结果。SOP 应记录发现文件、修改规则、验收命令和提交格式，但每题必须重新绑定工作区、参数和成功凭据。不要假设存在 spec.md、check、TOKEN 或固定行号；不要修改验收器或无关文件。'''
 API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。'''
-PROMPT_CORE = '''你是自动解题器，目标是在14轮内完成任务。每次只返回一个JSON：
+PROMPT_CORE = '''你是自动解题器，目标是在12轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
 PROMPT_DEPLOY = DEPLOYMENT_SOP
@@ -1185,9 +1185,6 @@ class PioneerTaskSolver:
             instanceId=task_instance_id(state, fingerprint, accept_seq),
             acceptSeq=accept_seq, documentDir=None, documentDirProbed=False,
             llmPending=False, submitStatus=None,
-            # The verified heritage contract requires an explicit large page;
-            # leaving this unset silently triggers the service default (10).
-            apiLimit=100 if ctx.get('taskKind') == 'api' else None,
             promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
             metrics=metrics, resendPending=False, **ctx)
         # The first task in a family must be explored by the model.  Later
@@ -1904,9 +1901,6 @@ class PioneerTaskSolver:
                 self._consume_llm(state, s)
             elif s['stage'] == 'wait_submit':
                 self._consume_submit(state, s)
-            if s['stage'] == 'api_fetch' and not api_fetch_query(
-                    s.get('apiReplay') or {}, state.phase_task, 'preview'):
-                s['stage'] = 'ask'
             s['feedbackRound'] = state.round_no
             s['consumedFeedback'] = fingerprint
         self.session = s
