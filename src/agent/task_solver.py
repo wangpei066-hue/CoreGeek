@@ -340,6 +340,26 @@ try:
             more = bool(f.read(1))
         out.update(path=paths[0], content=content, nextOffset=offset + len(content), more=more,
                    documentDir=os.path.dirname(paths[0]))
+        # Return small, explicitly referenced Markdown files with the same
+        # read.  This is generic document traversal and saves a round without
+        # interpreting task semantics or inventing facts.
+        if offset == 0:
+            import re
+            related = []
+            for ref in re.findall(r'[`"“「']([^`"”」'\n]+\.md)[`"”」']|(?<![\w/])([A-Za-z0-9_.-]+\.md)', content):
+                rel = (ref[0] or ref[1]).strip()
+                candidate = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(paths[0]), rel)
+                if candidate == paths[0] or not os.path.isfile(candidate):
+                    continue
+                if any(item.get('path') == os.path.abspath(candidate) for item in related):
+                    continue
+                with open(candidate, encoding='utf-8', errors='replace') as rf:
+                    related.append(dict(path=os.path.abspath(candidate), content=rf.read(12000),
+                                        documentDir=os.path.dirname(os.path.abspath(candidate))))
+                if len(related) >= 4:
+                    break
+            if related:
+                out['relatedDocuments'] = related
 except Exception as e:
     out['error'] = str(e)
 print(json.dumps(out, ensure_ascii=False))
@@ -910,6 +930,10 @@ class PioneerTaskSolver:
                 s['stage'] = 'read'
                 return execute
             s['documents'].append(result)
+            for related in result.get('relatedDocuments') or []:
+                if not any(item.get('path') == related.get('path') for item in s['documents']):
+                    s['documents'].append(dict(marker=MARKER, requestId=result.get('requestId'),
+                                               event='read_document', **related))
             if result.get('path') and not s.get('documentDir'):
                 s['documentDir'] = str(Path(result['path']).parent)
             # phaseTask often only says "read task_x.md".  Promote classification
