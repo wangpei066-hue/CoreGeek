@@ -85,6 +85,43 @@ class RocketTargetingTests(unittest.TestCase):
         state = night_state([rocket, wall], robots, round_no=128)
         self.assertIsNotNone(plan_attack(rocket, robots, state))
 
+    def test_day5_rocket_hits_front_boss_instead_of_rear_swarm(self):
+        """第五夜：BOSS 在刷新边时，不能因为近处小怪堆积分更高就全程不打 BOSS。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=30, level=2, cooldown=0)
+        robots = block(16, 16) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertTrue(any(abs(p["x"] - 28) <= 1 and abs(p["y"] - 10) <= 1 for p in positions), positions)
+        self.assertIn(1, damage)
+        self.assertGreaterEqual(damage[1], 10)
+
+    def test_day5_rocket_centers_on_boss_when_only_splash_also_hits(self):
+        """能打到 BOSS 的落点里仍选收益最高的：孤立 BOSS 应打中心 20，不打旁边溅射 10。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=30, level=1, cooldown=0)
+        robots = [robot(1, 26, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertEqual(positions, [{"x": 26, "y": 10}])
+        self.assertEqual(damage[1], 20)
+
+    def test_day5_out_of_range_boss_does_not_block_in_range_swarm(self):
+        """BOSS 还在 1 级火箭射程外时，仍打射程内的密集堆，不空放。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=10, level=1, cooldown=0)
+        robots = block(12, 12) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertEqual(positions, [{"x": 13, "y": 13}])
+
+    def test_day1_still_prefers_dense_block_over_front_boss(self):
+        """第五天前保持原策略：近处小怪堆优先于远处单独 BOSS。"""
+        rocket = make_role(10040, 10, 10, "rocket", attack_range=30, level=1, cooldown=0)
+        robots = block(16, 16) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=80)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertEqual(positions, [{"x": 17, "y": 17}])
+        self.assertNotIn(1, damage)
+
 
 class RailgunTargetingTests(unittest.TestCase):
     def test_railgun_finishes_robot_rocket_already_damaged(self):
