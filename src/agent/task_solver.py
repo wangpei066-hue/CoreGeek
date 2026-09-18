@@ -1005,13 +1005,11 @@ def api_fetch_query(item, task, request_id, offset=None, limit=None):
 
 
 def default_heritage_experience(task, documents):
-    """Build the documented heritage contract after reading the task brief.
-
-    The server-side environment intentionally supplies the same contract in
-    every heritage fixture.  Using it after the task brief is read avoids
-    burning the deadline on stale API_DOCS exploration while retaining the
-    task's host/path when one is provided.
-    """
+    """Deprecated compatibility hook; contract inference belongs to the LLM."""
+    return None
+    # The former implementation intentionally remains unreachable in old
+    # replay traces; no production path may use a fixed credential or schema.
+    '''
     blob = '\n'.join(str(item.get('content') or '') for item in documents or [])
     urls = [clean_url(url) for url in URL_RE.findall(blob + '\n' + (task or ''))]
     parsed = urlparse(urls[0]) if urls else urlparse('http://localhost:8899/api/v1/heritage/search')
@@ -1022,7 +1020,7 @@ def default_heritage_experience(task, documents):
     # The lab contract is stable across the heritage tasks.  The task brief
     # intentionally omits the key, so retain the verified local credential
     # here instead of forcing an extra stale-doc/LLM round.
-    token = extract_task_secret(task) or 'heritage-api-key-2024'
+    token = extract_task_secret(task)
     auth_match = re.search(r'(?im)^\s*(Authorization|X-[A-Za-z0-9-]+|Api-Key|API-Key)\s*:\s*(?:Bearer\s+)?(?:<[^>]+>|`?([A-Za-z0-9._-]{8,})`?)', blob)
     if not auth_match:
         named_header = re.search(r'(?im)^\s*Header\s*:\s*([A-Za-z][A-Za-z0-9-]+)', blob)
@@ -1064,6 +1062,7 @@ def default_heritage_experience(task, documents):
                 cityParam=city_param, extraParams={}, recordsPath='data.records',
                 callVerified=False, recordsComplete=False, serviceHint='heritage',
                 invalidReason=None, token=token)
+    '''
 
 
 def parse_llm(text):
