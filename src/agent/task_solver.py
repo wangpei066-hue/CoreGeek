@@ -982,6 +982,9 @@ class PioneerTaskSolver:
                     hints.append(hint.format(value))
             if hints:
                 self._fact(s, '最新工具错误证据：' + '；'.join(dict.fromkeys(hints)) + '。下一次命令必须按该证据修正，并在同一脚本完成重试、分页和统计。')
+            expected = re.findall(r"Expected format:\s*['\"]?([^'\"\\n]+)", output, flags=re.IGNORECASE)
+            if expected:
+                self._fact(s, '真实错误明确要求认证格式：%s；下一次命令必须直接采用该格式，不要继续尝试旧请求头。' % expected[-1].strip())
             if re.search(r'["\']data["\']\s*:\s*\{', output):
                 self._fact(s, '真实响应显示 data 是 JSON 对象而非数组；下一次脚本必须先检查类型并读取对象中的实际字段，不能直接按 data[0] 访问。')
             elif re.search(r'["\']data["\']\s*:\s*\[', output):
