@@ -16,7 +16,6 @@ MIN_TASK_TIMEOUT_ROUNDS = 4
 PROMPT_VERSION = '20260918-generic-skill1'
 WAITING_STAGES = ('wait_read', 'wait_tool', 'wait_probe', 'wait_llm', 'wait_submit')
 MD_PATTERN = re.compile(r'''[`"“「']([^`"”」'\n]+\.md)(?:[`"”」'])|([^\s`"'“”「」<>，。；：、（）()\[\]]+\.md)''', re.IGNORECASE)
-TOKEN_RE = re.compile(r'TOKEN[:：]\s*(\S+)')
 # URLs in task documents are commonly enclosed in Markdown backticks and
 # followed by Chinese punctuation.  Keep extraction permissive, then normalize
 # each match before passing it to urlparse/curl.
@@ -108,11 +107,6 @@ def task_context(task):
 
 def task_fingerprint(task):
     return hashlib.sha256((task or '').strip().encode()).hexdigest()[:24]
-
-
-def extract_token(text):
-    match = TOKEN_RE.search(text or '')
-    return match.group(1).rstrip('.,;，。；\"\'`') if match else None
 
 
 def path_basename(path):
@@ -849,28 +843,6 @@ class PioneerTaskSolver:
                 'phase_task_cleared', 'phase_task_changed', 'budget_insufficient'),
         )
 
-    def _remember_api(self, item):
-        if not item or not item.get('path'):
-            return
-        kept = []
-        for old in self.experience.get('api') or []:
-            if old.get('baseUrl') == item.get('baseUrl') and old.get('path') == item.get('path'):
-                continue
-            kept.append(old)
-        kept.append(item)
-        self.experience['api'] = kept[-8:]
-
-    def _remember_deploy(self, item):
-        if not item:
-            return
-        kept = []
-        for old in self.experience.get('deploy') or []:
-            if old.get('kind') == item.get('kind') and old.get('environment') == item.get('environment'):
-                continue
-            kept.append(old)
-        kept.append(item)
-        self.experience['deploy'] = kept[-8:]
-
     def _remember_skill(self, state, s):
         """Store bounded, answer-free evidence for later same-family tasks.
 
@@ -1028,7 +1000,7 @@ class PioneerTaskSolver:
             s['documents'].append(result)
             if result.get('convertedCrlf'):
                 self._fact(s, '已转换CRLF: %s' % ','.join(result['convertedCrlf']))
-            if result.get('precheckOnly') and not (result.get('checkExitCode') == 0 and extract_token(result.get('checkTail') or '')):
+            if result.get('precheckOnly') and result.get('checkExitCode') != 0:
                 self._fact(s, '部署预检完成，尚未最终验收')
             s['deployPhase'] = 'fix'
             s['llmFallbackReason'] = 'deployment_probe_requires_llm'
