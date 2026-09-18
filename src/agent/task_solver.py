@@ -1560,6 +1560,7 @@ class PioneerTaskSolver:
         redacted['commandHasPagination'] = bool(
             re.search(r'\boffset\b', command, re.IGNORECASE)
             and re.search(r'\blimit\b', command, re.IGNORECASE))
+        redacted['command'] = command[:3000]
         s['history'].append(redacted)
         # Tool output is evidence for the model.  It is deliberately not
         # parsed into a type-specific answer by the solver.
@@ -1634,6 +1635,12 @@ class PioneerTaskSolver:
                 else:
                     command = answer['command']
                     s.setdefault('procedure', []).append(command)
+                    recent_commands = [item.get('command') for item in s.get('history') or []
+                                       if item.get('event') == 'execute_tool' and item.get('command')]
+                    target = self._command_target(command)
+                    same_target = sum(self._command_target(old) == target for old in recent_commands[-4:])
+                    if target and same_target >= 2:
+                        self._fact(s, '同一工具目标已连续尝试多次；请在一次脚本中完成剩余步骤或直接提交，不要逐页/逐次重复调用')
                     if (s.get('taskKind') == 'api'
                             and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
                         s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
@@ -1657,6 +1664,15 @@ class PioneerTaskSolver:
             s['history'].append({'llmError': str(e), 'response': state.llm_resp[:6000],
                                  'errors': [err.description for err in state.errors]})
             s['stage'] = 'ask'
+
+    @staticmethod
+    def _command_target(command):
+        """Return a coarse target fingerprint without interpreting task semantics."""
+        text = re.sub(r'\s+', ' ', str(command or '')).strip()
+        urls = re.findall(r'https?://[^\s"\'`]+', text)
+        if urls:
+            return re.sub(r'[?&](?:page|offset|cursor|limit|size)=[^& ]*', '', urls[0])
+        return text[:240] if text else ''
 
     def _consume_submit(self, state, s):
         pioneer_id = s.get('pioneer')
