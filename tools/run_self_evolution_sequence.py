@@ -10,6 +10,9 @@ import argparse
 import json
 import tempfile
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.agent.local_task_env import LocalTaskEnvironment
 from tools.run_local_task import DashScopeLLM, LocalTaskDriver
