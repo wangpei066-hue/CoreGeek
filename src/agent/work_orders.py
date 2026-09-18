@@ -204,14 +204,19 @@ def wall_feasible_target(state, blocked=None):
 
 
 def remaining_wall_slots(state):
-    """按优先级排序的、当前仍缺的墙位：关键缺口在前。"""
+    """按优先级排序的、当前仍缺的墙位：迎敌正面未封时正面排在最前。"""
     from .brain import own_station
-    from .opening import primary_wall_plan, survival_wall_plan
+    from .opening import critical_wall_missing, primary_wall_plan, survival_wall_plan
     base = own_station(state)
     if base is None:
         return []
     existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles
                 if r.role_type == 'wall' and r.health > 0}
+    front = [p for p in critical_wall_missing(state)]
+    if front:
+        rest = [p for p in primary_wall_plan(state, base)
+                if p not in existing and p not in front]
+        return front + rest
     critical = [p for p in survival_wall_plan(state, base) if p not in existing]
     # primary_wall_plan 已是 U 形顺序：正面中心 → 两翼由前往后。不要再按 (x, y)
     # 字典序排，否则左半图会先拿到后沿两角。

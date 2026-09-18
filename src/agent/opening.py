@@ -12,6 +12,7 @@ from .decision_log import trace, selected
 WALL_MARGIN = 2
 STONE_BATCH = 6  # 墙阶段两名工人各备半圈，减少往返。
 MUSTER_BUFFER = 3
+BUILDER_NIGHT_POST_SLACK = 1  # 施工工回双火箭位多留 1 回合，避免站墙格/绕路导致入夜第一回合还在路上。
 # 75/76 只是观测到的开火时点，不再推迟官方入夜（cycle 70）后的远程经济。
 DAY1_L2_GUNNER_READY_CYCLE = 75
 DAY1_OTHER_READY_CYCLE = 76
@@ -209,14 +210,26 @@ def step_off_construction(role, state, blocked, reserved):
         return None
     yard = courtyard_cells(state, base) if base else set()
     ring = set(wall_ring(state, base)) if base else set()
+    here = (role.pos.x, role.pos.y)
+    # 队友会让开，不把他们当永久墙；否则四人挤在墙格上就下不来。
+    obstacles = mobile_walkable(state, blocked, reserved) - {here}
     options = []
     for step in neighbors8(role.pos, state.map_info.width, state.map_info.height):
         key = (step.x, step.y)
-        if key in blocked | reserved:
+        if key in obstacles | reserved:
             continue
         attack = bool(base and attack_side_of_front(state, base, step))
         rank = (0 if key in yard else 1, 1 if key in ring else 0, 1 if attack else 0, key)
         options.append((rank, key, step))
+    if not options:
+        # 邻格被本回合预留占住时仍可迈出去：预留只是队友落点，站着空转更糟。
+        for step in neighbors8(role.pos, state.map_info.width, state.map_info.height):
+            key = (step.x, step.y)
+            if key in obstacles:
+                continue
+            attack = bool(base and attack_side_of_front(state, base, step))
+            rank = (2, 1 if key in ring else 0, 1 if attack else 0, key)
+            options.append((rank, key, step))
     if not options:
         return None
     _rank, key, step = min(options)
@@ -281,10 +294,11 @@ def _yard_reaches_wall(entry, target, obstacles, yard, width, height):
 
 
 def wall_approach_path(role, target, blocked, state, extra_avoid=()):
-    """从院子内侧接近墙。已经贴着施工格就地建造；在院内不许出院绕行。
+    """从院子内侧接近墙。已经贴着施工格就地建造。
 
     未砌的墙格不能当障碍：否则工人会被逼着贴迎敌墙外侧绕完整条墙线。
-    也不再优先走「完全避开墙线」的远路——那会把人送到后沿再绕回来。
+    院内能走到施工邻格就不出院；只有被基地/炮台分成口袋、内侧走不通时，
+    才从后方/翼侧绕到另一侧，仍禁止贴迎敌墙外侧横向绕行。
     """
     base = next((r for r in state.team_our.roles if r.role_type == 'station'), None)
     if base is None:
@@ -298,11 +312,10 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
     if yard and here not in yard:
         enter = enter_courtyard_path(role, obstacles, state, toward=target)
         if enter is not None:
-            # 进院后在院内（不许出院）够不到的缺口，院外也判不可达；
-            # 否则院外“迈进一步可达”、进院又“不可达”转身出去，在门口来回。
-            if enter and not _yard_reaches_wall(enter[-1], target, obstacles, yard, width, height):
-                return None
-            return enter
+            # 只走进去后仍能贴到缺口的口袋。南侧口袋被炮台堵住时不要进了又出院，
+            # 改从后方绕到能施工的一侧。
+            if (not enter) or _yard_reaches_wall(enter[-1], target, obstacles, yard, width, height):
+                return enter
     obstacles.add((target.x, target.y))
     direction = attack_direction(state, base)
     wall_dist = chebyshev(target, Pos(base.pos.x, base.pos.y))
@@ -324,7 +337,22 @@ def wall_approach_path(role, target, blocked, state, extra_avoid=()):
         return None
     if here in yard:
         interior = obstacles | _outside_stay_blockers(yard | {here}, width, height, here)
-        return path_to_any(role.pos, goals, interior, width, height)
+        path = path_to_any(role.pos, goals, interior, width, height)
+        if path is not None:
+            return path
+        # 院内被基地/炮台分成互不连通的口袋时，允许从后方/翼侧绕到另一侧贴缺口，
+        # 仍禁止贴迎敌墙外侧横向绕行。
+        avoid_attack = {(x, y) for x in range(width) for y in range(height)
+                        if (x, y) != here and attack_side_of_front(state, base, Pos(x, y))}
+        detour = path_to_any(role.pos, goals, obstacles | avoid_attack, width, height)
+        if detour is not None and not _path_wraps_attack_front(state, base, detour):
+            return detour
+        return None
+    avoid_attack = {(x, y) for x in range(width) for y in range(height)
+                    if (x, y) != here and attack_side_of_front(state, base, Pos(x, y))}
+    detour = path_to_any(role.pos, goals, obstacles | avoid_attack, width, height)
+    if detour is not None and not _path_wraps_attack_front(state, base, detour):
+        return detour
     return path_to_any(role.pos, goals, obstacles, width, height)
 
 
@@ -1346,7 +1374,7 @@ def can_extend_walls(state, role=None):
 
 
 def due_wall_gaps(state, role=None):
-    """本回合该砌的墙：先迎敌正面（怪物刷新方向），再生存墙两翼，夜前有余量才补其余 U 形。
+    """本回合该砌的墙：先迎敌正面（怪物刷新方向），再生存墙两翼，入夜窗口才停补其余 U 形。
 
     施工工、选格、寻路、采石批次都只看这一份列表。正面某格建造失败时跳过，不卡住侧翼。
     """
@@ -1361,9 +1389,9 @@ def due_wall_gaps(state, role=None):
         return []
     if can_extend_walls(state, role):
         return extra
-    # 白天还早时不要因为「一段墙估价过大」把缺口从名单拿掉，否则施工工解锁去采铜/空转。
-    from .brain import WALL_UPGRADE_DUSK_WINDOW
-    if day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW:
+    # 估价说「这一段当天修不完」也不能提前把缺口拿掉：人手上有石时仍该走近去砌。
+    # 真正停手只看入夜窗口（只够走回夜防岗位），不要用升级用的 20 回合窗口当停工线。
+    if not dusk_must_return(state, role):
         return extra
     return []
 
@@ -1373,8 +1401,15 @@ def defense_wall_missing(state, role=None):
     return due_wall_gaps(state, role)
 
 
+def _builder_night_post_slack(state, role):
+    from .opening_schedule import opening_worker_mode
+    if role is None or opening_worker_mode(state, role) != 'builder':
+        return 0
+    return BUILDER_NIGHT_POST_SLACK
+
+
 def dusk_must_return(state, role=None):
-    """入夜窗口：剩下的回合只够走到夜防岗位。施工工按到双火箭共用位估时。"""
+    """入夜窗口：剩下的回合只够走到夜防岗位。施工工按到双火箭共用位估时，并多留 1 回合。"""
     remaining = defense_rounds_remaining(state, role)
     if remaining <= 0:
         return True
@@ -1384,7 +1419,7 @@ def dusk_must_return(state, role=None):
     gun = station_return_steps(role, state, blocked)
     if gun is None:
         gun = MUSTER_BUFFER
-    return remaining <= gun
+    return remaining <= gun + _builder_night_post_slack(state, role)
 
 
 def last_adjacent_wall_ok(state, role):
@@ -1398,7 +1433,7 @@ def last_adjacent_wall_ok(state, role):
     gun = station_return_steps(role, state, blocked)
     if gun is None:
         gun = MUSTER_BUFFER
-    if remaining != gun + 1:
+    if remaining != gun + 1 + _builder_night_post_slack(state, role):
         return False
     due = due_wall_gaps(state, role)
     return any(chebyshev(role.pos, Pos(*p)) == 1 for p in due)
@@ -1615,7 +1650,13 @@ def builder_move_to_dual_rockets(role, state, blocked, reserved, reason):
     if weapon is None:
         return None
     path = weapon_approach_path(role, weapon, blocked, reserved, state)
-    return move_on_path(state, role, path, reserved, reason)
+    cmd = move_on_path(state, role, path, reserved, reason)
+    if cmd:
+        return cmd
+    greedy = step_toward_wall_gap(role, (weapon.pos.x, weapon.pos.y), blocked, reserved, state)
+    if greedy:
+        return move_on_path(state, role, greedy, reserved, reason)
+    return None
 
 
 def move_on_path(state, role, path, reserved, reason):
@@ -2263,11 +2304,22 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             return True, cmd
-        # 白天砌不上就停在缺口旁等下一回合，不要改去双火箭位来回跑。
+        adjacent = any(chebyshev(role.pos, Pos(*p)) == 1 for p in missing)
+        if adjacent:
+            # 已经贴着缺口：这一回合砌令发不出，停一回合，不要改去炮位来回跑。
+            trace(state, role.id, 'builder_hold_at_gap',
+                  '手里有石且贴着缺口，本回合砌令发不出，留在施工任务上',
+                  stones=role.backpack.count('stone'), missing=len(missing))
+            return True, None
+        retreat = interior_retreat_path(role, blocked | reserved, state)
+        if retreat:
+            cmd = move_on_path(state, role, retreat, reserved, '有石有缺口但砌不上，先回院子再施工')
+            if cmd:
+                return True, cmd
         trace(state, role.id, 'builder_hold_at_gap',
-              '手里有石但本回合砌不上，留在施工任务上不改去炮位',
+              '手里有石但本回合砌不上、人也没贴着缺口，交给后续采矿/解卡',
               stones=role.backpack.count('stone'), missing=len(missing))
-        return True, None
+        return False, None
     cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=True)
     if cmd:
         return True, cmd
@@ -2379,6 +2431,28 @@ def builder_unjam_walls(role, state, blocked, reserved, allow_mine=True):
             cmd = move_on_path(state, role, greedy_best[1], reserved, 'BFS接近失败，朝缺口迈一步避免空转')
             if cmd:
                 return cmd
+        here = (role.pos.x, role.pos.y)
+        ring = set(wall_ring(state, base))
+        if here in ring:
+            cmd = step_off_construction(role, state, blocked, reserved)
+            if cmd:
+                return cmd
+        for point in due_wall_gaps(state, role):
+            if point in reserved:
+                continue
+            if (point[0], point[1], 'wall') in state.failed_build_spots:
+                continue
+            if chebyshev(role.pos, Pos(*point)) == 1:
+                reserved.add(point)
+                return selected(state, role.id, {'action': 'build', 'name': 'wall', 'targetPos': [{'x': point[0], 'y': point[1]}]},
+                                '有石且贴着缺口，safe_wall 全拒也先封上避免空转')
+        due = due_wall_gaps(state, role)
+        if due:
+            greedy = step_toward_wall_gap(role, due[0], blocked, reserved, state)
+            if greedy:
+                cmd = move_on_path(state, role, greedy, reserved, '有石有缺口，朝迎敌面迈一步避免空转')
+                if cmd:
+                    return cmd
         return None
     if not in_courtyard(state, base, role.pos):
         # 没石头时先去采石，不要空手走回家再出门。
@@ -2644,6 +2718,7 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
 
     本回合只认一个目标：sticky 仍在名单且走得到就继续；否则接在已有墙上。
     迎敌正面永远先于两翼；同一圈优先补更短的那一侧，贴着人的先砌以省步数。
+    迎敌面未封时丢掉侧翼 sticky。safe_wall 全拒时仍走向/贴着缺口，避免空转。
     返回 (point, path)；path==[] 表示已贴着可砌。
     """
     from .brain import own_station
@@ -2660,14 +2735,15 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
     mid_y = defense_mid_y(state, base) if base is not None else 0
     existing_top = sum(1 for e in existing if e[1] > mid_y)
     existing_bot = sum(1 for e in existing if e[1] < mid_y)
+    front_open = any(tuple(p)[0] == front for p in candidates)
 
-    def usable(point):
+    def usable(point, ignore_safe=False):
         point = tuple(point)
         if point not in order:
             return None
         if point in occupied or (*point, 'wall') in state.failed_build_spots:
             return None
-        if not safe_wall(state, point, set(blocked) | set(claimed), assignments):
+        if not ignore_safe and not safe_wall(state, point, set(blocked) | set(claimed), assignments):
             if role is None or chebyshev(role.pos, Pos(*point)) != 1:
                 return None
         if role is None:
@@ -2691,21 +2767,30 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
 
     if sticky:
         sticky = tuple(sticky)
-        path = usable(sticky)
-        if path is not None:
-            return sticky, path
+        if front_open and sticky[0] != front:
+            sticky = ()
+        else:
+            path = usable(sticky)
+            if path is not None:
+                return sticky, path
 
-    ranked = []
-    for point in candidates:
-        point = tuple(point)
-        path = usable(point)
-        if path is None:
-            continue
-        adj_exist = any(chebyshev(Pos(*point), Pos(*e)) == 1 for e in existing)
-        isolated = 0 if (not existing or adj_exist) else 1
-        walk = 0 if path == [] else len(path)
-        front_first = 0 if point[0] == front else 1
-        ranked.append((front_first, isolated, side_bias(point), depth(point), walk, order[point], point, path))
+    def rank_all(ignore_safe=False):
+        ranked = []
+        for point in candidates:
+            point = tuple(point)
+            path = usable(point, ignore_safe=ignore_safe)
+            if path is None:
+                continue
+            adj_exist = any(chebyshev(Pos(*point), Pos(*e)) == 1 for e in existing)
+            isolated = 0 if (not existing or adj_exist) else 1
+            walk = 0 if path == [] else len(path)
+            front_first = 0 if point[0] == front else 1
+            ranked.append((front_first, isolated, side_bias(point), depth(point), walk, order[point], point, path))
+        return ranked
+
+    ranked = rank_all(False)
+    if not ranked:
+        ranked = rank_all(True)
     if not ranked:
         return None, None
     ranked.sort()
@@ -2719,6 +2804,15 @@ def claim_opening_wall(role, state, candidates, blocked, reserved, claimed, assi
     if sticky and sticky not in {tuple(p) for p in candidates}:
         state.policy_memory.get('opening_wall_targets', {}).pop(str(role.id), None)
         sticky = ()
+    elif sticky:
+        from .brain import own_station
+        base = own_station(state)
+        if base is not None:
+            left, right, _bottom, _top = defense_bounds(state, base)
+            front = right if attack_direction(state, base) == 1 else left
+            if sticky[0] != front and any(tuple(p)[0] == front for p in candidates):
+                state.policy_memory.get('opening_wall_targets', {}).pop(str(role.id), None)
+                sticky = ()
 
     skipped = set()
     while True:
@@ -2765,8 +2859,14 @@ def opening_worker_survival_action(role, state, blocked, reserved, claimed, assi
     batch_target = min(STONE_BATCH, cap or STONE_BATCH, len(missing)) if missing else 0
     urgent_ready = stones > 0 and day_rounds_remaining(state.round_no) <= MUSTER_BUFFER + 6
     batch_ready = stones >= batch_target if batch_target else stones > 0
+    front = [tuple(p) for p in _buildable_wall_points(state, critical_wall_missing(state))]
+    if front:
+        missing = front
     if stones > 0 and missing and (full or batch_ready or urgent_ready):
         cmd = claim_opening_wall(role, state, missing, blocked, reserved, claimed, assignments)
+        if cmd:
+            return cmd, 'BUILD_SURVIVAL_WALL'
+        cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             return cmd, 'BUILD_SURVIVAL_WALL'
     if worker_has_metal(role, state) and stones == 0 and full:

@@ -2,7 +2,7 @@
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.protocol import PlayerTask, Pos, RobotRole, Zone
+from src.agent.protocol import PlayerTask, Pos, RobotRole, ShopItem, Zone
 from test_opening import opening_state
 from test_shop_items import make_role
 
@@ -458,6 +458,72 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         if cmd.get('action') == 'build':
             self.fail('入夜窗口不该去砌侧翼/后沿: %s' % cmd)
 
+    def test_day2_cycle50_extra_walls_stay_on_due_list(self):
+        """离入夜还有 20 回合时，侧翼/后沿缺口必须还在施工名单里，不能按升级窗口提前清空。"""
+        from src.agent.opening import due_wall_gaps, extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        self.assertTrue(extra_wall_missing(state))
+        self.assertTrue(due_wall_gaps(state, builder))
+
+    def test_day2_cycle50_builder_does_not_idle_waiting_for_l3_gold(self):
+        """#1512 R180：手里有石、墙没齐、差 150 金升 3 级，不能连续空转。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        state.team_our.gold_num = 84
+        state.weapon_shop_list = [
+            ShopItem('WeaponUpgradeVoucher1', 100),
+            ShopItem('WeaponUpgradeVoucher2', 150),
+        ]
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
+    def test_unaffordable_weapon_job_does_not_freeze_builder_with_stones(self):
+        """升级任务金不够时保留目标，但本回合必须去砌墙或采矿，不能站着等 150 金。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        state.team_our.gold_num = 84
+        state.weapon_shop_list = [
+            ShopItem('WeaponUpgradeVoucher1', 100),
+            ShopItem('WeaponUpgradeVoucher2', 150),
+        ]
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        rocket = next(r for r in state.team_our.roles if r.id == 20)
+        state.worker_item_jobs[builder.id] = {
+            'item': 'WeaponUpgradeVoucher2',
+            'target': (rocket.pos.x, rocket.pos.y),
+            'kind': 'weapon',
+        }
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
     def _builder_beside_front_railgun(self, remaining=None, backpack=None, open_front_gap=True):
         """正式布局 C：施工工贴着正面电磁炮，可选拆掉贴身墙缺口。"""
         from src.agent.grid import build_blocked_set
@@ -526,18 +592,61 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertTrue(path)
         self.assertEqual(dest, (path[0].x, path[0].y), dest)
 
-    def test_builder_last_adjacent_wall_ok_then_must_return(self):
-        """回岗位前刚好多 1 回合且贴着缺口：允许砌最后一块；再少一回合就必须走。"""
-        from src.agent.opening import last_adjacent_wall_ok, worker_should_build_walls
+    def test_builder_starts_returning_one_round_before_exact_travel(self):
+        """施工工入夜前多留 1 回合回双火箭，避免第一夜还在路上。"""
+        from src.agent.opening import BUILDER_NIGHT_POST_SLACK, dusk_must_return, worker_should_build_walls
         state, builder, gun = self._builder_beside_front_railgun()
         self.assertGreater(gun, 1)
-        state.round_no = 130 + (70 - (gun + 1))
+        state.round_no = 130 + (70 - (gun + BUILDER_NIGHT_POST_SLACK))
+        self.assertTrue(dusk_must_return(state, builder))
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'move', cmd)
+
+    def test_first_night_builder_goes_to_shared_stand_not_one_rocket(self):
+        """入夜第一回合即使贴着一门火箭，也要先走到共用位，才能操作两门。"""
+        from src.agent.opening import shared_rocket_stand_cells
+        from src.agent.grid import build_blocked_set
+        state = self._dual_rocket_night()
+        state.round_no = 70
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 9)  # 贴着火箭 (9,9)，但不是两门共用位
+        economist.pos = Pos(4, 11)
+        pioneer.pos = Pos(10, 12)
+        for rocket in (r for r in state.team_our.roles if r.role_type == 'rocket'):
+            rocket.cooldown = 0
+        state.policy_memory['weapon_assignment'] = {'1': 20, '3': 22}
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        state.robot.roles = [RobotRole(100, Pos(20, 10), 'smallRobot', 40)]
+        commands = self.decide(state)
+        self.assertFalse(any(c.get('controllerId') == str(builder.id) for c in commands.values()
+                             if c.get('action') == 'attack'), commands)
+        moved = commands.get(builder.id, {})
+        self.assertEqual(moved.get('action'), 'move', commands)
+        dest = (moved['targetPos'][0]['x'], moved['targetPos'][0]['y'])
+        stands = shared_rocket_stand_cells(state, build_blocked_set(state))
+        here = (builder.pos.x, builder.pos.y)
+        self.assertNotIn(here, stands)
+        closer = min(max(abs(dest[0] - x), abs(dest[1] - y)) for x, y in stands)
+        was = min(max(abs(here[0] - x), abs(here[1] - y)) for x, y in stands)
+        self.assertLessEqual(closer, was)
+        self.assertTrue(dest in stands or closer < was, (dest, stands))
+
+    def test_builder_last_adjacent_wall_ok_then_must_return(self):
+        """回岗位前刚好多 1+slack 回合且贴着缺口：允许砌最后一块；再少就必须走。"""
+        from src.agent.opening import BUILDER_NIGHT_POST_SLACK, last_adjacent_wall_ok, worker_should_build_walls
+        state, builder, gun = self._builder_beside_front_railgun()
+        self.assertGreater(gun, 1)
+        last_ok = gun + 1 + BUILDER_NIGHT_POST_SLACK
+        state.round_no = 130 + (70 - last_ok)
         self.assertTrue(last_adjacent_wall_ok(state, builder), gun)
         self.assertTrue(worker_should_build_walls(state, builder))
         cmd = self.decide(state).get(builder.id, {})
         self.assertEqual(cmd.get('action'), 'build', cmd)
         self.assertEqual(cmd.get('name'), 'wall')
-        state.round_no = 130 + (70 - gun)
+        state.round_no = 130 + (70 - (gun + BUILDER_NIGHT_POST_SLACK))
         self.assertFalse(worker_should_build_walls(state, builder))
         cmd = self.decide(state).get(builder.id, {})
         self.assertNotEqual(cmd.get('action'), 'build', cmd)
