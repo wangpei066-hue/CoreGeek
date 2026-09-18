@@ -1478,7 +1478,7 @@ class PioneerTaskSolver:
             ),
             'deadlineConstraint': (
                 '剩余回合不超过3：禁止再做单独的检查或探查；把最后修复、验收和证据输出合并在当前一次 execute，下一轮立即 submit。'
-                if remaining <= 3 else ''
+                if remaining <= 5 else ''
             ),
             'documents': self.session.get('documents') or [],
             'promptVersion': PROMPT_VERSION,
@@ -1486,7 +1486,7 @@ class PioneerTaskSolver:
             'experienceHit': self.session.get('experienceHit', False),
         }
         prefix = ''
-        if remaining is not None and remaining <= 3:
+        if remaining is not None and remaining <= 5:
             prefix = ('URGENT DEADLINE: only %s rounds remain. Do not perform a standalone read, probe, or verification. '
                       'If the latest evidence shows the requested state is already valid, return submit now; otherwise combine the final fix, check, and answer evidence in this one execute.\n' % remaining)
         return prefix + ''.join(parts) + json.dumps(payload, ensure_ascii=False)
