@@ -15,7 +15,7 @@ import unittest
 from src.agent import GameServer
 from src.agent.task_solver import (
     MARKER, extract_md_paths, parse_llm, sandbox_command, task_context,
-    task_fingerprint, normalize_skill, READ_SCRIPT, EXEC_SCRIPT,
+    task_fingerprint, normalize_skill, READ_SCRIPT, EXEC_SCRIPT, PROMPT_BYTE_LIMIT,
     PioneerTaskSolver,
 )
 
@@ -165,15 +165,27 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(len(self.solver.experience['skills']), 1)
         self.assertEqual(self.solver.experience['skills'][0]['evidenceLevel'], 'confirmed')
 
-    def test_submit_without_structured_skill_is_blocked(self):
+    def test_submit_without_structured_skill_does_not_sacrifice_answer(self):
         state = self._state('直接提交一个答案')
         self.solver.step(state, {})
         state = self._state(state.phase_task, round_no=11,
                             llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
-        prompt, _ = self.solver.step(state, {})
-        self.assertTrue(prompt)
-        self.assertEqual(self.solver.session['stage'], 'wait_llm')
-        self.assertTrue(any('附带skill' in str(item) for item in self.solver.session['history']))
+        commands = {}
+        self.solver.step(state, commands)
+        self.assertEqual(self.solver.session['stage'], 'wait_submit')
+        self.assertEqual(commands[1]['taskAnswer'], '42')
+        self.assertTrue(any('skillRejected' in item for item in self.solver.session['history']))
+
+    def test_skill_normalizer_coerces_common_model_shapes(self):
+        candidate = skill('coerced')
+        candidate['parameters'] = {
+            'target': {'source': '当前题面', 'validation': '非空'},
+        }
+        candidate['verification'] = '验收结果必须成功'
+        candidate['failureRecovery'] = '根据错误修正'
+        normalized = normalize_skill(candidate)
+        self.assertEqual(normalized['parameters'][0]['name'], 'target')
+        self.assertEqual(normalized['verification'], ['验收结果必须成功'])
 
     def test_multiple_unrelated_skills_coexist(self):
         first = normalize_skill(skill('first'), 'one')
@@ -186,11 +198,58 @@ class TaskSolverStepTests(unittest.TestCase):
         self.solver._remember_skill(None, self.solver.session, 'confirmed')
         self.assertEqual({x['name'] for x in self.solver.experience['skills']}, {'first', 'second'})
 
+    def test_phase_clear_after_submit_promotes_confirmed_skill(self):
+        state = self._state('直接提交一个答案')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42',
+                                                 'skill': skill('phase-clear')}))
+        self.solver.step(state, {})
+        self.assertEqual(self.solver.session['submitStatus'], 'sent')
+        self.solver.step(self._state('', round_no=12), {})
+        self.assertEqual(len(self.solver.experience['skills']), 1)
+        self.assertEqual(self.solver.experience['skills'][0]['evidenceLevel'], 'confirmed')
+
+    def test_confirmed_skill_keeps_bounded_verified_command_evidence(self):
+        candidate = normalize_skill(skill('with-evidence'), 'one')
+        self.solver.session = {
+            'skillCandidate': candidate,
+            'answer': 'SECRET-ANSWER',
+            'workspace': '/tmp/task-one',
+            'metrics': {'acceptedRound': 1},
+            'round': 3,
+            'history': [
+                {'event': 'execute_tool', 'exitCode': 1, 'command': 'bad command'},
+                {'event': 'execute_tool', 'exitCode': 0,
+                 'command': 'run /tmp/task-one --expect SECRET-ANSWER'},
+            ],
+        }
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        evidence = self.solver.experience['skills'][0]['verifiedCommands']
+        self.assertEqual(len(evidence), 1)
+        self.assertIn('<WORKSPACE>', evidence[0])
+        self.assertIn('<TASK_ANSWER>', evidence[0])
+        self.assertNotIn('bad command', evidence[0])
+
     def test_prompt_uses_base_prompt_without_task_taxonomy(self):
         state = self._state('计算1+1')
         prompt, _ = self.solver.step(state, {})
         self.assertIn('任务类型和内容不可预知', prompt)
         self.assertNotIn('taskKind', prompt)
+
+    def test_prompt_is_bounded_by_utf8_bytes(self):
+        state = self._state('超长任务' + '甲' * 30000)
+        self.solver.step(state, {})
+        self.solver.session['documents'] = [
+            {'path': '/tmp/large.md', 'content': '文档' * 30000},
+        ]
+        self.solver.session['history'] = [
+            {'event': 'execute_tool', 'output': '结果' * 20000},
+        ]
+        prompt = self.solver.make_prompt(state)
+        self.assertLessEqual(len(prompt.encode('utf-8')), PROMPT_BYTE_LIMIT)
+        self.assertIn('prompt compacted', prompt)
+        json.loads(prompt.split('当前任务上下文：', 1)[1])
 
     def test_explicit_skill_reuse_records_real_hit_and_bindings(self):
         candidate = normalize_skill(skill('reusable'), 'one')
@@ -241,6 +300,42 @@ class TaskSolverStepTests(unittest.TestCase):
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
+
+    def test_complete_shaped_tool_json_is_evidence_not_automatic_answer(self):
+        state = self._state('取得结果并提交')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'execute', 'command': 'echo result'}))
+        self.solver.step(state, {})
+        rid = self.solver.session['requestId']
+        result = json.dumps({
+            'marker': MARKER, 'requestId': rid, 'event': 'execute_tool', 'exitCode': 0,
+            'output': json.dumps({'items': [], 'total': 0, 'answer': '0'}),
+        })
+        commands = {}
+        prompt, execute = self.solver.step(
+            self._state(state.phase_task, round_no=12, last_cmd_result=result), commands)
+        self.assertTrue(prompt)
+        self.assertFalse(execute)
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertNotIn(1, commands)
+
+    def test_relative_document_tries_workspace_after_document_directory(self):
+        doc_dir = Path(self.temp.name) / 'task-docs'
+        workspace = Path(self.temp.name) / 'workspace'
+        doc_dir.mkdir()
+        workspace.mkdir()
+        (workspace / 'spec.md').write_text('workspace specification')
+        command = sandbox_command(READ_SCRIPT, {
+            'requestId': 'r-workspace', 'path': 'spec.md', 'offset': 0,
+            'documentDir': str(doc_dir), 'workspace': str(workspace),
+        })
+        result = subprocess.run(['sh', '-c', command], cwd=self.temp.name,
+                                capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout.strip())
+        self.assertEqual(payload.get('content'), 'workspace specification')
+        self.assertNotIn('error', payload)
 
     def test_rejected_submission_goes_back_to_ask(self):
         state = self._state('直接提交一个答案')

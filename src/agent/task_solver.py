@@ -33,11 +33,41 @@ BASE_PROMPT = '''你是比赛自进化任务解题器。任务类型和内容不
 或 {"action":"read","path":"说明文件路径","skillDecision":{...}}
 或 {"action":"submit","taskAnswer":"本题要求的最终答案字符串","skill":{...},"skillDecision":{...}}
 若答案要求JSON，将其序列化为taskAnswer字符串；提交必须有充分依据，需要执行或验证时应先取得真实结果。
-每次submit必须同时返回skill候选，它必须包含name、applicability(summary/requiredSignals/incompatibleSignals)、invariants、parameters(name/source/validation)、procedure、verification、failureRecovery、answerContract。它必须是对成功轨迹的反事实压缩：删除本题答案、凭据、绝对路径和实例常量，用参数槽位表达可变部分，未确证推断不得写入invariants。
+每次submit同时返回skill候选，包含name、applicability(summary/requiredSignals/incompatibleSignals)、invariants、parameters(name/source/validation)、procedure、verification、failureRecovery、answerContract。它必须是对成功轨迹的反事实压缩：保留真实验证过且后续执行必需的稳定机制常量（如精确命令形状、协议、路由、字段和验收契约）；只将新实例会变的值参数化。删除本题答案和绝对实例路径，未确证推断不得写入invariants。
 '''
 PROMPT_HASH = hashlib.sha256(
     (BASE_PROMPT + PROMPT_VERSION).encode()
 ).hexdigest()[:16]
+PROMPT_BYTE_LIMIT = 62 * 1024
+
+
+def _clip_utf8(value, byte_limit):
+    """Bound a string by encoded bytes without splitting a UTF-8 character."""
+    text = str(value or '')
+    raw = text.encode('utf-8')
+    if len(raw) <= byte_limit:
+        return text
+    marker = '\n...[prompt compacted]...\n'.encode()
+    room = max(0, byte_limit - len(marker))
+    head = int(room * 0.7)
+    tail = room - head
+    return (raw[:head].decode('utf-8', errors='ignore')
+            + marker.decode()
+            + raw[-tail:].decode('utf-8', errors='ignore'))
+
+
+def _compact_prompt_value(value, string_bytes=600, list_limit=8, depth=0):
+    if depth > 6:
+        return None
+    if isinstance(value, str):
+        return _clip_utf8(value, string_bytes)
+    if isinstance(value, list):
+        return [_compact_prompt_value(item, string_bytes, list_limit, depth + 1)
+                for item in value[-list_limit:]]
+    if isinstance(value, dict):
+        return {key: _compact_prompt_value(item, string_bytes, list_limit, depth + 1)
+                for key, item in value.items()}
+    return value
 
 
 def extract_md_paths(task):
@@ -82,46 +112,6 @@ def relevant_md_paths(task):
 def extract_task_secret(task):
     match = SECRET_RE.search(task or '')
     return match.group(1) if match else None
-
-
-def extract_json_objects(text):
-    objects = []
-    decoder = json.JSONDecoder()
-    index = 0
-    text = text or ''
-    while index < len(text):
-        if text[index] == '{':
-            try:
-                item, end = decoder.raw_decode(text, index)
-                if isinstance(item, dict):
-                    objects.append(item)
-                index = end
-                continue
-            except ValueError:
-                pass
-        index += 1
-    return objects
-
-
-def evidence_answer_candidate(documents, output):
-    """Find a complete answer object already printed by the tool.
-
-    This is schema-driven and task-agnostic: it never computes fields or
-    chooses values.  It only allows the state machine to submit an object when
-    the current task material names the same fields and the tool printed them.
-    """
-    source = '\n'.join(str(item.get('content') or '') for item in documents or [])
-    examples = extract_json_objects(source)
-    required = set()
-    for item in examples:
-        if len(item) >= 2:
-            required.update(str(key) for key in item)
-    if len(required) < 2:
-        return None
-    for item in reversed(extract_json_objects(output)):
-        if required.issubset(item.keys()):
-            return json.dumps(item, ensure_ascii=False, separators=(',', ':'))
-    return None
 
 
 def match_key(state):
@@ -263,11 +253,15 @@ try:
 
     if os.path.isabs(name):
         consider(name)
-    elif doc_dir:
-        consider(os.path.join(doc_dir, name))
-    elif workspace:
-        consider(os.path.join(workspace, name))
     else:
+        # A task document may live beside, rather than inside, its explicitly
+        # declared workspace.  Try both deterministic bases before searching.
+        if doc_dir:
+            consider(os.path.join(doc_dir, name))
+        if workspace:
+            consider(os.path.join(workspace, name))
+        paths = list(dict.fromkeys(paths))
+    if not paths:
         consider(name)
         if not paths:
             started = time.monotonic()
@@ -414,7 +408,7 @@ def _bounded_json(value, depth=0):
 
 
 def normalize_skill(candidate, source_fingerprint=None):
-    """验证内容无关的可实例化 Skill schema。"""
+    """宽容地归一化模型生成的可实例化 Skill。"""
     if not isinstance(candidate, dict):
         raise ValueError('submit必须附带skill对象')
     name = candidate.get('name')
@@ -426,9 +420,19 @@ def normalize_skill(candidate, source_fingerprint=None):
     for key in ('requiredSignals', 'incompatibleSignals'):
         if not isinstance(applicability.get(key), list):
             raise ValueError('skill.applicability.%s必须为列表' % key)
+    candidate = dict(candidate)
     for key in SKILL_LIST_FIELDS:
-        if not isinstance(candidate.get(key), list):
-            raise ValueError('skill.%s必须为列表' % key)
+        value = candidate.get(key)
+        if isinstance(value, dict) and key == 'parameters':
+            candidate[key] = [dict({'name': name}, **(item if isinstance(item, dict)
+                                                       else {'description': item}))
+                              for name, item in value.items()]
+        elif isinstance(value, str) and value.strip():
+            candidate[key] = [value]
+        elif value is None:
+            candidate[key] = []
+        elif not isinstance(value, list):
+            candidate[key] = [value]
     if not candidate.get('procedure') or not candidate.get('verification'):
         raise ValueError('skill必须包含非空procedure和verification')
     if not isinstance(candidate.get('answerContract'), (str, dict, list)):
@@ -674,6 +678,19 @@ class PioneerTaskSolver:
         success_count = int((previous or {}).get('successCount') or 0)
         if evidence_level == 'confirmed':
             success_count += 1
+        # Keep a small piece of ground truth with the model-authored
+        # abstraction.  This is deliberately content agnostic: any command
+        # that really completed with exit code 0 can help the next model
+        # recover details which were accidentally omitted from `procedure`.
+        # The next task still has to bind its own instance values and verify
+        # the result; these commands are evidence, not an instruction to copy.
+        verified_commands = []
+        for event in s.get('history') or []:
+            if (event.get('event') == 'execute_tool'
+                    and event.get('exitCode') == 0
+                    and event.get('command')):
+                verified_commands.append(
+                    self._sanitize_skill(event['command'], s, s.get('answer')))
         record.update(
             evidenceLevel=evidence_level,
             learnedAt=state.round_no if state is not None else s.get('round'),
@@ -684,6 +701,7 @@ class PioneerTaskSolver:
                            if x.get('event') in ('execute_tool', 'read_document')]),
             successCount=success_count,
             confidence=min(0.95, 0.5 + 0.1 * success_count) if success_count else 0.25,
+            verifiedCommands=verified_commands[-3:],
         )
         key = 'skills' if evidence_level == 'confirmed' else 'provisionalSkills'
         items = [x for x in self.experience.get(key) or []
@@ -697,11 +715,6 @@ class PioneerTaskSolver:
         workspace = str(session.get('workspace') or '')
         if workspace:
             value = value.replace(workspace, '<WORKSPACE>')
-        # Credentials and task-specific answer literals must never become a
-        # reusable skill.  Keep command shape and flags so a later LLM can
-        # parameterize it against the new task.
-        value = re.sub(r'(?i)(authorization\s*:\s*(?:bearer\s+)?)[^\s"\']+', r'\1<SECRET>', value)
-        value = re.sub(r'(?i)(api[_-]?key|token)([=:\s]+)[^\s"\']+', r'\1\2<SECRET>', value)
         return value[:3000]
 
     def _sanitize_skill(self, value, session, answer=None):
@@ -837,14 +850,6 @@ class PioneerTaskSolver:
         if result.get('error') or (result.get('exitCode') not in (None, 0) and result.get('event') == 'execute_tool'):
             self._record_failure(
                 s, 'execute', command, s.get('workspace'), classify_tool_error(result) or 'nonzero_exit')
-        if result.get('event') == 'execute_tool':
-            candidate = evidence_answer_candidate(
-                s.get('documents'), str(result.get('output') or result.get('outputTail') or ''))
-            if candidate:
-                s['answer'] = candidate
-                s['metrics']['answerReadyRound'] = state.round_no
-                s['stage'] = 'submit'
-                return execute
         s['stage'] = 'ask'
         return execute
 
@@ -880,23 +885,25 @@ class PioneerTaskSolver:
                     s['skillCandidate'] = normalize_skill(
                         answer.get('skill'), s.get('fingerprint'))
                 except ValueError as exc:
-                    s['history'].append({'blocked': str(exc)})
-                    self._fact(s, '提交前必须返回完整、可实例化的结构化skill：%s' % exc)
-                    s['stage'] = 'ask'
-                    return
+                    # Never sacrifice a verified task answer merely because
+                    # the auxiliary learning artifact is malformed.
+                    s.pop('skillCandidate', None)
+                    s['history'].append({'skillRejected': str(exc)})
+                    self._fact(s, '本次skill候选无效，但不阻断当前答案提交：%s' % exc)
                 answer_text = answer['taskAnswer'].strip()
-                sanitized = self._sanitize_skill(s['skillCandidate'], s, answer_text)
-                s['skillCandidate'] = normalize_skill(sanitized, s.get('fingerprint'))
-                parent_id = decision.get('skillId')
-                parent = next((item for item in self.experience.get('skills') or []
-                               if item.get('skillId') == parent_id), None)
-                if decision['decision'] == 'adapt' and parent:
-                    s['skillCandidate']['parentSkillId'] = parent_id
-                    s['skillCandidate']['version'] = int(parent.get('version') or 1) + 1
-                elif decision['decision'] == 'reuse' and parent:
-                    s['skillCandidate']['version'] = int(parent.get('version') or 1)
-                else:
-                    s['skillCandidate']['version'] = 1
+                if s.get('skillCandidate'):
+                    sanitized = self._sanitize_skill(s['skillCandidate'], s, answer_text)
+                    s['skillCandidate'] = normalize_skill(sanitized, s.get('fingerprint'))
+                    parent_id = decision.get('skillId')
+                    parent = next((item for item in self.experience.get('skills') or []
+                                   if item.get('skillId') == parent_id), None)
+                    if decision['decision'] == 'adapt' and parent:
+                        s['skillCandidate']['parentSkillId'] = parent_id
+                        s['skillCandidate']['version'] = int(parent.get('version') or 1) + 1
+                    elif decision['decision'] == 'reuse' and parent:
+                        s['skillCandidate']['version'] = int(parent.get('version') or 1)
+                    else:
+                        s['skillCandidate']['version'] = 1
                 s['answer'] = answer['taskAnswer']
                 s['stage'] = 'submit'
                 s['metrics']['answerReadyRound'] = state.round_no
@@ -1054,10 +1061,15 @@ class PioneerTaskSolver:
                     # after submit is the platform-level success signal;
                     # preserve the explored procedure for the next task.
                     if status == 'sent':
-                        self._remember_skill(state, self.session, 'phase_cleared_unconfirmed')
-                    self.session['endReason'] = 'phase_cleared_after_submit_unconfirmed'
-                    self.session['submitStatus'] = 'cleared_unconfirmed'
-                    self._archive_current('phase_cleared_unconfirmed', state.round_no)
+                        failed = any(err.error_code in (1, 2, 4) for err in state.errors)
+                        evidence = 'phase_cleared_rejected' if failed else 'confirmed'
+                        self._remember_skill(state, self.session, evidence)
+                        self.session['submitStatus'] = 'cleared_rejected' if failed else 'accepted'
+                    reason = ('phase_cleared_after_submit_rejected'
+                              if self.session.get('submitStatus') == 'cleared_rejected'
+                              else 'phase_cleared_after_submit')
+                    self.session['endReason'] = reason
+                    self._archive_current(reason, state.round_no)
                 elif self.session.get('stage') in INCOMPLETE_STAGES:
                     self.session['endReason'] = 'phase_task_cleared'
                     self._archive_current('phase_task_cleared', state.round_no)
@@ -1078,7 +1090,8 @@ class PioneerTaskSolver:
             if s.get('submitStatus') == 'sent':
                 # Same promotion rule when the next task is delivered
                 # directly instead of an empty phaseTask round.
-                self._remember_skill(state, s, 'phase_changed_unconfirmed')
+                failed = any(err.error_code in (1, 2, 4) for err in state.errors)
+                self._remember_skill(state, s, 'phase_changed_rejected' if failed else 'confirmed')
             if s.get('stage') in INCOMPLETE_STAGES:
                 self._archive_current('phase_task_changed', state.round_no)
             fingerprint = task_fingerprint(state.phase_task)
@@ -1260,6 +1273,8 @@ class PioneerTaskSolver:
             'skillGuidance': (
                 '不预设任务类型。逐个检查候选Skill的适用条件和冲突条件，并在每次回复的skillDecision中'
                 '明确记录reuse/adapt/reject。没有可靠匹配时从当前材料探索，不得强行套用。'
+                'verifiedCommands是上次成功任务的真实执行证据，不是可直接照抄的指令；先区分稳定机制与实例值，'
+                '重新绑定本题参数，并以本题验收结果确认。'
             ),
             'goal': {
                 'stage': self.session.get('stage'),
@@ -1298,9 +1313,62 @@ class PioneerTaskSolver:
         prefix = ''
         if remaining is not None and remaining <= 5:
             prefix = ('URGENT DEADLINE: only %s rounds remain. Do not perform a standalone read, probe, or verification. '
-                      'If the latest tool output contains a complete JSON object with the fields requested by the current task, you MUST return submit now using that object verbatim. '
-                      'Only when no complete answer object exists may you perform one minimal fix execute, then submit immediately.\n' % remaining)
-        return prefix + BASE_PROMPT + '\n当前任务上下文：' + json.dumps(payload, ensure_ascii=False)
+                      'Submit immediately only when the latest evidence satisfies the task semantic success criteria; matching a requested JSON shape alone is not proof of success. '
+                      'Otherwise perform one minimal corrective execute with its validation included, then submit immediately.\n' % remaining)
+        def render():
+            return prefix + BASE_PROMPT + '\n当前任务上下文：' + json.dumps(payload, ensure_ascii=False)
+
+        prompt = render()
+        if len(prompt.encode('utf-8')) > PROMPT_BYTE_LIMIT:
+            documents = []
+            source_documents = payload.get('documents') or []
+            per_document = max(1200, 24000 // max(1, min(len(source_documents), 8)))
+            for document in source_documents[-8:]:
+                compact = _compact_prompt_value(document, 600, 6)
+                if isinstance(compact, dict) and isinstance(document, dict):
+                    for key in ('content', 'output', 'outputTail'):
+                        if key in document:
+                            compact[key] = _clip_utf8(document[key], per_document)
+                documents.append(compact)
+            payload['documents'] = documents
+            payload['recentResults'] = _compact_prompt_value(payload.get('recentResults', [])[-4:], 900, 6)
+            experience = payload.get('experience') or {}
+            payload['experience'] = {
+                'skills': _compact_prompt_value((experience.get('skills') or [])[-4:], 350, 6)
+            }
+            payload['facts'] = _compact_prompt_value(payload.get('facts', [])[-12:], 400, 8)
+            payload['failedActions'] = _compact_prompt_value(payload.get('failedActions', [])[-8:], 400, 6)
+            payload['promptCompacted'] = True
+            prompt = render()
+        if len(prompt.encode('utf-8')) > PROMPT_BYTE_LIMIT:
+            payload['task'] = _clip_utf8(payload.get('task'), 10000)
+            payload['currentTask'] = _clip_utf8(payload.get('currentTask'), 6000)
+            payload['cachedTaskDescription'] = _clip_utf8(payload.get('cachedTaskDescription'), 6000)
+            payload['documents'] = _compact_prompt_value(payload.get('documents', [])[-4:], 700, 4)
+            payload['recentResults'] = _compact_prompt_value(payload.get('recentResults', [])[-2:], 500, 4)
+            payload['experience'] = _compact_prompt_value(payload.get('experience'), 180, 4)
+            payload['lastToolOutput'] = _clip_utf8(payload.get('lastToolOutput'), 2500)
+            prompt = render()
+        if len(prompt.encode('utf-8')) > PROMPT_BYTE_LIMIT:
+            # Keep the JSON envelope valid even for adversarially large input.
+            # Whole-prompt byte slicing would corrupt the model protocol.
+            payload = {
+                'requestId': self.session.get('requestId'),
+                'instanceId': self.session.get('instanceId'),
+                'task': _clip_utf8(self.session.get('taskDescription') or state.phase_task, 8000),
+                'currentTask': _clip_utf8(state.phase_task, 4000),
+                'workspace': self.session.get('workspace'),
+                'documentDir': self.session.get('documentDir'),
+                'experience': _compact_prompt_value(
+                    {'skills': (self._relevant_experience(self.session, state.phase_task)['skills'])[-1:]},
+                    160, 3),
+                'recentResults': _compact_prompt_value((self.session.get('history') or [])[-2:], 350, 3),
+                'lastToolOutput': _clip_utf8(self._last_tool_output(), 1800),
+                'goal': {'stage': self.session.get('stage'), 'remainingRoundsEstimate': remaining},
+                'promptCompacted': True,
+            }
+            prompt = render()
+        return prompt
 
     def _last_tool_output(self):
         """Expose the latest concrete evidence without requiring history search."""
