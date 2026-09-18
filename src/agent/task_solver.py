@@ -1183,6 +1183,13 @@ class PioneerTaskSolver:
             if self.session:
                 status = self.session.get('submitStatus')
                 if status in ('accepted', 'sent', 'cleared_unconfirmed'):
+                    # Some platforms advance phaseTask immediately after a
+                    # successful final submission, so no later round carries
+                    # an explicit accepted callback.  A phase clear/change
+                    # after submit is the platform-level success signal;
+                    # preserve the explored procedure for the next task.
+                    if status == 'sent':
+                        self._remember_skill(state, self.session)
                     self.session['endReason'] = 'phase_cleared_after_submit_unconfirmed'
                     self.session['submitStatus'] = 'cleared_unconfirmed'
                     self._archive_current('phase_cleared_unconfirmed', state.round_no)
@@ -1203,6 +1210,10 @@ class PioneerTaskSolver:
             self.experience = empty_experience(match_key(state))
             s = self.session = self._new_session(key, state)
         elif s.get('key') != key:
+            if s.get('submitStatus') == 'sent':
+                # Same promotion rule when the next task is delivered
+                # directly instead of an empty phaseTask round.
+                self._remember_skill(state, s)
             if s.get('stage') in INCOMPLETE_STAGES:
                 self._archive_current('phase_task_changed', state.round_no)
             fingerprint = task_fingerprint(state.phase_task)
