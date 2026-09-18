@@ -146,6 +146,27 @@ def extract_json_objects(text):
     return objects
 
 
+def evidence_answer_candidate(documents, output):
+    """Find a complete answer object already printed by the tool.
+
+    This is schema-driven and task-agnostic: it never computes fields or
+    chooses values.  It only allows the state machine to submit an object when
+    the current task material names the same fields and the tool printed them.
+    """
+    source = '\n'.join(str(item.get('content') or '') for item in documents or [])
+    examples = extract_json_objects(source)
+    required = set()
+    for item in examples:
+        if len(item) >= 2:
+            required.update(str(key) for key in item)
+    if len(required) < 2:
+        return None
+    for item in reversed(extract_json_objects(output)):
+        if required.issubset(item.keys()):
+            return json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+    return None
+
+
 def dotted_get(data, path):
     current = data
     for part in (path or '').split('.'):
@@ -1023,6 +1044,14 @@ class PioneerTaskSolver:
             return execute
         if result.get('convertedCrlf'):
             self._fact(s, '执行前已转换CRLF: %s' % ','.join(result['convertedCrlf']))
+        if result.get('event') in ('execute_tool', 'api_curl'):
+            candidate = evidence_answer_candidate(
+                s.get('documents'), str(result.get('output') or result.get('outputTail') or ''))
+            if candidate:
+                s['answer'] = candidate
+                s['metrics']['answerReadyRound'] = state.round_no
+                s['stage'] = 'submit'
+                return execute
         if s.get('taskKind') == 'workspace':
             s['llmFallbackReason'] = 'deployment_check_failed'
         s['stage'] = 'ask'
