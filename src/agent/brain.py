@@ -1657,7 +1657,16 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                   heldVoucher=held_weapon_voucher, jobKind=(job or {}).get('kind'))
             return cmd
     # 施工工墙没砌完且白天还早：不提前回炮；入夜窗口必须回双火箭。
-    from .opening import dusk_must_return
+    from .opening import builder_move_to_dual_rockets, dusk_must_return
+    if (opening_worker_mode(state, worker) == 'builder' and is_day_round(state.round_no)
+            and dusk_must_return(state, worker) and not allow_build):
+        cmd = builder_move_to_dual_rockets(
+            worker, state, blocked, reserved, '入夜只够走到双火箭共用位，施工工停手回岗')
+        if cmd:
+            return cmd
+        handled, cmd = muster_for_night(worker, state, blocked, reserved)
+        if handled:
+            return cmd
     must_muster = not (builder_focus and allow_build and not dusk_must_return(state, worker))
     if must_muster:
         handled, cmd = muster_for_night(worker, state, blocked, reserved)

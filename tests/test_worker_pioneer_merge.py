@@ -458,6 +458,90 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         if cmd.get('action') == 'build':
             self.fail('入夜窗口不该去砌侧翼/后沿: %s' % cmd)
 
+    def _builder_beside_front_railgun(self, remaining=None, backpack=None, open_front_gap=True):
+        """正式布局 C：施工工贴着正面电磁炮，可选拆掉贴身墙缺口。"""
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import courtyard_cells, neighbors8, shared_rocket_stand_cells, station_return_steps
+        state = _slot_layout_state(140)
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        blocked = build_blocked_set(state)
+        stands = shared_rocket_stand_cells(state, blocked)
+        yard = courtyard_cells(state, base)
+        stand = next(Pos(p.x, p.y) for p in neighbors8(
+            railgun.pos, state.map_info.width, state.map_info.height)
+            if (p.x, p.y) in yard and (p.x, p.y) not in stands)
+        for other in (economist, pioneer):
+            if (other.pos.x, other.pos.y) == (stand.x, stand.y):
+                other.pos = Pos(4, 10)
+        builder.pos = stand
+        builder.backpack = list(backpack if backpack is not None else ['stone'] * 4)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        if open_front_gap:
+            near_wall = next((r for r in state.team_our.roles
+                              if r.role_type == 'wall' and r.health > 0
+                              and max(abs(r.pos.x - stand.x), abs(r.pos.y - stand.y)) == 1), None)
+            if near_wall is not None:
+                state.team_our.roles.remove(near_wall)
+        if remaining is not None:
+            state.round_no = 130 + (70 - remaining)
+        blocked = build_blocked_set(state)
+        return state, builder, station_return_steps(builder, state, blocked)
+
+    def test_builder_beside_front_railgun_is_not_at_night_post(self):
+        """贴着正面电磁炮不算夜防到岗，估时必须按走到双火箭共用位。"""
+        from src.agent.economy import defense_occupancy
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import dusk_must_return, station_return_detail, worker_should_build_walls
+        state, builder, gun = self._builder_beside_front_railgun(remaining=20)
+        self.assertGreater(gun, 1)
+        blocked = build_blocked_set(state)
+        detail = station_return_detail(builder, state, blocked)
+        self.assertFalse(detail['alreadyAtPost'])
+        self.assertGreater(detail['steps'], 1)
+        occupancy, snap = defense_occupancy(builder, state, blocked)
+        self.assertFalse(snap.get('atGun'))
+        state.round_no = 130 + (70 - gun)
+        self.assertTrue(dusk_must_return(state, builder))
+        self.assertFalse(worker_should_build_walls(state, builder))
+
+    def test_builder_leaves_front_railgun_when_only_travel_rounds_remain(self):
+        """入夜只够走回双火箭时，施工工不能在正面继续砌墙，必须起步回共用位。"""
+        from src.agent.opening import builder_dual_rocket, dusk_must_return, station_path, worker_should_build_walls
+        from src.agent.grid import build_blocked_set
+        state, builder, gun = self._builder_beside_front_railgun()
+        self.assertGreater(gun, 1)
+        state.round_no = 130 + (70 - gun)
+        self.assertTrue(dusk_must_return(state, builder))
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'move', cmd)
+        dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+        rocket = builder_dual_rocket(state, builder)
+        path = station_path(builder, rocket, build_blocked_set(state), state)
+        self.assertTrue(path)
+        self.assertEqual(dest, (path[0].x, path[0].y), dest)
+
+    def test_builder_last_adjacent_wall_ok_then_must_return(self):
+        """回岗位前刚好多 1 回合且贴着缺口：允许砌最后一块；再少一回合就必须走。"""
+        from src.agent.opening import last_adjacent_wall_ok, worker_should_build_walls
+        state, builder, gun = self._builder_beside_front_railgun()
+        self.assertGreater(gun, 1)
+        state.round_no = 130 + (70 - (gun + 1))
+        self.assertTrue(last_adjacent_wall_ok(state, builder), gun)
+        self.assertTrue(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'build', cmd)
+        self.assertEqual(cmd.get('name'), 'wall')
+        state.round_no = 130 + (70 - gun)
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertNotEqual(cmd.get('action'), 'build', cmd)
+
     def test_builder_still_builds_after_staged_plan_is_done(self):
         self.test_builder_extends_extra_walls_when_day_has_spare_rounds()
 

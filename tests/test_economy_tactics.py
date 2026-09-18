@@ -51,8 +51,13 @@ class EconomyTests(unittest.TestCase):
         role.backpack = ['copper'] * 20
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertEqual(commands[role.id]['action'], 'move')
-        self.assertTrue(any(e['code'] == 'income_muster' and e['role_id'] == role.id
-                            for e in state.decision_events))
+        self.assertTrue(
+            any(e['code'] == 'income_muster' and e['role_id'] == role.id
+                for e in state.decision_events)
+            or any(e.get('code') == 'selected' and e.get('role_id') == role.id
+                   and '双火箭' in (e.get('message') or '')
+                   for e in state.decision_events)
+        )
 
     def test_mid_day_near_gun_keeps_working(self):
         """去掉第50回合一刀切后，离炮很近的工人白天中段仍可继续干活。"""
@@ -73,8 +78,13 @@ class EconomyTests(unittest.TestCase):
         role.backpack = ['copper'] * 3
         state.robot.roles = [RobotRole(id=30001, pos=Pos(30, 10), role_type='smallRobot', health=40)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertTrue(any(e['code'] == 'income_muster' and e.get('role_id') == role.id
-                            for e in state.decision_events))
+        self.assertTrue(
+            any(e['code'] == 'income_muster' and e.get('role_id') == role.id
+                for e in state.decision_events)
+            or any(e.get('code') == 'selected' and e.get('role_id') == role.id
+                   and '双火箭' in (e.get('message') or '')
+                   for e in state.decision_events)
+        )
         self.assertEqual(commands[role.id]['action'], 'move')
 
     def test_pre_night_small_ore_goes_to_vendor_before_third_night(self):

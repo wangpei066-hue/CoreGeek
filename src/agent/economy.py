@@ -453,10 +453,17 @@ def defense_occupancy(role, state, blocked):
     from .pioneer_schedule import defense_snapshot
     snap = defense_snapshot(role, state, blocked)
     at_assigned = bool(snap.get('alreadyAtPost'))
-    at_gun = at_assigned or any(
-        r.health > 0 and r.role_type in WEAPON_TYPES and chebyshev(role.pos, r.pos) <= 1
-        for r in (state.team_our.roles if state.team_our else [])
-    )
+    from .opening_schedule import opening_worker_mode
+    if opening_worker_mode(state, role) == 'builder':
+        from .opening import shared_rocket_stand_cells
+        stands = shared_rocket_stand_cells(state, blocked)
+        here = (role.pos.x, role.pos.y)
+        at_gun = (here in stands) if stands else at_assigned
+    else:
+        at_gun = at_assigned or any(
+            r.health > 0 and r.role_type in WEAPON_TYPES and chebyshev(role.pos, r.pos) <= 1
+            for r in (state.team_our.roles if state.team_our else [])
+        )
     reasons = list(snap.get('defenseDueReasons') or [])
     if snap.get('pressure') or snap.get('imminentContact'):
         kind = 'must_hold' if at_gun else 'returning'

@@ -1157,8 +1157,8 @@ def plan_opening_fsm(state):
         bpath = weapon_approach_path(builder_role, night_weapon, blocked, set(), state)
         night_travel = None if bpath is None else len(bpath)
         day_travel = role_travel.get(builder_role.id)
-        # 白天按当前炮位继续施工；只在走去双火箭位已经来得及的最后窗口才改用夜里估时。
-        if night_travel is not None and remaining <= night_travel + MUSTER_BUFFER:
+        # 施工工夜防岗位是双火箭共用位：白天也按这条路估时，免得正面砌墙砌到天黑才走。
+        if night_travel is not None:
             role_travel[builder_role.id] = night_travel if day_travel is None else max(day_travel, night_travel)
     cashout_commits = state.policy_memory.setdefault(CASHOUT_COMMIT_KEY, {})
     due_latch = state.policy_memory.setdefault(ROLE_DUE_KEY, {})

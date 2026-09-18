@@ -1096,12 +1096,24 @@ def staged_wall_missing(state):
 
 
 def station_return_detail(role, state, blocked, from_pos=None):
-    """回炮步数及原因。已在操炮/基地邻格可以为 0；无路径、无炮位、无基地是未知，不能记成 0。"""
+    """回炮步数及原因。已在操炮/基地邻格可以为 0；无路径、无炮位、无基地是未知，不能记成 0。
+    施工工的夜防岗位是双火箭共用位：贴着一门火箭或正面电磁炮都不算已经到岗。"""
     from dataclasses import replace
+    from .opening_schedule import opening_worker_mode
     actor = replace(role, pos=from_pos) if from_pos is not None else role
     stand = {'x': actor.pos.x, 'y': actor.pos.y}
     weapon = assign_weapons(state).get(role.id)
-    if weapon is not None and chebyshev(actor.pos, weapon.pos) <= 1 and actor.pos != weapon.pos:
+    if opening_worker_mode(state, role) == 'builder':
+        here = (actor.pos.x, actor.pos.y)
+        stands = shared_rocket_stand_cells(state, blocked)
+        if stands and here in stands:
+            rocket = builder_dual_rocket(state, role) or weapon
+            return dict(steps=0, reason='already_at_weapon', alreadyAtPost=True,
+                        weaponId=None if rocket is None else rocket.id, stand=stand)
+        night_weapon = builder_dual_rocket(state, role)
+        if night_weapon is not None:
+            weapon = night_weapon
+    elif weapon is not None and chebyshev(actor.pos, weapon.pos) <= 1 and actor.pos != weapon.pos:
         return dict(steps=0, reason='already_at_weapon', alreadyAtPost=True,
                     weaponId=weapon.id, stand=stand)
     if weapon is None:
@@ -1362,7 +1374,7 @@ def defense_wall_missing(state, role=None):
 
 
 def dusk_must_return(state, role=None):
-    """入夜窗口：回炮前只够走到炮位（贴着缺口有石仍可砌 1 格）。"""
+    """入夜窗口：剩下的回合只够走到夜防岗位。施工工按到双火箭共用位估时。"""
     remaining = defense_rounds_remaining(state, role)
     if remaining <= 0:
         return True
@@ -1372,7 +1384,24 @@ def dusk_must_return(state, role=None):
     gun = station_return_steps(role, state, blocked)
     if gun is None:
         gun = MUSTER_BUFFER
-    return remaining <= gun + 1
+    return remaining <= gun
+
+
+def last_adjacent_wall_ok(state, role):
+    """回炮前刚好多 1 回合：贴着缺口有石可以砌最后一块，之后必须走。"""
+    if role is None or 'stone' not in (role.backpack or []):
+        return False
+    remaining = defense_rounds_remaining(state, role)
+    if remaining <= 0:
+        return False
+    blocked = build_blocked_set(state)
+    gun = station_return_steps(role, state, blocked)
+    if gun is None:
+        gun = MUSTER_BUFFER
+    if remaining != gun + 1:
+        return False
+    due = due_wall_gaps(state, role)
+    return any(chebyshev(role.pos, Pos(*p)) == 1 for p in due)
 
 
 def full_wall_build_window(state, role=None):
@@ -1381,7 +1410,7 @@ def full_wall_build_window(state, role=None):
 
 
 def worker_should_build_walls(state, role=None):
-    """有 due 缺口就砌；入夜窗口只砌贴身那一格；夜间只补正面关键缺口。"""
+    """有 due 缺口就砌；入夜只够回岗位时停手；回岗位前刚好多 1 回合才允许贴身砌最后一块。"""
     from .tactics import night_wave_cleared, night_near_work_allowed
     if night_wave_cleared(state):
         return True
@@ -1394,8 +1423,15 @@ def worker_should_build_walls(state, role=None):
     if not due:
         return False
     if dusk_must_return(state, role):
-        return bool(role is not None and 'stone' in (role.backpack or [])
-                    and any(chebyshev(role.pos, Pos(*p)) == 1 for p in due))
+        return False
+    if last_adjacent_wall_ok(state, role):
+        return True
+    blocked = build_blocked_set(state)
+    gun = station_return_steps(role, state, blocked)
+    if gun is None:
+        gun = MUSTER_BUFFER
+    if remaining <= gun + 1:
+        return False
     return True
 
 
@@ -1553,7 +1589,8 @@ def assign_weapons(state, excluded_ids=(), persist=False):
 
 
 def builder_dual_rocket(state, role, extra_excluded=()):
-    """施工工夜里守双火箭：按经济工外出后的两人三炮分配，拿到他该开的那门火箭。"""
+    """施工工夜里守双火箭：按经济工外出后的两人三炮分配，拿到他该开的那门火箭。
+    白天人还在正面电磁炮旁时，完整分配会把施工工分到电磁炮；夜防岗位仍是双火箭，不能据此估时。"""
     if role is None or role.role_type != 'worker':
         return None
     from .opening_schedule import opening_worker_mode, opening_worker_roles
@@ -1563,7 +1600,14 @@ def builder_dual_rocket(state, role, extra_excluded=()):
     excluded = set(extra_excluded)
     if eco:
         excluded.add(eco)
-    return assign_weapons(state, excluded_ids=excluded).get(role.id)
+    weapon = assign_weapons(state, excluded_ids=excluded, persist=False).get(role.id)
+    if weapon is not None and weapon.role_type == 'rocket':
+        return weapon
+    rockets = [r for r in state.team_our.roles
+               if r.role_type == 'rocket' and r.health > 0]
+    if not rockets:
+        return None
+    return min(rockets, key=lambda w: (chebyshev(role.pos, w.pos), w.id))
 
 
 def builder_move_to_dual_rockets(role, state, blocked, reserved, reason):
