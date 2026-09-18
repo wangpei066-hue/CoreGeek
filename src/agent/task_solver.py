@@ -959,6 +959,8 @@ class PioneerTaskSolver:
                     hints.append(hint.format(value))
             if hints:
                 self._fact(s, '最新工具错误证据：' + '；'.join(dict.fromkeys(hints)) + '。下一次命令必须按该证据修正，并在同一脚本完成重试、分页和统计。')
+            if re.search(r'bad interpreter|厘?换行|CRLF|cannot execute', output, re.IGNORECASE):
+                self._fact(s, '工具报告脚本格式或换行不兼容；下一次 execute 先按真实错误修复格式，再运行验收并准备提交。')
         if s['stage'] == 'wait_probe':
             s['documents'].append(result)
             if result.get('convertedCrlf'):
