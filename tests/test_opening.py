@@ -91,15 +91,43 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(set(plan), set(wall_ring(state, base)[:8]))
         self.assertNotIn((8, 7), plan)
 
-    def test_due_walls_on_day2_are_survival_until_done(self):
-        from src.agent.opening import due_wall_gaps, survival_wall_missing
+    def test_due_walls_on_day2_are_front_until_spawn_line_is_sealed(self):
+        from src.agent.opening import due_wall_gaps, critical_wall_missing
         state = opening_state()
         state.round_no = 140
         self._rockets(state)
         worker = state.team_our.roles[1]
         due = due_wall_gaps(state, worker)
-        self.assertEqual(set(due), set(survival_wall_missing(state)))
+        self.assertEqual(set(due), set(critical_wall_missing(state)))
+        self.assertTrue(due)
+        self.assertTrue(all(x == 13 for x, _y in due))
         self.assertNotIn((8, 7), due)
+        self.assertNotIn((12, 7), due)
+
+    def test_due_walls_skip_failed_front_and_continue_wings(self):
+        from src.agent.opening import due_wall_gaps, critical_wall_missing, survival_wall_missing
+        state = opening_state()
+        state.round_no = 140
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        for point in critical_wall_missing(state):
+            state.failed_build_spots.add((*point, 'wall'))
+        due = due_wall_gaps(state, worker)
+        self.assertTrue(due)
+        self.assertEqual(set(due), set(survival_wall_missing(state)) - set(critical_wall_missing(state)))
+
+    def test_due_walls_keep_extra_during_early_day(self):
+        from src.agent.opening import due_wall_gaps, survival_wall_plan, extra_wall_missing
+        state = opening_state()
+        state.round_no = 140
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        base = state.team_our.roles[0]
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        due = due_wall_gaps(state, worker)
+        self.assertEqual(set(due), set(extra_wall_missing(state)))
+        self.assertTrue(due)
 
     def test_builder_keeps_collecting_until_batch_is_enough(self):
         from src.agent.brain import V1Strategy, BasicActionValidator

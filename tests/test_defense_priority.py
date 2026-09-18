@@ -71,6 +71,43 @@ class DefensePriorityTests(unittest.TestCase):
         self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
         self.assertNotEqual(state.worker_item_jobs.get(economist.id, {}).get('kind'), 'wall')
 
+    def test_day3_keeper_upgrades_healthy_front_wall_when_u_complete(self):
+        """三面墙没有缺口后，施工工白天买墙券，优先升迎敌正面，满血也升。"""
+        state = defended()
+        state.team_our.gold_num = 200
+        state.round_no = 270
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        keeper = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        keeper.pos = Pos(8, 9)
+        economist.pos = Pos(4, 11)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        commands = self.decide(state)
+        self.assertEqual(commands[keeper.id].get('action'), 'buy')
+        self.assertEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+        job = state.worker_item_jobs[keeper.id]
+        self.assertEqual(job['kind'], 'wall')
+        self.assertEqual(job['target'][0], 13)
+
+    def test_day5_keeper_wall_upgrade_precedes_station(self):
+        """第五天三面墙已齐：施工工买墙券升迎敌面，不把回合让给升基地而空转。"""
+        from src.agent.brain import maybe_start_shop_item_job
+        state = defended()
+        state.team_our.gold_num = 426
+        state.round_no = 530
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
+        keeper = next(r for r in state.team_our.roles if r.id == 1)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        maybe_start_shop_item_job(keeper, state)
+        job = state.worker_item_jobs[keeper.id]
+        self.assertEqual(job['kind'], 'wall')
+        self.assertEqual(job['item'], 'WallUpgradeVoucher1')
+        self.assertEqual(job['target'][0], 13)
+
     def test_keeper_builds_new_walls_before_half_health_upgrades_early_day(self):
         """白天还早、侧翼没齐：施工工先补新墙，不跑商店升半血墙。"""
         state, workers = self._day_three_low_front_walls(2, round_no=270)

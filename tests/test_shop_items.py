@@ -575,13 +575,13 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):
     def test_worker_upgrades_damaged_wall_across_several_rounds(self):
-        """阶段墙已齐后，受损一级墙走升级券：买券、走到墙边、use。升级回满血。"""
-        from src.agent.opening import staged_wall_plan
+        """三面墙已齐后，受损一级墙走升级券：买券、走到墙边、use。升级回满血。"""
+        from src.agent.opening import primary_wall_plan
         from src.agent.brain import own_station
-        state = minimal_state(gold_num=1000)
-        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
+        state = minimal_state(gold_num=1000, round_no=270)
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(14, 15), neutral_type="weaponShop")])
         base = own_station(state)
-        for i, (x, y) in enumerate(staged_wall_plan(state, base)):
+        for i, (x, y) in enumerate(primary_wall_plan(state, base)):
             state.team_our.roles.append(make_role(500 + i, x, y, "wall", health=400, level=1))
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles.append(worker)

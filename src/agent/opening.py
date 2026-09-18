@@ -1179,6 +1179,23 @@ def critical_wall_missing(state):
     return [p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) == 0 and p not in existing]
 
 
+def _buildable_wall_points(state, points):
+    """非法/冷却格不算可建缺口，避免正面某格失败后整条队列卡死。"""
+    failed = state.failed_build_spots or set()
+    return [p for p in points if (*tuple(p), 'wall') not in failed]
+
+
+def three_sided_buildable_gaps(state):
+    """U 形（正面+两翼）还能建的缺口。失败冷却格除外。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return []
+    existing = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0}
+    return _buildable_wall_points(
+        state, [p for p in primary_wall_plan(state, base) if p not in existing])
+
+
 def worker_wall_muster_rounds(state, role, missing):
     """该工人补完分摊缺口并回到炮位的估计：到施工区 + 取石施工 + 回炮 + 历史余量。"""
     blocked = build_blocked_set(state)
@@ -1257,15 +1274,25 @@ def can_extend_walls(state, role=None):
 
 
 def due_wall_gaps(state, role=None):
-    """本回合该砌的墙：生存墙优先；齐了且夜前有余量才补其余 16 段。
+    """本回合该砌的墙：先迎敌正面（怪物刷新方向），再生存墙两翼，夜前有余量才补其余 U 形。
 
-    施工工、选格、寻路、采石批次都只看这一份列表，避免「锁 16 段」和「只许砌正面」互相卡住。
+    施工工、选格、寻路、采石批次都只看这一份列表。正面某格建造失败时跳过，不卡住侧翼。
     """
-    core = survival_wall_missing(state)
+    front = _buildable_wall_points(state, critical_wall_missing(state))
+    if front:
+        return front
+    core = _buildable_wall_points(state, survival_wall_missing(state))
     if core:
         return core
+    extra = _buildable_wall_points(state, extra_wall_missing(state))
+    if not extra:
+        return []
     if can_extend_walls(state, role):
-        return extra_wall_missing(state)
+        return extra
+    # 白天还早时不要因为「一段墙估价过大」把缺口从名单拿掉，否则施工工解锁去采铜/空转。
+    from .brain import WALL_UPGRADE_DUSK_WINDOW
+    if day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW:
+        return extra
     return []
 
 
@@ -2512,7 +2539,7 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
     """沿已有墙往外接，上下对称展开。粘住当前格，不跳到另一头。
 
     本回合只认一个目标：sticky 仍在名单且走得到就继续；否则接在已有墙上。
-    同一圈（正面离中心同样远，或两翼同一深度）优先补更短的那一侧，贴着人的先砌以省步数。
+    迎敌正面永远先于两翼；同一圈优先补更短的那一侧，贴着人的先砌以省步数。
     返回 (point, path)；path==[] 表示已贴着可砌。
     """
     from .brain import own_station
@@ -2573,7 +2600,8 @@ def next_wall_gap(role, state, candidates, blocked, reserved=(), claimed=(), sti
         adj_exist = any(chebyshev(Pos(*point), Pos(*e)) == 1 for e in existing)
         isolated = 0 if (not existing or adj_exist) else 1
         walk = 0 if path == [] else len(path)
-        ranked.append((isolated, side_bias(point), depth(point), walk, order[point], point, path))
+        front_first = 0 if point[0] == front else 1
+        ranked.append((front_first, isolated, side_bias(point), depth(point), walk, order[point], point, path))
     if not ranked:
         return None, None
     ranked.sort()
