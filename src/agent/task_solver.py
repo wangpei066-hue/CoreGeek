@@ -1191,6 +1191,10 @@ class PioneerTaskSolver:
             metrics['deadlineEstimated'] = True
         s = dict(
             key=key, stage='read', paths=relevant_md_paths(state.phase_task),
+            # Snapshot the task at acceptance time.  The platform may resend a
+            # shortened/changed phaseTask while the local read is in flight;
+            # the fallback LLM prompt must still contain the original brief.
+            taskDescription=state.phase_task or '',
             documents=[], history=[], facts=[], failedActions=[], index=0, offset=0,
             calls=0, retries=0, emptyWaits=0, emptyLlmWaits=0,
             fingerprint=fingerprint,
@@ -1961,6 +1965,10 @@ class PioneerTaskSolver:
             s['stage'] = 'ask'
         for field, value in task_context(state.phase_task).items():
             s.setdefault(field, value)
+        # Backfill sessions created before taskDescription was introduced.
+        # Do not overwrite an existing snapshot: it is the stable context for
+        # recovery after local sandbox failures.
+        s.setdefault('taskDescription', state.phase_task or '')
         # `exhausted` is not a server-side task state.  Recover sessions from
         # older local versions so a real match never becomes permanently
         # stuck because of a client-side budget guard.
@@ -2137,7 +2145,13 @@ class PioneerTaskSolver:
         payload = {
             'requestId': self.session.get('requestId'),
             'instanceId': self.session.get('instanceId'),
-            'task': state.phase_task,
+            # Keep both values for diagnostics.  ``task`` is deliberately the
+            # cached acceptance-time description so a local wait_read/tool
+            # failure can be recovered by the next LLM round without losing
+            # the original task wording.
+            'task': self.session.get('taskDescription') or state.phase_task,
+            'currentTask': state.phase_task,
+            'cachedTaskDescription': self.session.get('taskDescription') or state.phase_task,
             'taskKind': kind,
             'workspace': self.session.get('workspace'),
             'documentDir': self.session.get('documentDir'),
