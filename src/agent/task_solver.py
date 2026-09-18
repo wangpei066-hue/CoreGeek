@@ -47,7 +47,7 @@ BASE_PROMPT = '''你是比赛自进化任务解题器，根据phaseTask、文档
 若答案要求JSON，将其序列化为taskAnswer字符串；提交必须有充分依据，需要执行或验证时应先取得真实结果。
 '''
 DEPLOYMENT_SOP = '''部署类任务的经验只来自已经读取过的本题规范和真实工具结果。SOP 应记录发现文件、修改规则、验收命令和提交格式，但每题必须重新绑定工作区、参数和成功凭据。不要假设存在 spec.md、check、TOKEN 或固定行号；不要修改验收器或无关文件。命令必须兼容 POSIX/Linux：严禁 macOS 写法 `sed -i ''`，修改文本优先使用一次 Python 脚本完成并立即运行验收。'''
-API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。读完任务和 API 文档后，优先在一次 execute 中写一个参数化脚本：先处理一次错误响应并修正契约，然后循环所有分页、去重、统计并只输出最终 JSON；不要把“请求第1页、请求第2页”拆成多个回合。English constraint: perform the complete API collection and calculation in ONE execute command; never issue the same endpoint once per page across rounds. If a response contains pagination, write a loop in the current command and print only the final answer object.'''
+API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。首个请求得到成功响应后，不要再做单独的诊断请求：在同一条 execute 中用 Python 先检查 JSON 的实际类型（列表、对象及其 data/items 字段），兼容分页和字段缺失，完成全部收集、去重、统计并打印最终 JSON；脚本异常时只修复一次并立即输出可提交结果。必须为最后的 submit 保留至少一个回合，不要把“请求第1页、请求第2页”拆成多个回合。English constraint: perform the complete API collection and calculation in ONE execute command; never issue the same endpoint once per page across rounds. If a response contains pagination, write a loop in the current command and print only the final answer object.'''
 PROMPT_CORE = '''你是自动解题器，目标是在题目分配的截止回合内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
@@ -982,6 +982,10 @@ class PioneerTaskSolver:
                     hints.append(hint.format(value))
             if hints:
                 self._fact(s, '最新工具错误证据：' + '；'.join(dict.fromkeys(hints)) + '。下一次命令必须按该证据修正，并在同一脚本完成重试、分页和统计。')
+            if re.search(r'["\']data["\']\s*:\s*\{', output):
+                self._fact(s, '真实响应显示 data 是 JSON 对象而非数组；下一次脚本必须先检查类型并读取对象中的实际字段，不能直接按 data[0] 访问。')
+            elif re.search(r'["\']data["\']\s*:\s*\[', output):
+                self._fact(s, '真实响应显示 data 是 JSON 数组；统计脚本可遍历该数组，但仍需按响应中的分页字段循环。')
             if re.search(r'bad interpreter|厘?换行|CRLF|cannot execute', output, re.IGNORECASE):
                 self._fact(s, '工具报告脚本格式或换行不兼容；下一次 execute 先按真实错误修复格式，再运行验收并准备提交。')
         if s['stage'] == 'wait_probe':
