@@ -293,7 +293,7 @@ class PioneerScheduleTests(unittest.TestCase):
         state.phase_task = '工作区路径：`/tmp/ws`，修复部署环境'
         state.task_experience = {
             'durations': {
-                'workspace': [
+                'generic': [
                     {'duration': 4, 'outcome': 'answer_ready'},
                     {'duration': 5, 'outcome': 'answer_ready'},
                     {'duration': 12, 'outcome': 'timeout'},

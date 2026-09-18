@@ -3,18 +3,13 @@ from .decision_log import trace
 from .grid import chebyshev, move_towards
 from .log_format import emit_stderr
 from .protocol import Pos
-from .task_solver import MIN_TASK_TIMEOUT_ROUNDS, MARKER, task_context, task_fingerprint
+from .task_solver import MIN_TASK_TIMEOUT_ROUNDS, MARKER, task_fingerprint
 
 
 SCHEDULER_VERSION = '20260915-sched2'
-# 领取到提交的观测回退：Alpha/Beta 部署约 9 轮（探查+修复+验收+提交），不是优化目标。
-DEPLOY_SOLVE_ROUNDS = 9
-DEPLOY_SOLVE_NOTE = '观测部署领取到提交约9轮：probe/fix/check/submit，含失败余量'
-API_SOLVE_ROUNDS = 9
-API_SOLVE_NOTE = 'API尚无稳定实测，保守回退9轮，与部署分开配置'
 UNKNOWN_SOLVE_ROUNDS = 9
-UNKNOWN_SOLVE_NOTE = '领取前不知题型，取各类回退与经验的保守上界'
-ESTIMATED_SOLVE_ROUNDS = DEPLOY_SOLVE_ROUNDS
+UNKNOWN_SOLVE_NOTE = '任务内容不可预知，使用统一保守回退'
+ESTIMATED_SOLVE_ROUNDS = UNKNOWN_SOLVE_ROUNDS
 ACCEPT_RANGE = 1
 SHOP_STALL_ROUNDS = 4
 RESERVATION_KEY = 'pioneer_task_reservation'
@@ -22,11 +17,6 @@ SHOP_PROGRESS_KEY = 'pioneer_shop_progress'
 TASK_STREAK_KEY = 'pioneer_task_streaks'
 INTERRUPT_RESERVATION_COST = 24
 TASK_TYPES = ('自进化类1', '自进化类2')
-KIND_FALLBACKS = {
-    'workspace': (DEPLOY_SOLVE_ROUNDS, 'config.DEPLOY_SOLVE_ROUNDS ' + DEPLOY_SOLVE_NOTE),
-    'api': (API_SOLVE_ROUNDS, 'config.API_SOLVE_ROUNDS ' + API_SOLVE_NOTE),
-    'unknown': (UNKNOWN_SOLVE_ROUNDS, 'config.UNKNOWN_SOLVE_ROUNDS ' + UNKNOWN_SOLVE_NOTE),
-}
 
 
 def scheduler_task_session(state):
@@ -45,16 +35,16 @@ def scheduler_task_session(state):
     return session
 
 
-def _duration_from_experience(experience, kind, fallback):
-    samples = ((experience or {}).get('durations') or {}).get(kind) or []
+def _duration_from_experience(experience, fallback):
+    samples = ((experience or {}).get('durations') or {}).get('generic') or []
     values = [int(item['duration']) for item in samples if item.get('duration')]
     if not values:
-        return fallback, KIND_FALLBACKS[kind][1]
+        return fallback, 'config.UNKNOWN_SOLVE_ROUNDS ' + UNKNOWN_SOLVE_NOTE
     values.sort()
     idx = min(len(values) - 1, max(0, (len(values) * 3) // 4))
     estimate = max(fallback, values[idx])
-    return estimate, 'experience.p75_including_failures kind=%s n=%d fallback=%d' % (
-        kind, len(values), fallback)
+    return estimate, 'experience.p75_including_failures n=%d fallback=%d' % (
+        len(values), fallback)
 
 
 def estimated_solve_rounds(state):
@@ -62,20 +52,7 @@ def estimated_solve_rounds(state):
     if session.get('metrics', {}).get('answerReadyRound') or session.get('answer'):
         return 1, 'session.answer_ready'
     experience = getattr(state, 'task_experience', None) or {}
-    kind = None
-    if session.get('taskKind'):
-        kind = session.get('taskKind')
-    elif state.phase_task:
-        kind = task_context(state.phase_task).get('taskKind')
-    if kind in KIND_FALLBACKS:
-        fallback, _source = KIND_FALLBACKS[kind]
-        return _duration_from_experience(experience, kind, fallback)
-    estimates = []
-    for item_kind, (fallback, _source) in KIND_FALLBACKS.items():
-        estimate, source = _duration_from_experience(experience, item_kind, fallback)
-        estimates.append((estimate, source, item_kind))
-    estimate, source, item_kind = max(estimates, key=lambda row: row[0])
-    return estimate, 'pre_accept.max(%s) %s' % (item_kind, source)
+    return _duration_from_experience(experience, UNKNOWN_SOLVE_ROUNDS)
 
 
 def reservation_of(state):

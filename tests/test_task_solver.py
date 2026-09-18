@@ -14,57 +14,45 @@ import unittest
 
 from src.agent import GameServer
 from src.agent.task_solver import (
-    MARKER, clean_url, extract_md_paths, parse_llm, sandbox_command, task_context,
-    task_fingerprint, summarize_heritage_records, READ_SCRIPT, EXEC_SCRIPT,
+    MARKER, extract_md_paths, parse_llm, sandbox_command, task_context,
+    task_fingerprint, normalize_skill, READ_SCRIPT, EXEC_SCRIPT,
     PioneerTaskSolver,
 )
 
 
+def skill(name='generic-operation'):
+    return {
+        'name': name,
+        'applicability': {
+            'summary': '目标、环境机制与验收契约相同的后续任务',
+            'requiredSignals': ['存在明确的验收结果'],
+            'incompatibleSignals': ['验收契约变更'],
+        },
+        'invariants': ['先依据当前材料再执行'],
+        'parameters': [{'name': 'target', 'source': '当前题面', 'validation': '非空'}],
+        'procedure': ['提取{{target}}', '执行并验证'],
+        'verification': ['核对当前任务的成功条件'],
+        'failureRecovery': ['依据真实错误修正'],
+        'answerContract': '以当前题面为准',
+    }
+
+
 class TaskSolverHelperTests(unittest.TestCase):
-    def test_heritage_oldest_era_uses_historical_order_not_first_record(self):
-        records = [
-            {'name': '故宫', 'type': '建筑', 'era': '明清',
-             'protected_level': '世界遗产'},
-            {'name': '周口店遗址', 'type': '遗址', 'era': '旧石器时代',
-             'protected_level': '世界遗产'},
-            {'name': '潭柘寺', 'type': '宗教建筑', 'era': '晋',
-             'protected_level': '全国重点'},
-        ]
-        stats = summarize_heritage_records(records, total=3, complete=True)
-        self.assertEqual(stats['oldestEraName'], '周口店遗址')
-
-    def test_heritage_oldest_era_handles_composite_and_nanjing_eras(self):
-        records = [
-            {'name': '明孝陵', 'type': '陵墓', 'era': '明',
-             'protected_level': '世界遗产'},
-            {'name': '夫子庙', 'type': '建筑群', 'era': '宋',
-             'protected_level': '全国重点'},
-            {'name': '鸡鸣寺', 'type': '宗教建筑', 'era': '南北朝',
-             'protected_level': '全国重点'},
-        ]
-        stats = summarize_heritage_records(records, total=3, complete=True)
-        self.assertEqual(stats['oldestEraName'], '鸡鸣寺')
-
-    def test_extract_city_from_prose_task_brief(self):
-        from src.agent.task_solver import extract_city
-        self.assertEqual(extract_city('从 API 查询南京市的全部文化遗产记录'), '南京')
-        self.assertEqual(extract_city('location=北京'), '北京')
-
-    def test_clean_url_removes_markdown_and_chinese_trailing_punctuation(self):
-        self.assertEqual(clean_url('http://localhost:8899`）'), 'http://localhost:8899')
-        self.assertEqual(clean_url('http://localhost:8899/api/v1/search。'),
-                         'http://localhost:8899/api/v1/search')
 
     def test_extract_paths(self):
         self.assertEqual(extract_md_paths('阅读`/app/API Guide.md`，再查看 docs/query.md 和「天气说明.md」。'),
                          ['/app/API Guide.md', 'docs/query.md', '天气说明.md'])
         self.assertEqual(extract_md_paths('请阅读说明.md文件，参考说明.md'), ['说明.md'])
 
-    def test_task_context_classifies_workspace_api_unknown(self):
-        self.assertEqual(task_context('工作区为 /srv/app/，请修复配置')['taskKind'], 'workspace')
+    def test_task_context_only_extracts_explicit_workspace(self):
         self.assertEqual(task_context('工作区为 /srv/app/，请修复配置')['workspace'], '/srv/app/')
-        self.assertEqual(task_context('请调用天气 API 查询北京')['taskKind'], 'api')
-        self.assertEqual(task_context('计算1+1')['taskKind'], 'unknown')
+        self.assertEqual(task_context('请调用天气 API 查询北京'), {'workspace': None})
+        self.assertEqual(task_context('计算1+1'), {'workspace': None})
+
+    def test_structured_skill_schema_is_content_agnostic(self):
+        normalized = normalize_skill(skill(), 'source')
+        self.assertTrue(normalized['skillId'].startswith('skill-'))
+        self.assertEqual(normalized['sourceFingerprint'], 'source')
 
     def test_task_fingerprint_stable_for_same_text(self):
         self.assertEqual(task_fingerprint('同一段文本'), task_fingerprint('同一段文本'))
@@ -121,33 +109,6 @@ class TaskSolverStepTests(unittest.TestCase):
         state.last_round_role_action_results = last_round_role_action_results or {}
         return state
 
-    def test_heritage_contract_detected_from_read_task_document(self):
-        state = self._state('请阅读task_2_nanjing.md，获取任务信息')
-        self.solver.step(state, {})
-        request_id = self.solver.session['requestId']
-        task_doc = (
-            '# 查询南京文化遗产\n'
-            '从 API 查询南京市的全部文化遗产记录。\n'
-            '服务运行在 http://localhost:8899。'
-        )
-        read_result = json.dumps({
-            'marker': MARKER,
-            'requestId': request_id,
-            'event': 'read_document',
-            'path': '/tmp/task_2_nanjing.md',
-            'content': task_doc,
-            'nextOffset': len(task_doc),
-            'more': False,
-            'documentDir': '/tmp',
-        }, ensure_ascii=False)
-        state = self._state(state.phase_task, round_no=11, last_cmd_result=read_result)
-        self.solver.step(state, {})
-
-        replay = self.solver.session.get('apiReplay')
-        self.assertIsNotNone(replay)
-        self.assertEqual(replay['path'], '/api/v1/heritage/search')
-        self.assertEqual(self.solver.session.get('taskKind'), 'api')
-
     def sandbox(self, command):
         if not shutil.which('sh'):
             self.skipTest('需要 POSIX sh；请在 Linux 比赛运行环境补跑沙盒集成测试')
@@ -183,14 +144,15 @@ class TaskSolverStepTests(unittest.TestCase):
         # 沙盒脚本本身的字节级内容提取以 Linux/gawk 为准，这台机器的 sh/awk 只用来验证
         # 状态机流转不出错、返回的是合法 JSON，不断言逐字节内容（环境相关，非求解器逻辑）。
         read_back = self.sandbox(execute)
-        self.assertIn('"event":"read_document"', read_back)
+        self.assertIn('"event": "read_document"', read_back)
         state = self._state(state.phase_task, round_no=11, last_cmd_result=read_back)
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
 
         state = self._state(state.phase_task, round_no=12,
-                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42',
+                                                 'skill': skill()}))
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_submit')
         self.assertEqual(commands[1]['action'], 'submitAnswer')
@@ -200,6 +162,58 @@ class TaskSolverStepTests(unittest.TestCase):
                             last_round_role_action_results={1: True})
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session.get('answer'), '42')
+        self.assertEqual(len(self.solver.experience['skills']), 1)
+        self.assertEqual(self.solver.experience['skills'][0]['evidenceLevel'], 'confirmed')
+
+    def test_submit_without_structured_skill_is_blocked(self):
+        state = self._state('直接提交一个答案')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
+        prompt, _ = self.solver.step(state, {})
+        self.assertTrue(prompt)
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertTrue(any('附带skill' in str(item) for item in self.solver.session['history']))
+
+    def test_multiple_unrelated_skills_coexist(self):
+        first = normalize_skill(skill('first'), 'one')
+        second = normalize_skill(skill('second'), 'two')
+        self.solver.session = {'skillCandidate': first, 'metrics': {'acceptedRound': 1},
+                               'round': 2, 'history': []}
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        self.solver.session = {'skillCandidate': second, 'metrics': {'acceptedRound': 2},
+                               'round': 3, 'history': []}
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        self.assertEqual({x['name'] for x in self.solver.experience['skills']}, {'first', 'second'})
+
+    def test_prompt_uses_base_prompt_without_task_taxonomy(self):
+        state = self._state('计算1+1')
+        prompt, _ = self.solver.step(state, {})
+        self.assertIn('任务类型和内容不可预知', prompt)
+        self.assertNotIn('taskKind', prompt)
+
+    def test_explicit_skill_reuse_records_real_hit_and_bindings(self):
+        candidate = normalize_skill(skill('reusable'), 'one')
+        candidate['evidenceLevel'] = 'confirmed'
+        self.solver.experience['skills'] = [candidate]
+        state = self._state('相同机制的新实例')
+        prompt, _ = self.solver.step(state, {})
+        self.assertIn(candidate['skillId'], prompt)
+        response = {
+            'action': 'execute',
+            'command': 'printf done',
+            'skillDecision': {
+                'decision': 'reuse',
+                'skillId': candidate['skillId'],
+                'bindings': {'target': '新实例'},
+                'reason': '机制与验收契约一致',
+            },
+        }
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps(response, ensure_ascii=False))
+        self.solver.step(state, {})
+        self.assertTrue(self.solver.session['experienceHit'])
+        self.assertEqual(self.solver.session['skillDecision']['bindings']['target'], '新实例')
 
     def test_execute_tool_then_submit(self):
         state = self._state('执行 echo ready，再提交结果')
@@ -209,22 +223,10 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
 
-    def test_sandbox_command_falls_back_when_python3_missing(self):
-        doc = Path(self.temp.name) / 'fallback.md'
-        doc.write_text('fallback-ok', encoding='utf-8')
-        read_cmd = sandbox_command(READ_SCRIPT, dict(requestId='fallback-read', path=str(doc),
-                                                     offset=0, documentDir='', workspace=''))
-        read_back = self.sandbox_without_python(read_cmd)
-        self.assertIn('"event":"read_document"', read_back)
-        self.assertIn('fallback-ok', read_back)
-
-        exec_cmd = sandbox_command(EXEC_SCRIPT, dict(requestId='fallback-exec',
-                                                     command='printf tool-ok', workspace=''))
-        exec_back = self.sandbox_without_python(exec_cmd)
-        self.assertIn('"event":"execute_tool"', exec_back)
-        self.assertIn('tool-ok', exec_back)
-        self.assertIn('"exitCode":0', exec_back)
-
+    def test_execute_after_llm_response(self):
+        state = self._state('执行一条有依据的命令')
+        commands = {}
+        self.solver.step(state, commands)
         state = self._state(state.phase_task, round_no=11,
                             llm_resp=json.dumps({'action': 'execute', 'command': 'echo ready'}))
         prompt, execute = self.solver.step(state, commands)
@@ -233,8 +235,8 @@ class TaskSolverStepTests(unittest.TestCase):
 
         # 同上：这台机器的 sh/awk 组合不保证逐字节回显，只验证流程不出错、返回合法 JSON。
         tool_result = self.sandbox(execute)
-        self.assertIn('"event":"execute_tool"', tool_result)
-        self.assertIn('"exitCode":0', tool_result)
+        self.assertIn('"event": "execute_tool"', tool_result)
+        self.assertIn('"exitCode": 0', tool_result)
         state = self._state(state.phase_task, round_no=12, last_cmd_result=tool_result)
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
@@ -246,7 +248,8 @@ class TaskSolverStepTests(unittest.TestCase):
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         state = self._state(state.phase_task, round_no=11,
-                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '错误答案'}))
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '错误答案',
+                                                 'skill': skill()}))
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_submit')
 
