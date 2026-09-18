@@ -1471,6 +1471,8 @@ class PioneerTaskSolver:
             'nextActionConstraint': (
                 '如果最新工具输出包含 required_header、scheme 或 required_parameter，必须在下一条 execute 中直接采用这些字段/方案；'
                 '不要再次 read 同一文档，也不要继续使用已被错误响应否定的请求。'
+                + ('工具脚本刚刚出现 Python 异常；不要重写完整请求，保留已验证的请求并用最小解析片段修复异常。'
+                   if re.search(r'Traceback|KeyError|ValueError|SyntaxError', self._last_tool_output(), re.IGNORECASE) else '')
                 if self._last_tool_output() else (
                     '当前任务文档和引用资料已经读取完成；下一步必须直接 execute 一次完整的参数化流程，或提交已有充分证据，不能再次 read。'
                     if self.session.get('documents') else ''
