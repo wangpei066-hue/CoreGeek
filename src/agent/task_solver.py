@@ -1567,6 +1567,21 @@ class PioneerTaskSolver:
         if result.get('error') or (result.get('exitCode') not in (None, 0) and result.get('event') == 'execute_tool'):
             self._record_failure(
                 s, 'execute', command, s.get('workspace'), classify_tool_error(result) or 'nonzero_exit')
+        # Turn machine-readable API feedback into a short, durable fact.  This
+        # is generic evidence handling: the solver never chooses an endpoint,
+        # credential, field, or answer on the model's behalf.
+        if result.get('event') == 'execute_tool':
+            output = str(result.get('output') or result.get('outputTail') or '')
+            hints = []
+            for pattern, hint in (
+                (r'"required_header"\s*:\s*"([^"]+)"', '错误响应要求请求头 {0}'),
+                (r'"scheme"\s*:\s*"([^"]+)"', '错误响应要求认证方案 {0}'),
+                (r'"required_parameter"\s*:\s*"([^"]+)"', '错误响应要求参数 {0}'),
+            ):
+                for value in re.findall(pattern, output, flags=re.IGNORECASE):
+                    hints.append(hint.format(value))
+            if hints:
+                self._fact(s, '最新工具错误证据：' + '；'.join(dict.fromkeys(hints)) + '。下一次命令必须按该证据修正，并在同一脚本完成重试、分页和统计。')
         if s['stage'] == 'wait_probe':
             s['documents'].append(result)
             if result.get('convertedCrlf'):
@@ -1974,6 +1989,11 @@ class PioneerTaskSolver:
             'recentResults': self.session.get('history')[-8:],
             'lastCommand': self.session.get('lastTool'),
             'lastToolOutput': self._last_tool_output(),
+            'nextActionConstraint': (
+                '如果最新工具输出包含 required_header、scheme 或 required_parameter，必须在下一条 execute 中直接采用这些字段/方案；'
+                '不要再次 read 同一文档，也不要继续使用已被错误响应否定的请求。'
+                if self._last_tool_output() else ''
+            ),
             'documents': self.session.get('documents') or [],
             'promptVersion': PROMPT_VERSION,
             'promptHash': PROMPT_HASH,
