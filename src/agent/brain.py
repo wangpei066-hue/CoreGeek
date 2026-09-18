@@ -1489,8 +1489,13 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             target = Pos(x, y)
             dist = chebyshev(worker.pos, target)
             if dist == 0:
-                from .opening import step_off_construction
+                from .opening import step_off_construction, builder_unjam_walls
                 cmd = step_off_construction(worker, state, blocked, reserved)
+                if cmd:
+                    return cmd
+                del state.worker_build_targets[worker.id]
+                pending = None
+                cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=False)
                 if cmd:
                     return cmd
                 return None
@@ -1575,6 +1580,9 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
                                worker=worker if kind == "wall" else None)
     if target is None:
         trace(state, worker.id, "no_build_candidate", "搜索范围内无可用建造候选格（占用、越界或失败冷却）", kind=kind)
+        if kind == "wall":
+            from .opening import builder_unjam_walls
+            return builder_unjam_walls(worker, state, blocked, reserved, allow_mine=False)
         return None
     state.worker_build_targets[worker.id] = (target.x, target.y, kind)
     reserved.add((target.x, target.y))
@@ -1586,6 +1594,10 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             if cmd:
                 return cmd
             del state.worker_build_targets[worker.id]
+            from .opening import builder_unjam_walls
+            cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=False)
+            if cmd:
+                return cmd
             return None
         if dist == 1:
             del state.worker_build_targets[worker.id]
@@ -1604,6 +1616,10 @@ def try_build(worker: Role, state: "MatchState", blocked: set, reserved: set):
             if cmd:
                 return cmd
         del state.worker_build_targets[worker.id]
+        from .opening import builder_unjam_walls
+        cmd = builder_unjam_walls(worker, state, blocked, reserved, allow_mine=False)
+        if cmd:
+            return cmd
         return None
     dist = chebyshev(worker.pos, target)
     if dist == 0:
@@ -2679,6 +2695,21 @@ def plan_night(state: "MatchState") -> dict:
         if heal:
             commands[fighter.id] = selected(state, fighter.id, heal, '低血紧急治疗')
             continue
+        if (night_open and opening_worker_mode(state, fighter) == 'builder'
+                and not _on_shared_rocket_stand(fighter, state, blocked)):
+            from .opening import builder_dual_rocket
+            post = assignments.get(fighter.id)
+            if post is None or post.role_type != 'rocket':
+                post = builder_dual_rocket(state, fighter)
+            if post is not None:
+                cmd = _cmd_to_dual_rocket_stand(
+                    fighter, post, state, blocked, reserved, exit_hold,
+                    '入夜第一回合施工工先就位双火箭共用位，再操作两门炮')
+                if cmd:
+                    trace(state, fighter.id, 'weapon_assignment',
+                          '入夜第一回合施工工先走到双火箭共用位', weapon_id=post.id)
+                    commands[fighter.id] = cmd
+                    continue
         if urgent:
             cmd = tactical_action(fighter, state, blocked, reserved, allow_travel=False)
             if cmd:

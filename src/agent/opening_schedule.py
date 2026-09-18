@@ -698,17 +698,21 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     唯一的硬约束是 return_deadline，石头当天用不掉就带到第二天。
     """
     from .opening import (
-        MUSTER_BUFFER, assign_weapons, claim_opening_wall, day_rounds_remaining,
-        survival_wall_missing,
+        MUSTER_BUFFER, _buildable_wall_points, assign_weapons, claim_opening_wall,
+        critical_wall_missing, day_rounds_remaining, survival_wall_missing,
     )
     from . import work_orders as wo
 
     orders = wo.compute_work_orders(state, blocked)
     program = orders['wall_program']
     emergency = orders['emergency_defense']['active']
+    front = [tuple(p) for p in _buildable_wall_points(state, critical_wall_missing(state))]
     critical = survival_wall_missing(state)
     slots = [tuple(p) for p in program['target_wall_slots']] or wo.remaining_wall_slots(state)
-    if critical:
+    if front:
+        # 迎敌面未封：施工名单只留正面，不要把翼头和 sticky 侧翼混进来。
+        slots = front
+    elif critical:
         slots = [tuple(p) for p in critical]
     stones = wo.stone_count(role)
     pack_full = wo.backpack_full(role)
@@ -747,10 +751,16 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     build_now = bool(stones > 0 and slots and not prefer_gather and not still_gather)
     if build_now:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
-        if not cmd and critical:
+        if not cmd and front:
+            from .opening import builder_unjam_walls
+            cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
+        if not cmd and critical and not front:
             extra = [tuple(p) for p in (program['target_wall_slots'] or []) if tuple(p) not in slots]
             if extra:
                 cmd = claim_opening_wall(role, state, extra, blocked, reserved, claimed, wall_assignments)
+        if not cmd and stones > 0 and slots:
+            from .opening import builder_unjam_walls
+            cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             target = None
             if cmd.get('action') in ('build', 'move'):
@@ -790,7 +800,8 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                              'wall_stage_metal_unused', cmd)
 
     # GATHER_STONE_BATCH：背包没满就继续采，当天建不完也把石头带到第二天，不提前回防空转。
-    if not pack_full and not mine_exhausted:
+    # 已经该砌（有石、有缺口、不是还在凑批次）时不要抱石跑回矿，否则会在墙线和石矿之间空转。
+    if not pack_full and not mine_exhausted and not (stones > 0 and slots and not still_gather):
         mine, path, reason = choose_nearest_mine(role, state, blocked, reserved, ('stone',))
         if mine is not None:
             target = (mine.pos.x, mine.pos.y)
@@ -819,10 +830,16 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
     # 还有石头但刚才没能建成：再试一次墙线，避免抱着石头空转。
     if stones > 0 and slots:
         cmd = claim_opening_wall(role, state, slots, blocked, reserved, claimed, wall_assignments)
-        if not cmd and critical:
+        if not cmd and front:
+            from .opening import builder_unjam_walls
+            cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
+        if not cmd and critical and not front:
             extra = [tuple(p) for p in (program['target_wall_slots'] or []) if tuple(p) not in slots]
             if extra:
                 cmd = claim_opening_wall(role, state, extra, blocked, reserved, claimed, wall_assignments)
+        if not cmd:
+            from .opening import builder_unjam_walls
+            cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             wo.builder_state(state, role.id,
                              'BUILD_WALL_BATCH' if cmd.get('action') == 'build' else 'GO_WALL_LINE')
@@ -830,7 +847,12 @@ def opening_wall_work(role, state, blocked, reserved, claimed, assignments):
                          'build_batch_retry', cmd)
 
     wo.builder_state(state, role.id, 'PLAN_NEXT_ACTION')
-    from .opening import opening_yard_wait
+    from .opening import builder_unjam_walls, opening_yard_wait
+    if stones > 0 and slots:
+        unjam = builder_unjam_walls(role, state, blocked, reserved, allow_mine=True)
+        if unjam:
+            return _tick(state, role, STAGE_WALL, 'wall', 'wall', None, 1, unjam.get('action'),
+                         'unjam_walls', unjam)
     wait = opening_yard_wait(role, state, blocked, reserved)
     wait_reason = ('backpack_full_no_buildable_slot' if pack_full else
                    'stone_mine_exhausted' if mine_exhausted else 'no_reachable_work')

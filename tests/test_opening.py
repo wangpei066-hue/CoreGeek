@@ -897,6 +897,142 @@ class OpeningTests(unittest.TestCase):
         walking = commands.get(1, {}).get('action') == 'move'
         self.assertTrue(firing or walking or 1 not in commands)
 
+    def test_wing_sticky_is_dropped_while_front_is_open(self):
+        """迎敌面未封时，侧翼 sticky 必须丢掉，改砌正面。"""
+        from src.agent.opening import next_wall_gap, due_wall_gaps, wall_priority
+        state = opening_state()
+        self._rockets(state)
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(12, 7)
+        worker.backpack = ['stone'] * 6
+        blocked = build_blocked_set(state)
+        gaps = due_wall_gaps(state, worker)
+        base = state.team_our.roles[0]
+        self.assertTrue(any(wall_priority(state, base, p) == 0 for p in gaps))
+        point, path = next_wall_gap(worker, state, gaps, blocked, sticky=(12, 7))
+        self.assertIsNotNone(point)
+        self.assertEqual(wall_priority(state, base, point), 0, point)
+        self.assertNotEqual(point, (12, 7))
+
+    def test_day1_builder_builds_front_not_wing_head(self):
+        """第一天迎敌面未封时，贴着翼头的施工工也要去砌正面。"""
+        state = opening_state()
+        state.round_no = 40
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        builder = state.team_our.roles[1]
+        builder.pos = Pos(11, 7)  # 贴着翼头 (12,7)，不站在墙格上
+        builder.backpack = ['stone'] * 8
+        economist = state.team_our.roles[2]
+        economist.pos = Pos(6, 9)
+        economist.backpack = []
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        cmd = commands.get(builder.id, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'), cmd)
+        pos = cmd['targetPos'][0]
+        target = (pos['x'], pos['y'])
+        front = [(13, y) for y in range(7, 13)]
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall', cmd)
+            self.assertEqual(pos['x'], 13, cmd)
+            self.assertIn(target, front, cmd)
+        else:
+            here = (builder.pos.x, builder.pos.y)
+            closer = min(max(abs(target[0] - x), abs(target[1] - y)) for x, y in front)
+            was = min(max(abs(here[0] - x), abs(here[1] - y)) for x, y in front)
+            self.assertLessEqual(closer, was, (target, here))
+            self.assertNotEqual(target, (12, 7), cmd)
+
+    def test_builder_steps_into_yard_when_teammate_blocks_the_only_inner_cell(self):
+        """站在正面墙格上、院子邻格被队友占着，也要迈进院子，不能迈到墙外。"""
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        self._rockets(state)
+        builder = state.team_our.roles[1]
+        builder.pos = Pos(13, 10)
+        builder.backpack = ['stone'] * 6
+        economist = state.team_our.roles[2]
+        economist.pos = Pos(12, 10)
+        economist.backpack = []
+        pioneer = state.team_our.roles[3]
+        pioneer.pos = Pos(12, 9)
+        state.team_our.roles.append(make_role(40, 12, 11, 'wall', health=1000, level=1))
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        cmd = commands.get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'move', cmd)
+        dest = cmd['targetPos'][0]
+        self.assertLessEqual(dest['x'], 13, dest)
+        self.assertNotEqual((dest['x'], dest['y']), (14, 10))
+
+    def test_builder_still_advances_when_safe_wall_rejects_last_front_gap(self):
+        """最后一段正面被 safe_wall 拒时，有石也不能空转，必须走近或就地封上。"""
+        from src.agent.opening import critical_wall_missing, next_wall_gap, safe_wall, assign_weapons
+        state = opening_state()
+        state.round_no = 140
+        self._rockets(state)
+        front = critical_wall_missing(state)
+        keep = (13, 9)
+        self.assertIn(keep, front)
+        occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles}
+        for y in range(state.map_info.height):
+            cell = (13, y)
+            if cell == keep or cell in occupied:
+                continue
+            state.team_our.roles.append(make_role(400 + y, 13, y, 'wall', health=1000, level=1))
+        state.map_info.zones = [Zone(Pos(20, 10), 'stone'), Zone(Pos(20, 20), 'weaponShop')]
+        worker = state.team_our.roles[1]
+        worker.pos = Pos(11, 10)
+        worker.backpack = ['stone'] * 6
+        economist = state.team_our.roles[2]
+        economist.pos = Pos(6, 9)
+        economist.backpack = []
+        blocked = build_blocked_set(state)
+        self.assertFalse(safe_wall(state, keep, blocked, assign_weapons(state)))
+        point, path = next_wall_gap(worker, state, [keep], blocked)
+        self.assertEqual(point, keep)
+        self.assertIsNotNone(path)
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        cmd = commands.get(worker.id, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'), cmd)
+
+    def test_builder_detours_rear_to_finish_upper_front(self):
+        """下半正面砌完、院内被炮台堵住时，仍要绕后去补上半正面，不能抱石回矿。"""
+        from src.agent.opening import wall_approach_path
+        state = opening_state()
+        state.round_no = 40
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 9, 9, 'rocket', level=1, health=1000),
+            make_role(21, 9, 10, 'rocket', level=1, health=1000),
+            make_role(22, 12, 9, 'railgun', level=1, health=1000),
+        ]
+        for i, y in enumerate((7, 8, 9)):
+            state.team_our.roles.append(make_role(70 + i, 13, y, 'wall', health=1000, level=1))
+        builder = state.team_our.roles[1]
+        builder.pos = Pos(12, 8)
+        builder.backpack = ['stone'] * 3
+        economist = state.team_our.roles[2]
+        economist.pos = Pos(6, 9)
+        economist.backpack = []
+        pioneer = state.team_our.roles[3]
+        pioneer.pos = Pos(12, 10)
+        blocked = build_blocked_set(state)
+        path = wall_approach_path(builder, Pos(13, 10), blocked, state)
+        self.assertIsNotNone(path)
+        self.assertFalse(any(p.x > 13 for p in path), [(p.x, p.y) for p in path])
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        cmd = commands.get(builder.id, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'), cmd)
+        dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall', cmd)
+            self.assertEqual(dest[0], 13, cmd)
+            self.assertGreaterEqual(dest[1], 10, cmd)
+        else:
+            self.assertNotEqual(dest, (6, 9), dest)
+            self.assertGreaterEqual(dest[0], 8, dest)
+
 
 class OpeningUpgradeEstimateTests(unittest.TestCase):
     def _rockets(self, state):

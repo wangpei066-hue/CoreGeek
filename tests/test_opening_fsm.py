@@ -212,7 +212,9 @@ class OpeningThreeRoleIdleTests(unittest.TestCase):
         for rid, track in tracks.items():
             self.assertEqual(ping_pong_runs(track), [], (rid, track))
         walls = sum(1 for r in state.team_our.roles if r.role_type == 'wall')
-        self.assertGreaterEqual(walls, 9)
+        # 迎敌面优先：第一天先封正面 6 格（SURVIVAL_WALL_FLOOR）。绕后补上半正面会占回合，
+        # 两翼不一定赶得上，不能再按「正面+两翼一起砌」去要求 9 段。
+        self.assertGreaterEqual(walls, 6)
         from src.agent.opening import assign_weapons
         for rid, weapon in assign_weapons(state).items():
             role = next(r for r in state.team_our.roles if r.id == rid)
@@ -245,7 +247,8 @@ class OpeningFsmTrailTests(unittest.TestCase):
                 and r['stage'] in (STAGE_FUND, STAGE_WALL)]
         self.assertEqual(len(idle), 0)
         walls = [r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0]
-        self.assertGreaterEqual(len(walls), 7)
+        # 迎敌面优先：第一天先封正面，不再把翼头算进「必须砌满 7 段」。
+        self.assertGreaterEqual(len(walls), 5)
         print('\n=== 场景 A 轨迹 ===\n' + format_trail(trail))
 
     def test_scene_b_goes_to_walls_once_after_weapons(self):
