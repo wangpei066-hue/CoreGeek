@@ -132,11 +132,17 @@ def forced_defense(state):
 
 def voucher_is_defense_critical(state):
     from .tactics import front_breached
+    from .brain import is_day_round, rebuilt_l1_weapon, weapons_under_strength
     forced, reason = forced_defense(state)
     if forced:
         return True, reason
     if front_breached(state):
         return True, 'front_breached'
+    missing = weapons_under_strength(state)
+    if missing and is_day_round(state.round_no):
+        return True, 'weapon_missing'
+    if rebuilt_l1_weapon(state) is not None:
+        return True, 'rebuilt_weapon_upgrade'
     return False, None
 
 

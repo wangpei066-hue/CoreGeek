@@ -170,8 +170,19 @@ class EconomyTests(unittest.TestCase):
         self.assertFalse(handled)
         self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
 
-    def test_voucher_gap_sends_backpack_to_vendor(self):
+    def test_voucher_gap_with_time_keeps_mining(self):
+        """缺口够但白天还早：继续攒包，不为 5 块铜跑小贩。"""
         state, role = defended_state(gold=75)
+        role.backpack = ['copper'] * 5
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_voucher_gap_near_dusk_sells_batch(self):
+        """今晚再采会错过买券、且矿够一趟门槛：才提前卖。"""
+        state, role = defended_state(gold=75)
+        state.round_no = 188  # 白天还剩约 12 回合。
+        role.pos = Pos(5, 5)  # 贴着小贩，卖矿回合足够短。
         role.backpack = ['copper'] * 5
         handled, cmd = liquidate(role, state, build_blocked_set(state), set())
         self.assertTrue(handled)
@@ -225,13 +236,13 @@ class EconomyTests(unittest.TestCase):
     def test_batch_fill_goes_to_vendor(self):
         state, role = economy_state()
         role.back_pack_capability = 10
-        role.backpack = ['copper'] * 6
+        role.backpack = ['copper'] * 8
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
 
     def test_sale_commitment_survives_price_drop_and_restart(self):
         state, role = economy_state()
         role.back_pack_capability = 10
-        role.backpack = ['copper'] * 6
+        role.backpack = ['copper'] * 8
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
         with tempfile.TemporaryDirectory() as root:
             save_build_memory(state, Path(root))
@@ -682,7 +693,7 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
     def test_night_worker_can_sell_after_wave_is_gone(self):
         state, role = defended_state(gold=0)
         state.round_no = 130 + 100
-        role.backpack = ['copper'] * 60
+        role.backpack = ['copper'] * 80
         state.policy_memory['night_saw_threat'] = True
         state.policy_memory['night_empty_streak'] = 1
         handled, cmd = liquidate(role, state, build_blocked_set(state), set())
@@ -707,3 +718,51 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
         with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
             cmd = opening_sell_metal(role, state, build_blocked_set(state), set(), 'fund')
         self.assertIsNone(cmd)
+
+    def test_dusk_window_keeps_small_rising_ore_reserve(self):
+        from unittest import mock
+        state, role = defended_state(gold=400)
+        role.backpack = ['copper'] * 8 + ['iron'] * 6
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            ores = sellable_ores(role, state, dump_extra_stone=True)
+        self.assertEqual(ores['copper'], 8)
+        self.assertEqual(ores['iron'], 3)
+
+    def test_full_backpack_at_shop_sells_instead_of_drop(self):
+        from src.agent.brain import decide_shop_item_job
+        state, role = defended_state(gold=400)
+        shop = next(z for z in state.map_info.zones if z.neutral_type == 'weaponShop')
+        role.pos = Pos(shop.pos.x, shop.pos.y)
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 10
+        weapon = next(r for r in state.team_our.roles if r.role_type == 'rocket')
+        state.worker_item_jobs[role.id] = {
+            'item': 'WeaponUpgradeVoucher1',
+            'target': (weapon.pos.x, weapon.pos.y),
+            'kind': 'weapon',
+        }
+        cmd = decide_shop_item_job(role, state, build_blocked_set(state), set())
+        self.assertIsNotNone(cmd)
+        self.assertNotEqual(cmd.get('action'), 'drop')
+        self.assertEqual(cmd.get('action'), 'sell')
+
+    def test_sale_unreachable_unfilled_pack_keeps_mining(self):
+        state, role = defended_state(gold=0)
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 8
+        state.map_info.zones = [z for z in state.map_info.zones if z.neutral_type != 'vendor']
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e['code'] == 'sale_unreachable' for e in state.decision_events))
+
+    def test_sticky_mine_keeps_target_when_batch_score_is_none(self):
+        from src.agent.economy import set_mine_target
+        state, role = defended_state(gold=400)
+        mine = next(z for z in state.map_info.zones if z.neutral_type == 'copper')
+        set_mine_target(state, role.id, mine, path_len=1, batch=6)
+        role.backpack = ['copper'] * 6
+        with unittest.mock.patch('src.agent.economy.trip_collect_limit', return_value=0):
+            picked = pick_mine(role, state, build_blocked_set(state), set(), {'copper', 'iron'})
+        self.assertIsNotNone(picked)
+        self.assertEqual((picked[0].pos.x, picked[0].pos.y), (mine.pos.x, mine.pos.y))

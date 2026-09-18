@@ -33,6 +33,8 @@ class OpeningTests(unittest.TestCase):
         self.assertEqual(pick_weapon_name(state, ('railgun',)), 'rocket')
         state.team_our.roles.append(make_role(22, 13, 10, 'railgun', level=1))
         self.assertEqual(pick_weapon_name(state), 'rocket')
+        next(r for r in state.team_our.roles if r.role_type == 'railgun').health = 0
+        self.assertEqual(pick_weapon_name(state), 'railgun')
 
     def test_upgrade_prefers_rocket_over_railgun(self):
         from src.agent.brain import _pick_upgradeable, WEAPON_TYPES
