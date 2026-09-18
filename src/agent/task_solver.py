@@ -1375,6 +1375,10 @@ class PioneerTaskSolver:
                     if self.session.get('documents') else ''
                 )
             ),
+            'deadlineConstraint': (
+                '剩余回合不超过3：禁止再做单独的检查或探查；把最后修复、验收和证据输出合并在当前一次 execute，下一轮立即 submit。'
+                if remaining <= 3 else ''
+            ),
             'documents': self.session.get('documents') or [],
             'promptVersion': PROMPT_VERSION,
             'promptHash': PROMPT_HASH,
