@@ -44,6 +44,15 @@ WALL_FIXER_GOLD_COST = 10
 WALL_REPAIR_RATIO = 0.8  # 「墙是否够健康」的判断阈值，不再用来派修墙包。
 WALL_CRITICAL_RATIO = 0.15  # 没有近敌时，血量低于满血 15% 才视为即将摧毁。
 WALL_CRITICAL_ABS = 80  # 约两次 BOSS 击或四次大型击；没有官方「下一击摧毁」表。
+# 第五天起经济工夜里不外出，贴正面墙待命修墙（离线夜战模拟：墙一破电磁炮/基地就被拆，
+# 修墙包 10 金回满血，入夜 15 回合内就位、带 6~8 个即可守住第 5~7 夜）。
+WALL_WATCH_DAY = 5
+WALL_WATCH_FIX_RATIO = 0.35  # 挨打的墙低于满血这个比例就用修墙包
+FIXER_STOCK_TARGET = 8
+FIXER_MIN_STOCK = 4          # 手里少于这个数时，买修墙包不给武器券预留金币
+BOMB_STOCK_DAY = 6
+BOMB_STOCK_TARGET = 2
+BOMB_GOLD_COST = 100
 _ROBOT_ATTACK = {'smallRobot': 5, 'middleRobot': 10, 'largeRobot': 20, 'bossRobot': 40}
 _WEAPON_STATION_VOUCHER_COST = {1: 100, 2: 150}
 _WALL_VOUCHER_COST = {1: 20, 2: 30}
@@ -823,6 +832,13 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
                   old_kind=old_job.get('kind'))
             del state.worker_item_jobs[role.id]
             pending_targets.discard(tuple(old_job['target']))
+        elif (old_job.get('kind') == 'weapon' and _night_stock_item(role, state, minimum_only=True)
+              and state.team_our.gold_num < item_cost(item_name, state)):
+            trace(state, role.id, 'upgrade_job_preempted',
+                  '第五天起修墙包不到最低库存：还在攒钱的武器券先让位，先买修墙包保墙',
+                  old_item=item_name)
+            del state.worker_item_jobs[role.id]
+            pending_targets.discard(tuple(old_job['target']))
     held = held_weapon_voucher_target(role, state, pending_targets)
     old_job = state.worker_item_jobs.get(role.id)
     if held and not (
@@ -834,6 +850,8 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
                   item=name, weapon_id=weapon.id, weapon_level=weapon.level or 1)
             return
     if role.id in state.worker_item_jobs:
+        return
+    if _start_night_stock_job(role, state, minimum_only=True):
         return
 
     step = next_upgrade_step(state, exclude_role_id=role.id)
@@ -919,24 +937,50 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
         }
         return
     if economist_stocking_fixer(state, role) and allow_structure_upgrade:
-        held = (role.backpack or []).count('WallFixer')
-        if held < 2:
-            from .economy import next_weapon_voucher_cost
-            reserved_gold = next_weapon_voucher_cost(state) if weapon_upgrade_due(state) else 0
-            if state.team_our.gold_num >= reserved_gold + WALL_FIXER_GOLD_COST:
-                wall = next((r for r in state.team_our.roles
-                             if r.role_type == 'wall' and r.health > 0), None)
-                target = wall or station
-                if target is not None:
-                    state.worker_item_jobs[role.id] = {
-                        "item": "WallFixer",
-                        "target": (target.pos.x, target.pos.y),
-                        "kind": "wall",
-                        "stock_for_night": True,
-                    }
-                    trace(state, role.id, 'economist_stock_fixer',
-                          '第五天起经济工白天囤修墙包，夜里回家再给前排残墙回血',
-                          held=held, gold=state.team_our.gold_num)
+        _start_night_stock_job(role, state, minimum_only=False)
+
+
+def _night_stock_item(role: Role, state: "MatchState", minimum_only: bool) -> Optional[str]:
+    """经济工白天该囤的夜战道具：先修墙包（前 FIXER_MIN_STOCK 个不给武器券让钱），
+    补满 FIXER_STOCK_TARGET 后第六天起再囤炸弹；都给下一张武器券留钱。"""
+    if not economist_stocking_fixer(state, role):
+        return None
+    from .economy import next_weapon_voucher_cost
+    from .news_memory import game_day
+    gold = state.team_our.gold_num or 0
+    fixers = (role.backpack or []).count('WallFixer')
+    if fixers < FIXER_MIN_STOCK:
+        return 'WallFixer' if gold >= WALL_FIXER_GOLD_COST else None
+    if minimum_only:
+        return None
+    reserved_gold = next_weapon_voucher_cost(state) if weapon_upgrade_due(state) else 0
+    if fixers < FIXER_STOCK_TARGET:
+        return 'WallFixer' if gold >= reserved_gold + WALL_FIXER_GOLD_COST else None
+    if (game_day(state.round_no) >= BOMB_STOCK_DAY
+            and _team_item_count(state, 'Bomb') < BOMB_STOCK_TARGET
+            and gold >= reserved_gold + BOMB_GOLD_COST):
+        return 'Bomb'
+    return None
+
+
+def _start_night_stock_job(role: Role, state: "MatchState", minimum_only: bool) -> bool:
+    item = _night_stock_item(role, state, minimum_only)
+    wall = next((r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0), None)
+    target = wall or own_station(state)
+    if item is None or target is None:
+        return False
+    # 目标只是占位：囤货任务买到手就结束，夜里由墙边待命逻辑使用。
+    state.worker_item_jobs[role.id] = {
+        "item": item,
+        "target": (target.pos.x, target.pos.y),
+        "kind": "wall",
+        "stock_for_night": True,
+        "held_before": (role.backpack or []).count(item),
+    }
+    trace(state, role.id, 'economist_stock_night_item',
+          '第五天起经济工白天囤修墙包（第六天起再囤炸弹），夜里在正面墙边待命使用',
+          item=item, held=(role.backpack or []).count(item), gold=state.team_our.gold_num)
+    return True
 
 
 
@@ -1072,10 +1116,30 @@ def _batch_buy_quantity(role: Role, state: "MatchState", job: dict) -> int:
                 and (w.pos.x, w.pos.y) not in others
                 and w.health < max_health(w) * WALL_UPGRADE_HEALTH_RATIO
             )
-    elif item == "WallFixer" and economist_stocking_fixer(state, role):
-        desired = max(1, 2 - (role.backpack or []).count("WallFixer"))
+    elif item in ("WallFixer", "Bomb") and job.get("stock_for_night"):
+        num = min(_night_stock_quantity(role, state, item), affordable, free)
+        if num <= 0:
+            # 到店时钱已被别的花销占用：不动武器券预留，释放囤货任务，避免守在店边空转。
+            state.worker_item_jobs.pop(role.id, None)
+            trace(state, role.id, "night_stock_released", "到店时可用金币不够囤货，释放任务", item=item)
+        return max(0, num)
     desired = max(1, desired - held)
     return max(1, min(desired, affordable, free))
+
+
+def _night_stock_quantity(role: Role, state: "MatchState", item: str) -> int:
+    """一趟补齐夜战库存；超出最低修墙包库存的部分给下一张武器券留钱。"""
+    from .economy import next_weapon_voucher_cost
+    gold = state.team_our.gold_num or 0
+    reserved_gold = next_weapon_voucher_cost(state) if weapon_upgrade_due(state) else 0
+    if item == "Bomb":
+        want = BOMB_STOCK_TARGET - _team_item_count(state, "Bomb")
+        return min(want, max(0, gold - reserved_gold) // BOMB_GOLD_COST)
+    own = (role.backpack or []).count("WallFixer")
+    urgent = max(0, FIXER_MIN_STOCK - own)
+    extra = max(0, FIXER_STOCK_TARGET - own - urgent)
+    spare = max(0, gold - urgent * WALL_FIXER_GOLD_COST - reserved_gold)
+    return urgent + min(extra, spare // WALL_FIXER_GOLD_COST)
 
 
 def _sync_weapon_job_owner(state: "MatchState", blocked=None) -> None:
@@ -1173,7 +1237,13 @@ def decide_shop_item_job(role: Role, state: "MatchState", blocked: set, reserved
                 return inside  # 夜里修墙尽量不出院子
         return night_safe_path(role, goal, walkable, state)
 
-    if item in role.backpack:
+    if job.get("stock_for_night"):
+        if (role.backpack or []).count(item) > job.get("held_before", 0):
+            # 囤货买到手就结束任务，不占着任务槽（否则经济工白天再也领不到武器券任务）。
+            del state.worker_item_jobs[role.id]
+            trace(state, role.id, "night_stock_bought", "夜战道具已买到手，结束囤货任务", item=item)
+            return None
+    elif item in role.backpack:
         if job.get("kind") == "station" and item == "StationUpgradeVoucher1" and not station_voucher_use_now(state, role):
             trace(state, role.id, "station_voucher_hold_for_attack",
                   "基地券留到挨打或火箭冷却时再用，升级回满血收益更高")
@@ -2526,6 +2596,115 @@ def economist_night_home_use(role, state, blocked, reserved):
     return None
 
 
+def night_wall_watcher(state, blocked):
+    """第五天起夜里墙边待命的人：经济工，身上有修墙包或炸弹，且不算他另外两人也守得住三炮。"""
+    from .news_memory import game_day
+    from .opening import guns_covered_without
+    from .opening_schedule import opening_worker_mode
+    if game_day(state.round_no) < WALL_WATCH_DAY:
+        return None
+    for worker in sorted((r for r in state.team_our.roles if r.role_type == 'worker' and r.health > 0),
+                         key=lambda r: r.id):
+        if opening_worker_mode(state, worker) != 'economist':
+            continue
+        pack = worker.backpack or []
+        if 'WallFixer' not in pack and 'Bomb' not in pack:
+            continue
+        if not guns_covered_without(state, {worker.id}, blocked, enemy_timing=False):
+            trace(state, worker.id, 'wall_watch_uncovered', '经济工去墙边后剩下两人守不住三炮，不待命')
+            continue
+        return worker
+    return None
+
+
+def _walls_under_fire(state):
+    """3 格内有机器人的墙，按血量比例从低到高。"""
+    from .tactics import threat_robots
+    robots = threat_robots(state)
+    walls = [r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0
+             and any(chebyshev(r.pos, robot.pos) <= 3 for robot in robots)]
+    return sorted(walls, key=lambda w: (w.health / max(max_health(w), 1), w.id))
+
+
+def _watch_anchor_wall(state):
+    """待命站位：挨打最重的墙；还没接敌时守迎敌正面中间那段。"""
+    hit = _walls_under_fire(state)
+    if hit:
+        return hit[0]
+    base = own_station(state)
+    if base is None:
+        return None
+    from .opening import defense_mid_y, wall_priority
+    mid = defense_mid_y(state, base)
+    front = [r for r in state.team_our.roles if r.role_type == 'wall' and r.health > 0
+             and wall_priority(state, base, (r.pos.x, r.pos.y)) == 0]
+    if not front:
+        return None
+    return min(front, key=lambda w: (abs(w.pos.y - mid), w.pos.y))
+
+
+def economist_wall_watch(role, state, blocked, reserved):
+    """墙边待命一回合：返回 (是否接管, 指令)。接管且指令为 None 表示已在墙边原地待命。
+    顺序：挨打且低于 WALL_WATCH_FIX_RATIO 的墙用修墙包 → 本夜第一次接敌扔一颗炸弹（其余留到高压）
+    → 站到挨打最重（没接敌时正面中间）的墙边。"""
+    from .opening import courtyard_path, mobile_walkable, move_on_path, night_strict_path
+    from .tactics import bomb_target, front_breached, pressure
+    heal = decide_emergency_heal(role, state)
+    if heal:
+        return True, selected(state, role.id, heal, '墙边待命：低血紧急治疗')
+    walkable = mobile_walkable(state, blocked, reserved)
+    pack = role.backpack or []
+
+    def go(target, reason):
+        path = courtyard_path(role, target, walkable, state)
+        if path is None:
+            path = night_strict_path(role, target, walkable, state)
+        return move_on_path(state, role, path, reserved, reason) if path else None
+
+    under_fire = _walls_under_fire(state)
+    if 'WallFixer' in pack:
+        critical = [w for w in under_fire
+                    if (w.health < max_health(w) * WALL_WATCH_FIX_RATIO or wall_about_to_fall(w, state))
+                    and ('repair', w.id) not in state.tactical_purchases]
+        near = [w for w in critical if chebyshev(role.pos, w.pos) <= 1]
+        if near:
+            wall = near[0]
+            state.tactical_purchases.add(('repair', wall.id))
+            trace(state, role.id, 'wall_watch_fix', '墙边待命：挨打的墙血量过低，用修墙包回满',
+                  wall_id=wall.id, wall_health=wall.health, fixers_left=pack.count('WallFixer') - 1)
+            return True, selected(state, role.id, {"action": "use", "name": "WallFixer",
+                                                   "targetPos": [{"x": wall.pos.x, "y": wall.pos.y}]},
+                                  '墙边待命：用修墙包给快倒的墙回满血')
+        for wall in critical:
+            cmd = go(wall.pos, '墙边待命：赶去给快倒的墙用修墙包')
+            if cmd:
+                return True, cmd
+    if 'Bomb' in pack:
+        night = (state.round_no or 0) // DAY_NIGHT_CYCLE
+        first_contact = bool(under_fire) and state.policy_memory.get('contact_bomb_night') != night
+        target = bomb_target(state) if (first_contact or pressure(state) or front_breached(state)) else None
+        if target:
+            _, damage, point, hits = target
+            state.policy_memory['contact_bomb_night'] = night
+            state.bombed_robots.update(r.id for r in hits)
+            trace(state, role.id, 'wall_watch_bomb',
+                  '墙边待命：本夜首次接敌或高压时对最密的 3×3 扔炸弹',
+                  first_contact=first_contact, expected_damage=damage, targets=[r.id for r in hits])
+            return True, selected(state, role.id, {"action": "use", "name": "Bomb",
+                                                   "targetPos": [{"x": point.x, "y": point.y}]},
+                                  '墙边待命：对密集机器人使用范围炸弹')
+    anchor = _watch_anchor_wall(state)
+    if anchor is None:
+        return False, None
+    if chebyshev(role.pos, anchor.pos) <= 1:
+        reserved.add((role.pos.x, role.pos.y))
+        trace(state, role.id, 'wall_watch_hold', '墙边待命，等墙挨打再修',
+              wall_id=anchor.id, fixers=pack.count('WallFixer'), bombs=pack.count('Bomb'))
+        return True, None
+    cmd = go(anchor.pos, '第五天起经济工夜里不外出，贴正面墙待命修墙')
+    return (True, cmd) if cmd else (False, None)
+
+
 def _night_worker_release(state, blocked, reserved):
     """两人三炮下第三个人（一名工人）的夜间安排，返回 (工人, 指令)；不放人返回 (None, None)。
     不看任务点是否可接：未清波时开拓者不接新任务、留在守炮名单。
@@ -2707,10 +2886,22 @@ def plan_night(state: "MatchState") -> dict:
     from .opening import shared_rocket_stand_cells, step_off_cells
     rocket_stands = shared_rocket_stand_cells(state, blocked)
     release_reserved = set(reserved) | rocket_stands
-    released_worker, released_cmd = ((None, None) if task_pioneers
+    # 第五天起经济工带着修墙包/炸弹就不外出，贴正面墙待命（接管不了时仍按原逻辑放出去采矿）。
+    watcher = None if task_pioneers else night_wall_watcher(state, blocked)
+    if watcher is not None:
+        handled, watch_cmd = economist_wall_watch(watcher, state, blocked, release_reserved)
+        if handled:
+            if watch_cmd:
+                commands[watcher.id] = watch_cmd
+        else:
+            watcher = None
+    released_worker, released_cmd = ((None, None) if task_pioneers or watcher is not None
                                       else _night_worker_release(state, blocked, release_reserved))
     reserved |= release_reserved - rocket_stands
     excluded = set(task_pioneers)
+    if watcher is not None:
+        excluded.add(watcher.id)
+        state.policy_memory.pop("night_released_worker", None)
     exit_hold = set()
     if released_worker is not None:
         excluded.add(released_worker.id)

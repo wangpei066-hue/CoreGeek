@@ -1498,7 +1498,10 @@ class WeaponRebuildAndFixerTests(unittest.TestCase):
         }
         cmd = decide_shop_item_job(economist, day, build_blocked_set(day), set())
         self.assertIsNone(cmd)
-        self.assertTrue(any(e['code'] == 'fixer_held_for_night' for e in day.decision_events))
+        # 囤货买到手就结束任务，修墙包留在背包里夜里用，任务槽空出来给武器券。
+        self.assertNotIn(economist.id, day.worker_item_jobs)
+        self.assertIn('WallFixer', economist.backpack)
+        self.assertTrue(any(e['code'] == 'night_stock_bought' for e in day.decision_events))
 
         night = _slot_layout_state(600, levels=(3, 3, 3), station_level=3)
         economist = next(r for r in night.team_our.roles if r.id == 2)
