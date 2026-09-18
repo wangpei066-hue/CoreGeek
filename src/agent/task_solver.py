@@ -723,8 +723,8 @@ def sandbox_command(script, query):
     # The competition image normally has python3, while a few replay
     # sandboxes expose only `python`.  Keep the wrapper portable without
     # changing the model-facing command protocol.
-    return ("if command -v python3 >/dev/null 2>&1; then python3 -c %s %s; "
-            "else python -c %s %s; fi" % (code, payload, code, payload))
+    runner = 'if command -v python3 >/dev/null 2>&1; then python3 -c "$1" "$2"; else python -c "$1" "$2"; fi'
+    return 'sh -c %s -- %s %s' % (shlex.quote(runner), code, payload)
 
 
 def parse_curl_output(text):
