@@ -12,7 +12,9 @@ import tempfile
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.agent.local_task_env import LocalTaskEnvironment
 from tools.run_local_task import DashScopeLLM, LocalTaskDriver
@@ -34,10 +36,8 @@ def main() -> int:
         driver = LocalTaskDriver(env, llm, max_rounds=args.max_rounds, state_root=state_root)
         try:
             result = driver.run()
-            session_path = state_root / "task_session.json"
-            experience_path = state_root / "task_experience.json"
-            session = json.loads(session_path.read_text()) if session_path.exists() else {}
-            experience = json.loads(experience_path.read_text()) if experience_path.exists() else {}
+            session = driver.server.store.load_task_session() if hasattr(driver.server, "store") else {}
+            experience = driver.server.store.load_task_experience() if hasattr(driver.server, "store") else {}
             report["tasks"].append({
                 "task": task_name,
                 "success": result["success"],
