@@ -48,7 +48,7 @@ BASE_PROMPT = '''你是比赛自进化任务解题器，根据phaseTask、文档
 若答案要求JSON，将其序列化为taskAnswer字符串；提交必须有充分依据，需要执行或验证时应先取得真实结果。
 '''
 DEPLOYMENT_SOP = '''部署类任务的经验只来自已经读取过的本题规范和真实工具结果。SOP 应记录发现文件、修改规则、验收命令和提交格式，但每题必须重新绑定工作区、参数和成功凭据。不要假设存在 spec.md、check、TOKEN 或固定行号；不要修改验收器或无关文件。'''
-API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。'''
+API_SOP = '''API 类任务的经验只来自本题文档、真实响应和已验证的技能文件。SOP 可以记录认证、端点、请求参数、分页、响应路径和统计方法；遇到同类后续任务时参数化复用，但先用真实响应确认契约，不把旧题字段或答案格式当作事实。读完任务和 API 文档后，优先在一次 execute 中写一个参数化脚本：先处理一次错误响应并修正契约，然后循环所有分页、去重、统计并只输出最终 JSON；不要把“请求第1页、请求第2页”拆成多个回合。English constraint: perform the complete API collection and calculation in ONE execute command; never issue the same endpoint once per page across rounds. If a response contains pagination, write a loop in the current command and print only the final answer object.'''
 PROMPT_CORE = '''你是自动解题器，目标是在12轮内完成任务。每次只返回一个JSON：
 {"action":"read","path":"..."}、{"action":"execute","command":"..."} 或 {"action":"submit","taskAnswer":"..."}。
 只依据任务文档和真实沙盒结果；不要猜、不要重复成功操作、不要做无关探查。读到足够信息后立即完成操作并提交。命令使用POSIX/Linux，不用macOS的sed -i ''、cat -A、file，不依赖外网。'''
@@ -1179,7 +1179,7 @@ class PioneerTaskSolver:
             # the fallback LLM prompt must still contain the original brief.
             taskDescription=state.phase_task or '',
             documents=[], history=[], facts=[], failedActions=[], index=0, offset=0,
-            calls=0, retries=0, emptyWaits=0, emptyLlmWaits=0,
+            calls=0, retries=0, emptyWaits=0, emptyLlmWaits=0, procedure=[],
             fingerprint=fingerprint,
             instanceId=task_instance_id(state, fingerprint, accept_seq),
             acceptSeq=accept_seq, documentDir=None, documentDirProbed=False,
@@ -1324,10 +1324,24 @@ class PioneerTaskSolver:
             'toolCount': len([x for x in s.get('history') or [] if x.get('event') in ('execute_tool', 'read_document')]),
             'successfulRoundSpan': max(0, int(s.get('round') or 0) - int((s.get('metrics') or {}).get('acceptedRound') or 0)),
             'learnedAt': s.get('round'),
+            'procedure': [self._redact_procedure(x, s) for x in (s.get('procedure') or [])[-6:]],
         }
         items = [x for x in self.experience.get('skills') or [] if x.get('taskKind') != record['taskKind']]
         items.append(record)
         self.experience['skills'] = items[-6:]
+
+    @staticmethod
+    def _redact_procedure(command, session):
+        value = str(command or '')
+        workspace = str(session.get('workspace') or '')
+        if workspace:
+            value = value.replace(workspace, '<WORKSPACE>')
+        # Credentials and task-specific answer literals must never become a
+        # reusable skill.  Keep command shape and flags so a later LLM can
+        # parameterize it against the new task.
+        value = re.sub(r'(?i)(authorization\s*:\s*(?:bearer\s+)?)[^\s"\']+', r'\1<SECRET>', value)
+        value = re.sub(r'(?i)(api[_-]?key|token)([=:\s]+)[^\s"\']+', r'\1\2<SECRET>', value)
+        return value[:3000]
 
     def _harvest(self, result, command, task, workspace=None):
         # Task-specific contract harvesting was removed.  Neutral successful
@@ -1660,6 +1674,7 @@ class PioneerTaskSolver:
                     s['stage'] = 'read'
                 else:
                     command = answer['command']
+                    s.setdefault('procedure', []).append(command)
                     if (s.get('taskKind') == 'api'
                             and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
                         s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
