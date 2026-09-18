@@ -128,7 +128,7 @@ DAY5_NIGHT = 4 * 130 + 80
 
 
 class BigRobotSplitTests(unittest.TestCase):
-    """第三天起：id 最小的火箭锚定大型/BOSS（算溅射），另一门火箭清数量，电磁炮必须带上大型。"""
+    """第三天起：id 最小的火箭锚定大型/BOSS（算溅射）；另一门在大型上路时清数量，贴墙开打后也锁大型。电磁炮必须带上大型。"""
 
     def _front(self):
         # 两段墙前各有一堆怪：一堆是大型带三只小怪，另一堆是一整块 3×3 中型
@@ -149,14 +149,28 @@ class BigRobotSplitTests(unittest.TestCase):
         self.assertTrue(any(rid in damage for rid in (10, 11, 12)), damage)
         self.assertTrue(all(abs(p["x"] - 20) <= 1 and abs(p["y"] - 20) <= 1 for p in positions), positions)
 
-    def test_other_rocket_keeps_clearing_swarm(self):
+    def test_other_rocket_clears_swarm_while_large_approaches(self):
+        """大型还在路上、没贴建筑时，另一门火箭仍清中小堆，不提前两门都锁。"""
+        walls = [make_role(10050, 18, 20, "wall", health=1000)]
+        robots = [robot(1, 28, 10, "largeRobot")]
+        robots += block(16, 16, "middleRobot", start_id=200)
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        state = night_state([anchor, other] + walls, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(other, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertTrue(all(16 <= p["x"] <= 18 for p in positions), positions)
+
+    def test_other_rocket_locks_large_when_sieging_wall(self):
+        """大型已经贴墙开打：另一门火箭也锁大型（周围小怪吃溅射），不再去打另一侧中型堆。"""
         wall, robots = self._front()
         anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
         other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
         state = night_state([anchor, other] + wall, robots, round_no=DAY3_NIGHT)
         positions, damage = plan_attack(other, robots, state)
-        self.assertNotIn(1, damage)
-        self.assertTrue(all(30 <= p["x"] <= 32 for p in positions), positions)
+        self.assertIn(1, damage)
+        self.assertTrue(any(rid in damage for rid in (10, 11, 12)), damage)
+        self.assertTrue(all(abs(p["x"] - 20) <= 1 and abs(p["y"] - 20) <= 1 for p in positions), positions)
 
     def test_day2_anchor_rocket_not_locked(self):
         wall, robots = self._front()

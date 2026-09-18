@@ -6,9 +6,11 @@
 第三天起有大型/BOSS 时分工（离线夜战模拟得出，见 docs/strategy.md 9.3）：
 - 锚定火箭（存活火箭里 id 最小的一门）只在能打到大型/BOSS 的落点里选；大型按威胁高估价值，
   溅射到的中小型照常计分，所以会选“大型 + 周围一圈中小”的落点；
-- 另一门火箭按原收益清数量，不锁大型/BOSS；
+- 另一门火箭在大型/BOSS 还在路上时按原收益清数量；一旦有大型/BOSS 贴建筑开打
+  （距墙/炮/基地 ≤3），两门火箭都锁这些攻城目标——破墙比漏打中小堆更糟，
+  且贴墙时周围通常有小怪，溅射不至于全空；
 - 电磁炮只在弹道能打到大型/BOSS 的落点里选收益最高的。
-射程够不着大型时都退回原收益。BOSS 远距离威胁系数不低于 BOSS_MIN_URGENCY。
+射程够不着锁定目标时都退回原收益。BOSS 远距离威胁系数不低于 BOSS_MIN_URGENCY。
 """
 from math import hypot
 from typing import Optional
@@ -74,6 +76,7 @@ class TargetContext:
         self.anchor_rocket_id = min((b.id for b in buildings if b.role_type == "rocket"), default=None)
         self.value = {}
         self.big_value = {}
+        self.siege_ids = set()
         for r in self.robots:
             hp_max, score, atk = ROBOT_STATS.get(r.role_type, (max(r.health, 1), 0, 0))
             dist = _distance_to_buildings(r.pos, buildings)
@@ -91,12 +94,18 @@ class TargetContext:
             self.value[r.id] = ((score + atk * urgency) / hp_max, score * KILL_BONUS)
             if r.role_type in BIG_TYPES:
                 self.big_value[r.id] = ((score + atk * max(urgency, 1.0)) / BIG_VALUE_SCALE, BIG_KILL_BONUS)
+                if dist <= ATTACKING_RANGE:
+                    self.siege_ids.add(r.id)
 
     def big_alive(self, ledger: DamageLedger):
         """第三天起还有剩余血量、且天亮前值得打的大型/BOSS；第三天前返回空。"""
         if not self.prioritize_big:
             return []
         return [r for r in self.robots if r.id in self.big_value and ledger.remaining(r) > 0]
+
+    def siege_big_alive(self, ledger: DamageLedger):
+        """正在打建筑的大型/BOSS。贴墙后破口比漏清中小堆更糟，两门火箭都改打它们。"""
+        return [r for r in self.big_alive(ledger) if r.id in self.siege_ids]
 
     def gain(self, damage: dict, ledger: DamageLedger, big_focus: bool = False) -> float:
         """big_focus=True（锚定火箭）时大型/BOSS 按 big_value 计价，其余照原值。"""
@@ -169,9 +178,10 @@ def _rocket_damage(ctx: TargetContext, x: int, y: int) -> dict:
     return damage
 
 
-def _big_lock_cells(ctx: TargetContext, cells, ledger: DamageLedger):
-    """锚定火箭：只保留能打到仍存活大型/BOSS 的落点（中心或溅射）。射程够不着则不锁。"""
-    ids = {r.id for r in ctx.big_alive(ledger)}
+def _big_lock_cells(ctx: TargetContext, cells, ledger: DamageLedger, ids=None):
+    """只保留能打到指定大型/BOSS 的落点（中心或溅射）。射程够不着则不锁。"""
+    if ids is None:
+        ids = {r.id for r in ctx.big_alive(ledger)}
     if not ids:
         return None
     locked = {cell for cell in cells if ids.intersection(_rocket_damage(ctx, *cell))}
@@ -196,7 +206,10 @@ def plan_rocket(weapon, ctx: TargetContext, ledger: DamageLedger):
                     cells.add((x, y))
     if not cells:
         return None
-    locked = _big_lock_cells(ctx, cells, ledger) if weapon.id == ctx.anchor_rocket_id else None
+    siege_ids = {r.id for r in ctx.siege_big_alive(ledger)}
+    locked = _big_lock_cells(ctx, cells, ledger, siege_ids) if siege_ids else None
+    if locked is None and weapon.id == ctx.anchor_rocket_id:
+        locked = _big_lock_cells(ctx, cells, ledger)
     search = locked or cells
     big_focus = locked is not None
     scratch = DamageLedger()
