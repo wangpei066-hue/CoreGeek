@@ -2,7 +2,7 @@
 import unittest
 
 from src.agent.brain import BasicActionValidator, V1Strategy
-from src.agent.protocol import PlayerTask, Pos, RobotRole, Zone
+from src.agent.protocol import PlayerTask, Pos, RobotRole, ShopItem, Zone
 from test_opening import opening_state
 from test_shop_items import make_role
 
@@ -457,6 +457,72 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         cmd = self.decide(state).get(1, {})
         if cmd.get('action') == 'build':
             self.fail('入夜窗口不该去砌侧翼/后沿: %s' % cmd)
+
+    def test_day2_cycle50_extra_walls_stay_on_due_list(self):
+        """离入夜还有 20 回合时，侧翼/后沿缺口必须还在施工名单里，不能按升级窗口提前清空。"""
+        from src.agent.opening import due_wall_gaps, extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        self.assertTrue(extra_wall_missing(state))
+        self.assertTrue(due_wall_gaps(state, builder))
+
+    def test_day2_cycle50_builder_does_not_idle_waiting_for_l3_gold(self):
+        """#1512 R180：手里有石、墙没齐、差 150 金升 3 级，不能连续空转。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        state.team_our.gold_num = 84
+        state.weapon_shop_list = [
+            ShopItem('WeaponUpgradeVoucher1', 100),
+            ShopItem('WeaponUpgradeVoucher2', 150),
+        ]
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
+    def test_unaffordable_weapon_job_does_not_freeze_builder_with_stones(self):
+        """升级任务金不够时保留目标，但本回合必须去砌墙或采矿，不能站着等 150 金。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan
+        state = self._day2_guns(opening_state())
+        state.round_no = 180
+        state.team_our.gold_num = 84
+        state.weapon_shop_list = [
+            ShopItem('WeaponUpgradeVoucher1', 100),
+            ShopItem('WeaponUpgradeVoucher2', 150),
+        ]
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(7, 21)
+        builder.backpack = ['stone'] * 5
+        rocket = next(r for r in state.team_our.roles if r.id == 20)
+        state.worker_item_jobs[builder.id] = {
+            'item': 'WeaponUpgradeVoucher2',
+            'target': (rocket.pos.x, rocket.pos.y),
+            'kind': 'weapon',
+        }
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
 
     def _builder_beside_front_railgun(self, remaining=None, backpack=None, open_front_gap=True):
         """正式布局 C：施工工贴着正面电磁炮，可选拆掉贴身墙缺口。"""

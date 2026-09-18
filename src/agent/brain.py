@@ -1904,7 +1904,11 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         elif held_item:
             continue_job = True
         elif job.get('kind') == 'weapon':
-            continue_job = True
+            item = job.get('item')
+            continue_job = (
+                item in (worker.backpack or [])
+                or state.team_our.gold_num >= item_cost(item, state)
+            )
         elif staged_walls_incomplete(state) and allow_build:
             continue_job = False
         else:
@@ -2002,6 +2006,8 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
 
     final_cmd = profitable_mine(worker, state, blocked, reserved) or decide_self_heal(worker) or decide_buy_medicine(worker, state)
     if not final_cmd:
+        final_cmd = _worker_avoid_day_idle(worker, state, blocked, reserved)
+    if not final_cmd:
         trace(state, worker.id, 'worker_day_no_command', '第二天及以后白天流程走完仍无命令',
               allow_build=allow_build, allow_weapon=allow_weapon, cashout=cashout,
               held_item=held_item, job_kind=(job or {}).get('kind'),
@@ -2009,6 +2015,49 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
               gold=state.team_our.gold_num if state.team_our else None,
               backpack=list(worker.backpack or []), position={'x': worker.pos.x, 'y': worker.pos.y})
     return final_cmd
+
+
+def _worker_avoid_day_idle(worker: Role, state: "MatchState", blocked: set, reserved: set):
+    """白天流程走完仍无令时：有石有缺口就解卡/砌墙，入夜窗口回岗，否则采矿或迈进院子。"""
+    from .economy import go_mine, profitable_mine
+    from .opening import (
+        builder_move_to_dual_rockets, builder_unjam_walls, due_wall_gaps, dusk_must_return,
+        extra_wall_missing, interior_retreat_path, move_on_path,
+    )
+    from .opening_schedule import opening_worker_mode
+    stones = 'stone' in (worker.backpack or [])
+    gaps = due_wall_gaps(state, worker) or (extra_wall_missing(state) if stones else [])
+    if stones and gaps:
+        cmd = try_build(worker, state, blocked, reserved)
+        if cmd:
+            return cmd
+        cmd = builder_unjam_walls(
+            worker, state, blocked, reserved,
+            allow_mine=not dusk_must_return(state, worker),
+        )
+        if cmd:
+            return cmd
+    if opening_worker_mode(state, worker) == 'builder' and dusk_must_return(state, worker):
+        cmd = builder_move_to_dual_rockets(
+            worker, state, blocked, reserved, '白天无其它合法动作，施工工回双火箭位')
+        if cmd:
+            return cmd
+    want = ('stone',) if gaps else ('copper', 'iron', 'stone')
+    cmd = go_mine(
+        worker, state, blocked, reserved, want_ores=want,
+        purpose='stone' if gaps else 'income',
+        travel_reason='白天无其它合法动作，继续采矿避免空转',
+        collect_reason='白天无其它合法动作，继续采矿避免空转',
+    )
+    if cmd:
+        return cmd
+    cmd = profitable_mine(worker, state, blocked, reserved)
+    if cmd:
+        return cmd
+    retreat = interior_retreat_path(worker, blocked | reserved, state)
+    if retreat:
+        return move_on_path(state, worker, retreat, reserved, '白天无其它合法动作，先回院子')
+    return None
 
 
 

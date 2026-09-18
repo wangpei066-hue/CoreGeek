@@ -1374,7 +1374,7 @@ def can_extend_walls(state, role=None):
 
 
 def due_wall_gaps(state, role=None):
-    """本回合该砌的墙：先迎敌正面（怪物刷新方向），再生存墙两翼，夜前有余量才补其余 U 形。
+    """本回合该砌的墙：先迎敌正面（怪物刷新方向），再生存墙两翼，入夜窗口才停补其余 U 形。
 
     施工工、选格、寻路、采石批次都只看这一份列表。正面某格建造失败时跳过，不卡住侧翼。
     """
@@ -1389,9 +1389,9 @@ def due_wall_gaps(state, role=None):
         return []
     if can_extend_walls(state, role):
         return extra
-    # 白天还早时不要因为「一段墙估价过大」把缺口从名单拿掉，否则施工工解锁去采铜/空转。
-    from .brain import WALL_UPGRADE_DUSK_WINDOW
-    if day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW:
+    # 估价说「这一段当天修不完」也不能提前把缺口拿掉：人手上有石时仍该走近去砌。
+    # 真正停手只看入夜窗口（只够走回夜防岗位），不要用升级用的 20 回合窗口当停工线。
+    if not dusk_must_return(state, role):
         return extra
     return []
 
@@ -1650,7 +1650,13 @@ def builder_move_to_dual_rockets(role, state, blocked, reserved, reason):
     if weapon is None:
         return None
     path = weapon_approach_path(role, weapon, blocked, reserved, state)
-    return move_on_path(state, role, path, reserved, reason)
+    cmd = move_on_path(state, role, path, reserved, reason)
+    if cmd:
+        return cmd
+    greedy = step_toward_wall_gap(role, (weapon.pos.x, weapon.pos.y), blocked, reserved, state)
+    if greedy:
+        return move_on_path(state, role, greedy, reserved, reason)
+    return None
 
 
 def move_on_path(state, role, path, reserved, reason):
@@ -2298,11 +2304,22 @@ def replenish_walls(role, state, blocked, reserved, primary_only=False, allow_bu
         cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=False)
         if cmd:
             return True, cmd
-        # 白天砌不上就停在缺口旁等下一回合，不要改去双火箭位来回跑。
+        adjacent = any(chebyshev(role.pos, Pos(*p)) == 1 for p in missing)
+        if adjacent:
+            # 已经贴着缺口：这一回合砌令发不出，停一回合，不要改去炮位来回跑。
+            trace(state, role.id, 'builder_hold_at_gap',
+                  '手里有石且贴着缺口，本回合砌令发不出，留在施工任务上',
+                  stones=role.backpack.count('stone'), missing=len(missing))
+            return True, None
+        retreat = interior_retreat_path(role, blocked | reserved, state)
+        if retreat:
+            cmd = move_on_path(state, role, retreat, reserved, '有石有缺口但砌不上，先回院子再施工')
+            if cmd:
+                return True, cmd
         trace(state, role.id, 'builder_hold_at_gap',
-              '手里有石但本回合砌不上，留在施工任务上不改去炮位',
+              '手里有石但本回合砌不上、人也没贴着缺口，交给后续采矿/解卡',
               stones=role.backpack.count('stone'), missing=len(missing))
-        return True, None
+        return False, None
     cmd = builder_unjam_walls(role, state, blocked, reserved, allow_mine=True)
     if cmd:
         return True, cmd
