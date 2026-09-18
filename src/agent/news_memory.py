@@ -12,16 +12,29 @@ from .log_format import headline
 from .news_logging import log_folk_plan, log_news_event, log_official_plan
 
 DAY_NIGHT_CYCLE = 130
+DAY_ROUNDS = 70
+MAP_X_MAX = 40
+MAP_Y_MAX = 31
 TREASURE_ACT_CONFIDENCE = 0.7
 # 已有宝藏假设置信度超过此值时，传闻 LLM 优先于官方矿价 LLM。
 FOLK_PRIORITY_CONFIDENCE = 0.5
 _CN_DAY = r'(?:[0-9]+|[一二三四五六七八九十]+)'
+_OPEN_NEAR = r'(?:开|启|召唤|解开|可进|窗口|松动)'
 _OPEN_TIME_IN_TEXT = re.compile(
-    rf'第\s*{_CN_DAY}\s*[天日].{{0,16}}(?:开|启|召唤|解开|可进|窗口)'
-    rf'|(?:开|启|召唤|解开|可进|窗口).{{0,16}}第\s*{_CN_DAY}\s*[天日]'
+    rf'第\s*{_CN_DAY}\s*[天日].{{0,16}}{_OPEN_NEAR}'
+    rf'|{_OPEN_NEAR}.{{0,16}}第\s*{_CN_DAY}\s*[天日]'
+    rf'|第\s*{_CN_DAY}\s*[天日]\s*(?:白昼|白天|白日)'
     rf'|回合\s*\d+',
     re.I,
 )
+_ORIGIN_DIR_RE = re.compile(
+    rf'(?:之)?([东西南北])\s*({_CN_DAY})\s*(?:公里|千米|km|格)',
+    re.I,
+)
+_CN_DAY_VALUES = {
+    "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
 COMBAT_ITEM_NAMES = {
     "Medicine", "DizzyWeapon", "Bomb", "WallFixer",
     "WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2",
@@ -211,8 +224,71 @@ def joined_legend_text(legends) -> str:
 
 
 def legend_mentions_open_time(text: str) -> bool:
-    """正文是否明确写了开启日/回合。听到传闻的那天、上古传说里的「开启」都不算。"""
+    """正文是否写了开启日/回合。听到日、上古传说里无日期的「开启」不算。"""
     return bool(text and _OPEN_TIME_IN_TEXT.search(text))
+
+
+def _parse_day_token(token: str) -> Optional[int]:
+    token = (token or "").strip()
+    if token.isdigit():
+        return int(token)
+    return _CN_DAY_VALUES.get(token)
+
+
+def parse_origin_relative_pos(text: str) -> Optional[dict]:
+    """原点之北/东 N 公里（1公里=1格）→ {x,y}。纯「西部」无数字则 None。"""
+    if not text or "原点" not in text:
+        return None
+    idx = text.find("原点")
+    window = text[idx:idx + 48]
+    dx = dy = 0
+    found = 0
+    for match in _ORIGIN_DIR_RE.finditer(window):
+        value = _parse_day_token(match.group(2))
+        if value is None:
+            continue
+        found += 1
+        direction = match.group(1)
+        if direction == "东":
+            dx += value
+        elif direction == "西":
+            dx -= value
+        elif direction == "北":
+            dy += value
+        elif direction == "南":
+            dy -= value
+    if not found:
+        return None
+    if not (0 <= dx <= MAP_X_MAX and 0 <= dy <= MAP_Y_MAX):
+        return None
+    return {"x": dx, "y": dy}
+
+
+def parse_legend_open_window(text: str) -> tuple:
+    """从「第N天/日 + 开启/松动/白昼」抽出回合窗；没有则 (None, None)。"""
+    if not text:
+        return None, None
+    patterns = (
+        rf'第\s*({_CN_DAY})\s*[天日].{{0,16}}{_OPEN_NEAR}',
+        rf'{_OPEN_NEAR}.{{0,16}}第\s*({_CN_DAY})\s*[天日]',
+        rf'第\s*({_CN_DAY})\s*[天日]\s*(?:白昼|白天|白日)',
+    )
+    matched = ""
+    day = None
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            day = _parse_day_token(match.group(1))
+            matched = match.group(0)
+            break
+    if day is None or not (1 <= day <= 10):
+        return None, None
+    start = (day - 1) * DAY_NIGHT_CYCLE
+    if re.search(r"白昼|白天|白日", matched) and not re.search(r"夜", matched):
+        return start, start + DAY_ROUNDS - 1
+    if re.search(r"夜", matched):
+        return start + DAY_ROUNDS, start + DAY_NIGHT_CYCLE - 1
+    return start, start + DAY_NIGHT_CYCLE - 1
 
 
 def is_resume_official(text: str) -> bool:
@@ -452,7 +528,60 @@ class NewsMemory:
                     legends=[row.get("text") for row in legends],
                 )
 
+        self._backfill_folk_from_legends()
         self.save()
+
+    def _complete_hypothesis_from_legends(self, hyp: dict) -> bool:
+        """用正文补 LLM 留空的原点公里坐标和第N日开启窗。有改动返回 True。"""
+        blob = joined_legend_text(self.data.get("legends"))
+        filled_altar = False
+        changed = False
+        if hyp.get("altarPos") is None:
+            parsed_pos = parse_origin_relative_pos(blob)
+            if parsed_pos:
+                hyp["altarPos"] = parsed_pos
+                filled_altar = True
+                changed = True
+                hyp["notes"] = (hyp.get("notes") or "") + " | filled_altar_from_origin"
+        if not legend_mentions_open_time(blob):
+            if hyp.get("openFromRound") is not None or hyp.get("openToRound") is not None:
+                hyp["openFromRound"] = None
+                hyp["openToRound"] = None
+                changed = True
+        elif hyp.get("openFromRound") is None and hyp.get("openToRound") is None:
+            start, end = parse_legend_open_window(blob)
+            if start is not None:
+                hyp["openFromRound"] = start
+                hyp["openToRound"] = end
+                changed = True
+                hyp["notes"] = (hyp.get("notes") or "") + " | filled_window_from_legend"
+        items = list(hyp.get("items") or [])
+        confidence = clamp_confidence(hyp.get("confidence", 0))
+        if filled_altar and items and confidence < TREASURE_ACT_CONFIDENCE:
+            confidence = max(confidence, TREASURE_ACT_CONFIDENCE)
+            hyp["confidence"] = confidence
+            changed = True
+        if not hyp.get("altarPos") or not items or confidence < TREASURE_ACT_CONFIDENCE:
+            if hyp.get("ready"):
+                hyp["ready"] = False
+                changed = True
+        elif filled_altar and not hyp.get("ready"):
+            hyp["ready"] = True
+            changed = True
+        return changed
+
+    def _backfill_folk_from_legends(self) -> None:
+        """已解码但坐标/窗口仍空时，用累计传闻补全，避免热更新后要等下一条传闻。"""
+        if self.data.get("treasureEmpty"):
+            return
+        hyp = self.data.get("treasureHypothesis")
+        if not isinstance(hyp, dict):
+            return
+        if not self._complete_hypothesis_from_legends(hyp):
+            return
+        self.data["treasureHypothesis"] = hyp
+        plan = self.store_folk_plan()
+        log_folk_plan(self.data.get("memoryRound"), plan, source="legend_backfill")
 
     def _upsert_ore_effect(self, effect: dict) -> None:
         ore = effect.get("affectedOre")
@@ -516,11 +645,9 @@ class NewsMemory:
                 hyp["altarPos"] = None
         else:
             hyp["altarPos"] = None
-        if not hyp["altarPos"] or not hyp["items"] or confidence < TREASURE_ACT_CONFIDENCE:
+        self._complete_hypothesis_from_legends(hyp)
+        if not hyp.get("altarPos") or not hyp["items"] or hyp["confidence"] < TREASURE_ACT_CONFIDENCE:
             hyp["ready"] = False
-        if not legend_mentions_open_time(joined_legend_text(self.data.get("legends"))):
-            hyp["openFromRound"] = None
-            hyp["openToRound"] = None
         self.data["treasureHypothesis"] = hyp
         # 这一批原文已经解过；等新传闻或召唤失败 2/3 再问，避免同一批低分重刷额度。
         self.data["needTreasureDecode"] = False
