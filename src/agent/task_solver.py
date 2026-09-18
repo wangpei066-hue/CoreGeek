@@ -1110,6 +1110,13 @@ class PioneerTaskSolver:
                     same_target = sum(self._command_target(old) == target for old in recent_commands[-4:])
                     if target and same_target >= 2:
                         self._fact(s, '同一工具目标已连续尝试多次；请在一次脚本中完成剩余步骤或直接提交，不要逐页/逐次重复调用')
+                        if any(item.get('errorClass') in ('nonzero_exit', 'tool_error')
+                               for item in (s.get('failedActions') or [])[-3:]):
+                            s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
+                            s['history'].append({'blocked': '同一API目标连续失败，必须更换解析策略', 'target': target})
+                            self._fact(s, '同一API目标已连续失败；禁止继续改写同一请求，下一步必须采用明显不同的解析或直接提交已有完整证据。')
+                            s['stage'] = 'ask'
+                            return
                     # A shell-local TOKEN produced by the documented login
                     # request is valid and must be reusable across pagination.
                     # Only reject external secret-file/environment shortcuts
