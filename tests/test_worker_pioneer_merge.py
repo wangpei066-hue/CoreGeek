@@ -168,6 +168,383 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         self.assertEqual(commands[freed.id]['action'], 'collect')
         self.assertFalse(any(e['code'] == 'night_worker_release_skipped' for e in state.decision_events))
 
+    def test_every_night_builder_mans_dual_rockets(self):
+        """每晚施工工留守开双火箭，经济工外出；施工工分到的必须是火箭。"""
+        for round_no in (80, 210, 340):
+            with self.subTest(round_no=round_no):
+                state = self._dual_rocket_night()
+                state.round_no = round_no
+                builder = next(r for r in state.team_our.roles if r.id == 1)
+                economist = next(r for r in state.team_our.roles if r.id == 2)
+                builder.pos = Pos(9, 10)
+                economist.pos = Pos(7, 9)
+                pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+                pioneer.pos = Pos(10, 12)
+                state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+                commands = self.decide(state)
+                released = [e for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
+                self.assertEqual(len(released), 1)
+                self.assertEqual(released[0]['role_id'], economist.id)
+                assignment = state.policy_memory['weapon_assignment']
+                self.assertIn(str(builder.id), assignment)
+                self.assertNotIn(str(economist.id), assignment)
+                weapon = next(r for r in state.team_our.roles if r.id == int(assignment[str(builder.id)]))
+                self.assertEqual(weapon.role_type, 'rocket')
+                firing = any(c.get('controllerId') == str(builder.id) for c in commands.values())
+                walking = commands.get(builder.id, {}).get('action') == 'move'
+                self.assertTrue(firing or walking)
+
+    def test_first_night_builder_moves_on_opening_round(self):
+        """首夜第一回合（cycle 70）施工工必须发出回双火箭位的移动，不能空转。"""
+        state = self._dual_rocket_night()
+        state.round_no = 70
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(6, 9)
+        economist.pos = Pos(4, 11)
+        pioneer.pos = Pos(10, 12)
+        for rocket in (r for r in state.team_our.roles if r.role_type == 'rocket'):
+            rocket.cooldown = 0
+        state.robot.roles = [RobotRole(100, Pos(26, 10), 'smallRobot', 40)]
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        commands = self.decide(state)
+        builder_cmd = commands.get(builder.id, {})
+        firing = any(c.get('controllerId') == str(builder.id) for c in commands.values()
+                     if c.get('action') == 'attack')
+        self.assertTrue(firing or builder_cmd.get('action') == 'move', builder_cmd)
+
+    def test_builder_moves_to_shared_stand_when_assigned_rocket_has_no_target(self):
+        """分配火箭就绪但打不了时，也要去共用位，不能贴着一门空转。"""
+        state = self._dual_rocket_night()
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 9)
+        economist.pos = Pos(6, 9)
+        pioneer.pos = Pos(10, 12)
+        for rocket in (r for r in state.team_our.roles if r.role_type == 'rocket'):
+            rocket.cooldown = 0
+        state.policy_memory['weapon_assignment'] = {'1': 20, '3': 22}
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        state.robot.roles = []
+        commands = self.decide(state)
+        self.assertNotIn(20, commands)
+        self.assertNotIn(21, commands)
+        moved = commands.get(1, {})
+        self.assertEqual(moved.get('action'), 'move', commands)
+        dest = moved['targetPos'][0]
+        self.assertLessEqual(max(abs(dest['x'] - 9), abs(dest['y'] - 10)), 2)
+
+    def test_builder_moves_to_shared_stand_instead_of_idling_on_cooling_rocket(self):
+        """贴着冷却火箭但不在共用位时，要迈到共用位去切另一门，不能原地空转。"""
+        state = self._dual_rocket_night()
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 9)
+        economist.pos = Pos(6, 9)
+        pioneer.pos = Pos(10, 12)
+        cooling = next(r for r in state.team_our.roles if r.id == 20)
+        ready = next(r for r in state.team_our.roles if r.id == 21)
+        cooling.cooldown = 2
+        ready.cooldown = 0
+        state.policy_memory['weapon_assignment'] = {'1': 20, '3': 22}
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        state.robot.roles = [RobotRole(100, Pos(20, 10), 'smallRobot', 40)]
+        commands = self.decide(state)
+        self.assertNotIn(20, commands)
+        fired = commands.get(21, {})
+        moved = commands.get(1, {})
+        if fired.get('action') == 'attack' and fired.get('controllerId') == '1':
+            return
+        self.assertEqual(moved.get('action'), 'move', commands)
+        dest = moved['targetPos'][0]
+        self.assertLessEqual(max(abs(dest['x'] - 9), abs(dest['y'] - 10)), 2)
+
+    def test_day2_builder_does_not_idle_with_stones_and_gaps(self):
+        state = opening_state()
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=2),
+            make_role(21, 12, 8, 'rocket', level=2),
+            make_role(22, 12, 12, 'rocket', level=2),
+        ]
+        for y in range(7, 13):
+            state.team_our.roles.append(make_role(40 + y, 13, y, 'wall', health=1000, level=1))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = ['stone'] * 8
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(6, 10)
+        economist.backpack = []
+        state.last_sent_command[1] = {'action': 'move', 'targetPos': [{'x': 11, 'y': 10}]}
+        state.last_round_role_action_results[1] = False
+        state.worker_build_targets[1] = (8, 7, 'wall')
+        commands = self.decide(state)
+        cmd = commands.get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'))
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
+
+    def test_day_builder_with_stone_south_of_base_still_moves_or_builds(self):
+        """有石、墙没齐、人不在缺口旁时不能空转（#973 R179 类问题）。"""
+        state = opening_state()
+        state.round_no = 180
+        state.team_our.gold_num = 90
+        state.team_our.roles += [
+            make_role(20, 12, 10, 'rocket', level=2),
+            make_role(21, 12, 8, 'rocket', level=2),
+            make_role(22, 12, 12, 'railgun', level=2),
+        ]
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(9, 20)
+        builder.backpack = ['stone']
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(6, 10)
+        economist.backpack = []
+        commands = self.decide(state)
+        cmd = commands.get(1, {})
+        self.assertIn(cmd.get('action'), ('move', 'collect'), cmd)
+        self.assertNotEqual(cmd.get('action'), 'build')
+
+    def _day2_guns(self, state):
+        state.round_no = 140
+        state.team_our.gold_num = 0
+        state.team_our.roles += [
+            make_role(20, 12, 8, 'rocket', level=2),
+            make_role(21, 11, 8, 'rocket', level=2),
+            make_role(22, 12, 10, 'railgun', level=2),
+        ]
+        state.map_info.zones = [Zone(Pos(6, 9), 'stone'), Zone(Pos(4, 11), 'iron'), Zone(Pos(4, 8), 'copper')]
+        return state
+
+    def test_day2_builder_on_wall_cell_steps_into_yard(self):
+        """站在墙格上要迈进院子，不能迈到墙外再绕回同一格。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(13, 12)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertEqual(cmd.get('action'), 'move')
+        dest = cmd['targetPos'][0]
+        self.assertTrue(9 <= dest['x'] <= 12 and 8 <= dest['y'] <= 11, dest)
+
+    def test_day2_builder_does_not_loop_on_wing_cell(self):
+        """#781：施工工不能连续多回合对着同一墙格空转。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(13, 12)
+        builder.backpack = ['stone'] * 8
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        targets = []
+        built = 0
+        for turn in range(8):
+            state.round_no = 140 + turn
+            commands = self.decide(state)
+            cmd = commands.get(1, {})
+            if cmd.get('action') == 'move':
+                dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+                targets.append(dest)
+                builder.pos = Pos(*dest)
+            elif cmd.get('action') == 'build' and cmd.get('name') == 'wall':
+                pos = cmd['targetPos'][0]
+                state.team_our.roles.append(make_role(80 + turn, pos['x'], pos['y'], 'wall', health=1000, level=1))
+                builder.backpack.remove('stone')
+                built += 1
+                targets.append(('build', pos['x'], pos['y']))
+            else:
+                targets.append(cmd.get('action'))
+        self.assertTrue(built >= 1 or len(set(t for t in targets if isinstance(t, tuple) and t[0] != 'build')) >= 2, targets)
+        self.assertFalse(all(t == (13, 12) for t in targets if isinstance(t, tuple) and t[0] != 'build'), targets)
+
+    def test_day2_builder_without_stone_goes_to_mine(self):
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = []
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 8)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('move', 'collect'))
+        if cmd.get('action') == 'collect':
+            self.assertEqual(cmd['targetPos'][0], {'x': 6, 'y': 9})
+
+    def test_day2_economist_mines_instead_of_wandering_to_walls(self):
+        """经济工第一晚后不去跟施工工抢墙/双火箭，空背包就去采矿。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(2, {})
+        self.assertIn(cmd.get('action'), ('move', 'collect'))
+        if cmd.get('action') == 'collect':
+            ore = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+            self.assertIn(ore, ((4, 11), (4, 8), (6, 9)))
+
+    def test_day2_builder_with_stones_does_not_walk_to_dual_rockets(self):
+        """白天还早、手里有石、墙有缺口：施工工必须建或接近缺口，不能去双火箭空转。"""
+        state = self._day2_guns(opening_state())
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(12, 10)
+        builder.backpack = ['stone'] * 6
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move'))
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
+        else:
+            dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+            rockets = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.role_type == 'rocket'}
+            self.assertNotIn(dest, rockets)
+
+    def test_builder_extends_extra_walls_when_day_has_spare_rounds(self):
+        """生存墙齐了、白天还早：施工工可以补其余 16 段，不能原地空转。"""
+        from src.agent.opening import (
+            courtyard_cells, extra_wall_missing, survival_wall_plan, worker_should_build_walls,
+        )
+        state = self._day2_guns(opening_state())
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        extra = extra_wall_missing(state)
+        self.assertTrue(extra)
+        gap = extra[0]
+        yard = courtyard_cells(state, base)
+        stand = next((Pos(x, y) for x, y in (
+            (gap[0] + dx, gap[1] + dy)
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if dx or dy
+        ) if (x, y) in yard), Pos(12, 10))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = stand
+        builder.backpack = ['stone'] * 4
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        self.assertTrue(worker_should_build_walls(state, builder), (stand, gap, extra))
+        cmd = self.decide(state).get(1, {})
+        self.assertIn(cmd.get('action'), ('build', 'move', 'collect'), cmd)
+
+    def test_builder_does_not_chase_extra_walls_at_dusk(self):
+        """生存墙齐了、入夜窗口：不再追后沿，去回炮或采矿。"""
+        from src.agent.opening import extra_wall_missing, survival_wall_plan, worker_should_build_walls
+        state = self._day2_guns(opening_state())
+        state.round_no = 198
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        for i, p in enumerate(survival_wall_plan(state, base)):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        self.assertTrue(extra_wall_missing(state))
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        builder.pos = Pos(11, 10)
+        builder.backpack = ['stone'] * 4
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(1, {})
+        if cmd.get('action') == 'build':
+            self.fail('入夜窗口不该去砌侧翼/后沿: %s' % cmd)
+
+    def _builder_beside_front_railgun(self, remaining=None, backpack=None, open_front_gap=True):
+        """正式布局 C：施工工贴着正面电磁炮，可选拆掉贴身墙缺口。"""
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import courtyard_cells, neighbors8, shared_rocket_stand_cells, station_return_steps
+        state = _slot_layout_state(140)
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        blocked = build_blocked_set(state)
+        stands = shared_rocket_stand_cells(state, blocked)
+        yard = courtyard_cells(state, base)
+        stand = next(Pos(p.x, p.y) for p in neighbors8(
+            railgun.pos, state.map_info.width, state.map_info.height)
+            if (p.x, p.y) in yard and (p.x, p.y) not in stands)
+        for other in (economist, pioneer):
+            if (other.pos.x, other.pos.y) == (stand.x, stand.y):
+                other.pos = Pos(4, 10)
+        builder.pos = stand
+        builder.backpack = list(backpack if backpack is not None else ['stone'] * 4)
+        economist.pos = Pos(4, 11)
+        economist.backpack = []
+        if open_front_gap:
+            near_wall = next((r for r in state.team_our.roles
+                              if r.role_type == 'wall' and r.health > 0
+                              and max(abs(r.pos.x - stand.x), abs(r.pos.y - stand.y)) == 1), None)
+            if near_wall is not None:
+                state.team_our.roles.remove(near_wall)
+        if remaining is not None:
+            state.round_no = 130 + (70 - remaining)
+        blocked = build_blocked_set(state)
+        return state, builder, station_return_steps(builder, state, blocked)
+
+    def test_builder_beside_front_railgun_is_not_at_night_post(self):
+        """贴着正面电磁炮不算夜防到岗，估时必须按走到双火箭共用位。"""
+        from src.agent.economy import defense_occupancy
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import dusk_must_return, station_return_detail, worker_should_build_walls
+        state, builder, gun = self._builder_beside_front_railgun(remaining=20)
+        self.assertGreater(gun, 1)
+        blocked = build_blocked_set(state)
+        detail = station_return_detail(builder, state, blocked)
+        self.assertFalse(detail['alreadyAtPost'])
+        self.assertGreater(detail['steps'], 1)
+        occupancy, snap = defense_occupancy(builder, state, blocked)
+        self.assertFalse(snap.get('atGun'))
+        state.round_no = 130 + (70 - gun)
+        self.assertTrue(dusk_must_return(state, builder))
+        self.assertFalse(worker_should_build_walls(state, builder))
+
+    def test_builder_leaves_front_railgun_when_only_travel_rounds_remain(self):
+        """入夜只够走回双火箭时，施工工不能在正面继续砌墙，必须起步回共用位。"""
+        from src.agent.opening import builder_dual_rocket, dusk_must_return, station_path, worker_should_build_walls
+        from src.agent.grid import build_blocked_set
+        state, builder, gun = self._builder_beside_front_railgun()
+        self.assertGreater(gun, 1)
+        state.round_no = 130 + (70 - gun)
+        self.assertTrue(dusk_must_return(state, builder))
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'move', cmd)
+        dest = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+        rocket = builder_dual_rocket(state, builder)
+        path = station_path(builder, rocket, build_blocked_set(state), state)
+        self.assertTrue(path)
+        self.assertEqual(dest, (path[0].x, path[0].y), dest)
+
+    def test_builder_last_adjacent_wall_ok_then_must_return(self):
+        """回岗位前刚好多 1 回合且贴着缺口：允许砌最后一块；再少一回合就必须走。"""
+        from src.agent.opening import last_adjacent_wall_ok, worker_should_build_walls
+        state, builder, gun = self._builder_beside_front_railgun()
+        self.assertGreater(gun, 1)
+        state.round_no = 130 + (70 - (gun + 1))
+        self.assertTrue(last_adjacent_wall_ok(state, builder), gun)
+        self.assertTrue(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertEqual(cmd.get('action'), 'build', cmd)
+        self.assertEqual(cmd.get('name'), 'wall')
+        state.round_no = 130 + (70 - gun)
+        self.assertFalse(worker_should_build_walls(state, builder))
+        cmd = self.decide(state).get(builder.id, {})
+        self.assertNotEqual(cmd.get('action'), 'build', cmd)
+
+    def test_builder_still_builds_after_staged_plan_is_done(self):
+        self.test_builder_extends_extra_walls_when_day_has_spare_rounds()
+
     def test_night_pioneer_never_takes_new_task_and_one_worker_goes_out(self):
         """未清波的夜里开拓者不接新任务、留在守炮名单；是否放工人与任务点可不可接无关。"""
         for round_no in (80, 210, 340):
@@ -269,10 +646,10 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(11, 13)
-        state.team_our.roles[1].pos = Pos(8, 9)
+        state.team_our.roles[2].pos = Pos(8, 9)  # 经济工买券；施工工有墙缺口时不买武器券
         commands = self.decide(state)
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(commands[2]['action'], 'buy')
+        self.assertEqual(commands[2]['name'], 'WeaponUpgradeVoucher1')
         self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
         self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
 
@@ -288,11 +665,11 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         ]
         from src.agent.protocol import Zone
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
-        state.team_our.roles[1].pos = Pos(8, 9)
+        state.team_our.roles[2].pos = Pos(8, 9)  # 经济工买券；施工工有墙缺口时不买武器券
         commands = self.decide(state)
         self.assertNotEqual(commands.get(3, {}).get('action'), 'buy')
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(commands[2]['action'], 'buy')
+        self.assertEqual(commands[2]['name'], 'WeaponUpgradeVoucher1')
 
     def test_workers_build_front_walls_early_day(self):
         state = opening_state()
@@ -308,8 +685,22 @@ class WorkerPioneerMergeTests(unittest.TestCase):
             worker.backpack = ['stone'] * 8
             worker.pos = pos
         early = self.decide(state)
-        self.assertTrue(any(c.get('action') == 'build' and c.get('name') == 'wall' for c in early.values()))
+        built = [
+            (c['targetPos'][0]['x'], c['targetPos'][0]['y'])
+            for c in early.values()
+            if c.get('action') == 'build' and c.get('name') == 'wall'
+        ]
+        self.assertTrue(
+            built or any(c.get('action') == 'move' for c in early.values()),
+            early,
+        )
+        for cell in built:
+            self.assertEqual(cell[0], 13, cell)
+            self.assertIn(cell[1], (8, 9, 10, 11), cell)
+        self.assertNotIn((13, 7), built)
+        self.assertNotIn((12, 7), built)
         self.assertFalse(any(e['code'] == 'stones_reserved_for_late_day' for e in state.decision_events))
+        self.assertFalse(any(e['code'] == 'emergency_front_seal' for e in state.decision_events))
 
     def test_workers_build_flanks_when_front_is_sealed(self):
         """正面已齐、白天还早：施工工带着石头应立刻补侧翼，不能空转留石。"""
@@ -404,8 +795,18 @@ class EnRouteMiningTests(unittest.TestCase):
             'item': 'WeaponUpgradeVoucher1', 'target': (rocket.pos.x, rocket.pos.y), 'kind': 'weapon'}
         return decide_shop_item_job(worker, state, build_blocked_set(state), set())
 
-    def test_worker_mines_passing_ore_while_carrying_voucher(self):
-        self.assertEqual(self._worker_with_voucher(150),
+    def test_worker_holds_voucher_and_keeps_working_early_in_the_day(self):
+        self.assertIsNone(self._worker_with_voucher(150))  # 不专程回去用，交给后续分支继续干活
+
+    def test_passing_ore_is_collected_on_the_way_to_use_a_voucher(self):
+        from src.agent.economy import en_route_collect
+        from test_defense_priority import defended
+        state = defended()
+        state.round_no = 150
+        state.map_info.zones.append(Zone(Pos(4, 4), 'copper'))
+        worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
+        worker.pos = Pos(4, 5)
+        self.assertEqual(en_route_collect(worker, state, 8, '顺路采矿'),
                          {'action': 'collect', 'targetPos': [{'x': 4, 'y': 4}]})
 
     def test_worker_goes_home_when_dusk_is_close(self):
@@ -463,8 +864,8 @@ class NightRouteTests(unittest.TestCase):
 
 
 def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):
-    """按正式炮位编制布三门炮和整圈单层墙。"""
-    from src.agent.opening import wall_ring, weapon_slot_plan
+    """按正式炮位编制布三门炮和整圈单层墙。人站在院内空位，不和炮/墙/基地重叠。"""
+    from src.agent.opening import courtyard_cells, wall_ring, weapon_slot_plan
     state = opening_state()
     state.round_no = round_no
     state.team_our.gold_num = 0
@@ -476,7 +877,28 @@ def _slot_layout_state(round_no, levels=(1, 1, 1), station_level=1):
         state.team_our.roles.append(make_role(20 + i, x, y, name, level=level, attack_range=20, health=1000))
     for i, (x, y) in enumerate(wall_ring(state, base)):
         state.team_our.roles.append(make_role(100 + i, x, y, 'wall', level=1, health=1000))
+    occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles
+                if r.role_type not in ('worker', 'pioneer')}
+    free = [c for c in sorted(courtyard_cells(state, base)) if c not in occupied]
+    for role in state.team_our.roles:
+        if role.role_type not in ('worker', 'pioneer'):
+            continue
+        here = (role.pos.x, role.pos.y)
+        if here in occupied:
+            cell = free.pop(0)
+            role.pos = Pos(*cell)
+            occupied.add(cell)
+        else:
+            occupied.add(here)
     return state
+
+
+def _dual_rocket_stand(state):
+    from src.agent.grid import build_blocked_set
+    from src.agent.opening import dual_rocket_stands
+    rockets = [r for r in state.team_our.roles if r.role_type == 'rocket']
+    stands = dual_rocket_stands(state, rockets[0], rockets[1], build_blocked_set(state))
+    return Pos(*sorted(stands)[0])
 
 
 class ThirdNightRepairTests(unittest.TestCase):
@@ -492,23 +914,29 @@ class ThirdNightRepairTests(unittest.TestCase):
         builder.backpack = ['WallUpgradeVoucher1']
         return state, builder
 
-    def test_builder_repairs_front_wall_from_inside_yard_under_pressure(self):
+    def test_builder_stays_on_dual_rockets_under_pressure(self):
+        """夜里有压力也先守双火箭，不用墙券把施工工从炮位拉开。"""
         state, builder = self._pressure_state((13, 10))
-        builder.pos = Pos(12, 10)
+        builder.pos = _dual_rocket_stand(state)
         commands = self.decide(state)
-        self.assertEqual(commands[builder.id], {'action': 'use', 'name': 'WallUpgradeVoucher1',
-                                                'targetPos': [{'x': 13, 'y': 10}]})
-        self.assertFalse(any(c.get('controllerId') == str(builder.id) for c in commands.values()))
+        self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
+        self.assertIn(str(builder.id), state.policy_memory.get('weapon_assignment', {}))
+        firing = any(c.get('controllerId') == str(builder.id) for c in commands.values())
+        walking = commands.get(builder.id, {}).get('action') == 'move'
+        self.assertTrue(firing or walking, commands.get(builder.id))
 
-    def test_builder_goes_mining_when_damaged_wall_is_outside_yard_reach(self):
-        """院里够不着残墙时不回去当第三个炮手：两人已守住三炮，这名工人去后院采矿。"""
+    def test_economist_goes_mining_when_builder_is_on_guns(self):
+        """院里够不着残墙时不把施工工放出去：施工工守双火箭，经济工去后院采矿。"""
         state, builder = self._pressure_state((13, 7))  # 角落墙只能从墙外够到
         from src.agent.protocol import Zone
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(4, 10)
         state.map_info.zones = [Zone(Pos(3, 10), 'iron')]
         commands = self.decide(state)
-        self.assertNotIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        self.assertIn(str(builder.id), state.policy_memory['weapon_assignment'])
+        self.assertNotIn(str(economist.id), state.policy_memory['weapon_assignment'])
         released = [e['role_id'] for e in state.decision_events if e['code'] == 'night_worker_released_to_economy']
-        self.assertEqual(released, [builder.id])
+        self.assertEqual(released, [economist.id])
         self.assertNotEqual(commands.get(builder.id, {}).get('action'), 'use')
 
     def test_upgrade_chain_waits_for_station_after_first_level_three_rocket(self):
@@ -543,7 +971,8 @@ class HeldVoucherAndNightRouteTests(unittest.TestCase):
         for weapon in state.team_our.roles:
             if weapon.role_type in ('rocket', 'railgun'):
                 weapon.attack_range = 3  # 敌人在射程外
-        gunner = next(r for r in state.team_our.roles if r.id == 2)
+        gunner = next(r for r in state.team_our.roles if r.id == 1)
+        gunner.pos = _dual_rocket_stand(state)
         gunner.backpack = ['WeaponUpgradeVoucher1']
         commands = self.decide(state)
         self.assertEqual(commands[gunner.id]['action'], 'use')
@@ -583,7 +1012,7 @@ class ChainVoucherTests(unittest.TestCase):
         from src.agent.brain import maybe_start_shop_item_job
         state = _slot_layout_state(150, levels=(1, 1, 1))
         railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
-        worker = make_role(1, railgun.pos.x - 1, railgun.pos.y, 'worker',
+        worker = make_role(1, railgun.pos.x, railgun.pos.y + 1, 'worker',
                            back_pack_capability=100, backpack=['WeaponUpgradeVoucher1'])
         maybe_start_shop_item_job(worker, state)
         target = tuple(state.worker_item_jobs[1]['target'])
@@ -628,6 +1057,176 @@ class FixtureNightMinerTests(unittest.TestCase):
                 self.assertNotIn('emergency_front_seal', codes)
 
 
+class NightDualRocketRotationTests(unittest.TestCase):
+    """跑完第一天再打一夜：两门火箭就绪且射程内有敌人时必须开火（一人轮流开两门），
+    电磁炮只补刀（伤害都打在已受伤的机器人上）。"""
+
+    RANGES = {'rocket': (10, 5), 'railgun': (6, 2)}
+
+    def test_first_night_no_idle_rocket_and_railgun_finishes(self):
+        import contextlib
+        import io
+        from test_opening_fsm import _map, apply_opening_commands
+        from src.agent.grid import chebyshev
+        from src.agent.targeting import ROBOT_STATS, TargetContext, _robots_on_segment, _rocket_damage
+        state = _map(opening_state())
+        state.team_our.gold_num = 75
+        strategy = V1Strategy(BasicActionValidator())
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(70):
+                commands = strategy.decide(state)
+                apply_opening_commands(state, commands)
+                state.round_no += 1
+                state.last_round_role_action_results = {k: True for k in commands}
+        roles = state.team_our.roles
+        weapons = [r for r in roles if r.role_type in self.RANGES]
+        for w in weapons:
+            first, step = self.RANGES[w.role_type]
+            w.attack_range = first + step * ((w.level or 1) - 1)
+            w.cooldown = 0
+        people = [r for r in roles if r.role_type in ('worker', 'pioneer')]
+        base = next(r for r in roles if r.role_type == 'station')
+        state.robot.roles = []
+        idle, railgun_on_full, railgun_dealt, next_id = [], 0, 0, 5000
+        for t in range(40):
+            if t % 4 == 0 and t < 28:
+                for k in range(3):
+                    kind = 'middleRobot' if (t // 4 + k) % 3 == 0 else 'smallRobot'
+                    state.robot.roles.append(RobotRole(next_id, Pos(26 + k, 7 + (t // 4 * 3 + k * 2) % 7),
+                                                       kind, ROBOT_STATS[kind][0]))
+                    next_id += 1
+            robots = [r for r in state.robot.roles if r.health > 0]
+            for w in weapons:
+                w.cooldown = max(0, (w.cooldown or 0) - 1)
+            with contextlib.redirect_stderr(io.StringIO()):
+                commands = strategy.decide(state)
+            fired = {wid for wid, c in commands.items() if c.get('action') == 'attack'}
+            for w in weapons:
+                if w.role_type == 'rocket' and not w.cooldown and w.id not in fired and any(
+                        chebyshev(r.pos, w.pos) <= w.attack_range for r in robots):
+                    idle.append((state.round_no, (w.pos.x, w.pos.y), [(p.pos.x, p.pos.y) for p in people]))
+            ctx = TargetContext(state, robots)
+            for wid in fired:
+                w = next(x for x in weapons if x.id == wid)
+                target = commands[wid]['targetPos']
+                damage = {}
+                if w.role_type == 'rocket':
+                    for tp in target:
+                        for rid, d in _rocket_damage(ctx, tp['x'], tp['y']).items():
+                            damage[rid] = damage.get(rid, 0) + d
+                    w.cooldown = 4  # 本回合开火后冷却 3 回合，下回合开始时先减 1
+                else:
+                    energy = 10 * (w.level or 1)
+                    for hit in _robots_on_segment(ctx, w.pos, target[0]['x'], target[0]['y']):
+                        d = min(energy, hit.health)
+                        damage[hit.id] = d
+                        energy -= d
+                        if energy <= 0:
+                            break
+                for rid, d in damage.items():
+                    robot = ctx.by_id[rid]
+                    if w.role_type == 'railgun':
+                        railgun_dealt += min(d, robot.health)
+                        if robot.health >= ROBOT_STATS[robot.role_type][0]:
+                            railgun_on_full += min(d, robot.health)
+                    robot.health -= d
+            occupied = {(r.pos.x, r.pos.y) for r in roles if r.health > 0}
+            occupied |= {(x, y) for x in (base.pos.x, base.pos.x + 1) for y in (base.pos.y, base.pos.y - 1)}
+            for person in people:
+                cmd = commands.get(person.id)
+                if cmd and cmd.get('action') == 'move':
+                    cell = (cmd['targetPos'][0]['x'], cmd['targetPos'][0]['y'])
+                    if cell not in occupied:
+                        person.pos = Pos(*cell)
+            for robot in state.robot.roles:
+                if robot.health <= 0:
+                    continue
+                nx = robot.pos.x + (base.pos.x > robot.pos.x) - (base.pos.x < robot.pos.x)
+                ny = robot.pos.y + (base.pos.y > robot.pos.y) - (base.pos.y < robot.pos.y)
+                if (nx, ny) not in occupied:
+                    robot.pos = Pos(nx, ny)
+            state.last_sent_command = commands
+            state.round_no += 1
+        self.assertEqual(idle, [])
+        self.assertGreater(railgun_dealt, 0)
+        self.assertLessEqual(railgun_on_full, railgun_dealt * 0.2, (railgun_on_full, railgun_dealt))
+
+
+class DayAssignmentMatchesNightLayoutTests(unittest.TestCase):
+    """白天三人各守一门时按夜里的布局分炮：开拓者守非火箭炮，否则入夜换炮位要穿院子、电磁炮空着。"""
+
+    def test_pioneer_keeps_railgun_every_day(self):
+        from src.agent.opening import assign_weapons
+        for round_no in (30, 160, 290, 420):
+            with self.subTest(round_no=round_no):
+                state = _slot_layout_state(round_no)
+                pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+                rocket = next(r for r in state.team_our.roles if r.role_type == 'rocket')
+                stand = Pos(rocket.pos.x, rocket.pos.y - 1)  # 一门火箭旁，但不是双火箭共用位
+                for other in state.team_our.roles:
+                    if other.id != pioneer.id and (other.pos.x, other.pos.y) == (stand.x, stand.y):
+                        other.pos = Pos(11, 11)
+                pioneer.pos = stand
+                weapon = assign_weapons(state).get(pioneer.id)
+                self.assertIsNotNone(weapon)
+                self.assertNotEqual(weapon.role_type, 'rocket', (round_no, weapon))
+
+
+class NightPressureRecallTests(unittest.TestCase):
+    """敌人逼近时叫外出工人回防：前两夜不叫；第三夜起只有带着能在家用上的道具才叫。"""
+
+    def _state(self, round_no, backpack):
+        state = _slot_layout_state(round_no)
+        state.map_info.zones = [Zone(Pos(3, 10), 'iron'), Zone(Pos(4, 6), 'stone')]
+        eco = next(r for r in state.team_our.roles if r.id == 2)
+        eco.pos = Pos(4, 10)  # 已在后院矿旁
+        eco.backpack = list(backpack)
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(10, 20)
+        pioneer.pos = Pos(20, 20)
+        state.policy_memory['night_released_worker'] = eco.id
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(8, 12)
+        pioneer.pos = Pos(7, 7)
+        # 6 个机器人在基地 7 格内：pressure 成立；守炮两人还没站到炮位旁。
+        state.robot.roles = [RobotRole(1000 + i, Pos(15, 7 + i), 'smallRobot', 40) for i in range(6)]
+        return state, eco
+
+    def _decide_released(self, state, eco):
+        from src.agent.tactics import pressure
+        self.assertTrue(pressure(state))
+        commands = V1Strategy(BasicActionValidator()).decide(state)
+        codes = {e['code'] for e in state.decision_events if e.get('role_id') == eco.id}
+        return commands.get(eco.id), codes
+
+    def test_first_two_nights_never_recall(self):
+        for round_no in (80, 210):
+            for backpack in ([], ['WallFixer']):
+                with self.subTest(round_no=round_no, backpack=backpack):
+                    state, eco = self._state(round_no, backpack)
+                    cmd, codes = self._decide_released(state, eco)
+                    self.assertIn('night_worker_released_to_economy', codes)
+                    self.assertNotIn('night_worker_release_uncovered', codes)
+                    self.assertEqual((cmd or {}).get('action'), 'collect', cmd)
+
+    def test_third_night_empty_handed_stays_out(self):
+        for backpack in ([], ['Medicine']):
+            with self.subTest(backpack=backpack):
+                state, eco = self._state(340, backpack)
+                cmd, codes = self._decide_released(state, eco)
+                self.assertNotIn('night_worker_release_uncovered', codes)
+                self.assertEqual((cmd or {}).get('action'), 'collect', cmd)
+
+    def test_third_night_recalls_worker_carrying_defense_item(self):
+        state, eco = self._state(340, ['WallFixer'])
+        cmd, codes = self._decide_released(state, eco)
+        self.assertIn('night_worker_release_uncovered', codes)
+        self.assertEqual((cmd or {}).get('action'), 'move', cmd)
+        self.assertGreater(cmd['targetPos'][0]['x'], eco.pos.x)  # 往基地方向走
+
+
 class NightTwoOnThreeSimulationTests(unittest.TestCase):
     """正式炮位布局下连跑一段夜战：机器人逼近并贴墙开打，也始终两人三炮、一名工人在后院。"""
 
@@ -670,3 +1269,135 @@ class NightTwoOnThreeSimulationTests(unittest.TestCase):
                 steady = released[2:]
                 self.assertTrue(all(r is not None for r in steady), released)
                 self.assertEqual(len(set(steady)), 1, released)
+
+
+class NightMinerSafetyTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def _night(self):
+        state = _slot_layout_state(80)
+        state.map_info.zones.append(Zone(Pos(5, 10), 'iron'))
+        state.robot.roles = [RobotRole(100, Pos(28, 10), 'smallRobot', 10)]
+        return state
+
+    def test_economist_in_danger_zone_is_not_released(self):
+        state = self._night()
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        economist.pos = Pos(18, 10)  # 入夜时还在正面外、机器人来的方向上
+        self.decide(state)
+        codes = [e['code'] for e in state.decision_events if e.get('role_id') == economist.id]
+        self.assertIn('night_worker_release_unsafe', codes)
+        self.assertNotIn('night_worker_released_to_economy', codes)
+        self.assertIn(str(economist.id), state.policy_memory['weapon_assignment'])  # 按守炮的人撤回
+
+    def test_released_worker_never_takes_an_unsafe_route(self):
+        from src.agent.grid import build_blocked_set
+        from src.agent.opening import night_safe_path
+        state = self._night()
+        worker = next(r for r in state.team_our.roles if r.id == 2)
+        worker.pos = Pos(6, 10)
+        target = Pos(20, 10)  # 只能穿过正面才能到
+        blocked = build_blocked_set(state)
+        self.assertIsNotNone(night_safe_path(worker, target, blocked, state))  # 守炮的人会退回普通路线
+        state.night_released_ids = {worker.id}
+        self.assertIsNone(night_safe_path(worker, target, blocked, state))  # 外出的人不走危险路线
+
+
+class WeaponRebuildAndFixerTests(unittest.TestCase):
+    def decide(self, state):
+        return V1Strategy(BasicActionValidator()).decide(state)
+
+    def test_day_rebuilds_missing_railgun_before_mining(self):
+        from src.agent.opening import courtyard_cells, weapon_slot_plan
+        state = _slot_layout_state(150)
+        state.team_our.gold_num = 80
+        state.team_our.player_tasks = []
+        state.team_our.roles = [r for r in state.team_our.roles if r.role_type != 'railgun']
+        base = next(r for r in state.team_our.roles if r.role_type == 'station')
+        slot = next(p for name, p in weapon_slot_plan(state, base) if name == 'railgun')
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        occupied = {(r.pos.x, r.pos.y) for r in state.team_our.roles if r.id != worker.id}
+        stand = next(
+            c for c in sorted(courtyard_cells(state, base))
+            if max(abs(c[0] - slot[0]), abs(c[1] - slot[1])) == 1 and c not in occupied
+        )
+        worker.pos = Pos(*stand)
+        commands = self.decide(state)
+        self.assertTrue(
+            any(c.get('action') == 'build' and c.get('name') == 'railgun' for c in commands.values())
+            or any(e.get('code') == 'rebuild_missing_weapon' for e in state.decision_events)
+            or any(
+                c.get('action') == 'move' and c.get('targetPos')
+                and max(abs(c['targetPos'][0]['x'] - slot[0]), abs(c['targetPos'][0]['y'] - slot[1])) <= 1
+                for c in commands.values()
+            ),
+            (commands, [e.get('code') for e in state.decision_events if e.get('role_id') in (1, 2, 3)]),
+        )
+
+    def test_rebuilt_l1_jumps_upgrade_queue(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = _slot_layout_state(150, levels=(3, 1, 3), station_level=1)
+        state.team_our.gold_num = 1000
+        state.policy_memory['weapon_rebuild_pending'] = True
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        maybe_start_shop_item_job(worker, state)
+        job = state.worker_item_jobs[1]
+        railgun = next(r for r in state.team_our.roles if r.role_type == 'railgun')
+        self.assertEqual(job['kind'], 'weapon')
+        self.assertEqual(job['item'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(tuple(job['target']), (railgun.pos.x, railgun.pos.y))
+
+    def test_intact_l1_railgun_does_not_jump_station_step(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = _slot_layout_state(150, levels=(3, 1, 2), station_level=1)
+        state.team_our.gold_num = 1000
+        worker = next(r for r in state.team_our.roles if r.id == 1)
+        maybe_start_shop_item_job(worker, state)
+        self.assertEqual(state.worker_item_jobs[1]['kind'], 'station')
+
+    def test_economist_stocks_fixer_from_day_five_not_day_four(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        economist_id = 2
+        day4 = _slot_layout_state(400, levels=(3, 3, 3), station_level=3)
+        day4.team_our.gold_num = 200
+        economist = next(r for r in day4.team_our.roles if r.id == economist_id)
+        maybe_start_shop_item_job(economist, day4)
+        job4 = day4.worker_item_jobs.get(economist_id) or {}
+        self.assertNotEqual(job4.get('item'), 'WallFixer')
+
+        day5 = _slot_layout_state(530, levels=(3, 3, 3), station_level=3)
+        day5.team_our.gold_num = 200
+        economist = next(r for r in day5.team_our.roles if r.id == economist_id)
+        maybe_start_shop_item_job(economist, day5)
+        job5 = day5.worker_item_jobs[economist_id]
+        self.assertEqual(job5['item'], 'WallFixer')
+        self.assertTrue(job5.get('stock_for_night'))
+
+    def test_economist_holds_fixer_by_day_and_uses_at_night(self):
+        from src.agent.brain import decide_shop_item_job, economist_night_home_use
+        from src.agent.grid import build_blocked_set
+        day = _slot_layout_state(530, levels=(3, 3, 3), station_level=3)
+        economist = next(r for r in day.team_our.roles if r.id == 2)
+        economist.backpack = ['WallFixer']
+        wall = next(r for r in day.team_our.roles if r.role_type == 'wall')
+        day.worker_item_jobs[economist.id] = {
+            'item': 'WallFixer',
+            'target': (wall.pos.x, wall.pos.y),
+            'kind': 'wall',
+            'stock_for_night': True,
+        }
+        cmd = decide_shop_item_job(economist, day, build_blocked_set(day), set())
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e['code'] == 'fixer_held_for_night' for e in day.decision_events))
+
+        night = _slot_layout_state(600, levels=(3, 3, 3), station_level=3)
+        economist = next(r for r in night.team_our.roles if r.id == 2)
+        economist.backpack = ['WallFixer']
+        damaged = next(r for r in night.team_our.roles if r.role_type == 'wall')
+        damaged.health = 200
+        night.robot.roles = [RobotRole(100 + i, Pos(16, 8 + i), 'smallRobot', 10) for i in range(4)]
+        cmd = economist_night_home_use(economist, night, build_blocked_set(night), set())
+        self.assertIsNotNone(cmd)
+        self.assertIn(cmd['action'], ('move', 'use'))
+        self.assertNotEqual(cmd.get('action'), 'collect')

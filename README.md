@@ -20,7 +20,7 @@
 
 - 自进化任务已接入：pioneer 仅在白天安全窗口前往任务点并发出 `acceptTask`；任务让位于回防和变现。收到任务后经平台沙盒读文档、调用 LLM 解题并提交；夜间暂停解题器输出，三名存活角色参与武器分配。
 - 推理类（官方消息）：启发式抽出停工/涨价日程，写入 `news_memory.officialPlan` 并打 `official_plan` 日志；可选矿价 LLM 覆盖同一份 JSON。当前**不**据此改工人采矿/卖矿。
-- 长上下文（民间传闻）：跨日累积后**直接**申请宝藏 LLM，写入 `news_memory.folkPlan` 并打 `folk_plan` 日志；不做正则启发式。当前**不**据此指挥开拓者买物/`summonTreasure`。日志搜 `official_plan` / `folk_plan`。
+- 长上下文（民间传闻）：跨日累积后申请宝藏 LLM，写入 `news_memory.folkPlan` 并打 `folk_plan` 日志；「原点+公里」和「第N日白昼/松动」在 LLM 留空时由本地补全。当前**不**据此指挥开拓者买物/`summonTreasure`。日志搜 `official_plan` / `folk_plan`。
 
 **尚未实现**：
 

@@ -447,7 +447,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
             maybe_start_shop_item_job(worker, state)
         self.assertNotIn(10010, state.worker_item_jobs)
 
-    def test_day3_keeper_repairs_front_wall_in_dusk_window(self):
+    def test_day3_keeper_skips_half_health_upgrade_when_wall_gaps_exist(self):
         from src.agent.grid import build_blocked_set
         state = minimal_state(round_no=312, gold_num=1000)
         state.team_our.roles[0] = make_role(10013, 10, 10, "station", health=1500, level=1)
@@ -458,9 +458,8 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
 
         cmd = maintain_front_wall_health(keeper, state, build_blocked_set(state), set())
 
-        self.assertIsNotNone(cmd)
-        self.assertEqual(state.worker_item_jobs[keeper.id]["kind"], "wall")
-        self.assertEqual(state.worker_item_jobs[keeper.id]["target"], (13, 10))
+        self.assertIsNone(cmd)
+        self.assertNotIn(keeper.id, state.worker_item_jobs)
 
     def test_no_job_started_without_enough_gold(self):
         state = minimal_state(gold_num=5)
@@ -565,7 +564,7 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
     def test_pioneer_starts_and_executes_upgrade_job(self):
         state = minimal_state(gold_num=1000)
         state.team_our.roles[0].level = 1  # 基地 level1，会先选中它升级
-        pioneer = make_role(10011, 12, 8, "pioneer", back_pack_capability=40)  # 站在新火箭预留位上
+        pioneer = make_role(10011, 9, 9, "pioneer", back_pack_capability=40)  # 站在火箭预留位上
         state.team_our.roles.append(pioneer)
         strategy = V1Strategy(BasicActionValidator())
         commands = strategy.decide(state)
@@ -575,16 +574,22 @@ class PioneerParticipatesInJobsTests(unittest.TestCase):
 
 class MultiRoundRepairIntegrationTest(unittest.TestCase):
     def test_worker_upgrades_damaged_wall_across_several_rounds(self):
-        """阶段墙已齐后，受损一级墙走升级券：买券、走到墙边、use。升级回满血。"""
-        from src.agent.opening import staged_wall_plan
+        """三面墙已齐后，受损一级墙走升级券：买券、走到墙边、use。升级回满血。"""
+        from src.agent.opening import primary_wall_plan
         from src.agent.brain import own_station
-        state = minimal_state(gold_num=1000)
-        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(0, 0), neutral_type="weaponShop")])
+        state = minimal_state(gold_num=1000, round_no=270)
+        state.team_our.roles[0].level = 3
+        state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(14, 15), neutral_type="weaponShop")])
         base = own_station(state)
-        for i, (x, y) in enumerate(staged_wall_plan(state, base)):
+        for i, (x, y) in enumerate(primary_wall_plan(state, base)):
             state.team_our.roles.append(make_role(500 + i, x, y, "wall", health=400, level=1))
         worker = make_role(10010, 15, 15, "worker", backpack=[], back_pack_capability=100)
         state.team_our.roles.append(worker)
+        state.team_our.roles += [
+            make_role(21, 12, 10, "rocket", level=3, health=1000),
+            make_role(22, 12, 8, "rocket", level=3, health=1000),
+            make_role(23, 12, 12, "railgun", level=3, health=1000),
+        ]
 
         strategy = V1Strategy(BasicActionValidator())
         validator = BasicActionValidator()

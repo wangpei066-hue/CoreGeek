@@ -39,17 +39,18 @@ class DefensePriorityTests(unittest.TestCase):
         self.assertFalse(any(e['code'] == 'task_yields_to_defense' and e.get('role_id') == 3
                              for e in state.decision_events))
 
-    def test_day_three_worker_upgrades_front_wall_below_half_health(self):
+    def test_day_three_worker_builds_instead_of_wall_voucher_when_gaps_exist(self):
         state = defended()
         state.team_our.gold_num = 100
-        state.round_no = 312  # 还有新墙要建时，入夜前窗口内才升级残墙
+        state.round_no = 312
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         worker = next(r for r in state.team_our.roles if r.role_type == 'worker')
         worker.pos = Pos(8, 9)
         front = primary_wall_plan(state, state.team_our.roles[0])[0]
         state.team_our.roles.append(make_role(200, front[0], front[1], 'wall', health=400, level=1))
         commands = self.decide(state)
-        self.assertEqual(commands[worker.id], {'action': 'buy', 'name': 'WallUpgradeVoucher1', 'num': 1})
+        self.assertIn(commands[worker.id].get('action'), ('build', 'move', 'collect'))
+        self.assertNotEqual(commands[worker.id].get('name'), 'WallUpgradeVoucher1')
 
     def _day_three_low_front_walls(self, count, gold=300, round_no=312):
         state = defended()
@@ -63,13 +64,99 @@ class DefensePriorityTests(unittest.TestCase):
             state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=400, level=1))
         return state, workers
 
-    def test_day_three_only_wall_keeper_takes_front_wall_jobs(self):
+    def test_day_three_only_wall_keeper_builds_when_gaps_remain(self):
         state, workers = self._day_three_low_front_walls(2)
         commands = self.decide(state)
         keeper, economist = workers[0], workers[1]
-        self.assertEqual(commands[keeper.id]['name'], 'WallUpgradeVoucher1')
-        self.assertNotEqual(commands.get(economist.id, {}).get('name'), 'WallUpgradeVoucher1')
+        self.assertIn(commands[keeper.id].get('action'), ('build', 'move', 'collect'))
+        self.assertNotEqual(commands.get(keeper.id, {}).get('name'), 'WallUpgradeVoucher1')
         self.assertNotEqual(state.worker_item_jobs.get(economist.id, {}).get('kind'), 'wall')
+
+    def test_day3_keeper_upgrades_healthy_front_wall_when_u_complete(self):
+        """三面墙没有缺口后，施工工白天买墙券，优先升迎敌正面，满血也升。"""
+        state = defended()
+        state.team_our.gold_num = 200
+        state.round_no = 270
+        state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
+        keeper = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        keeper.pos = Pos(8, 9)
+        economist.pos = Pos(4, 11)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        commands = self.decide(state)
+        self.assertEqual(commands[keeper.id].get('action'), 'buy')
+        self.assertEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+        job = state.worker_item_jobs[keeper.id]
+        self.assertEqual(job['kind'], 'wall')
+        self.assertEqual(job['target'][0], 13)
+
+    def test_wall_gaps_preempt_unbought_wall_upgrade_job(self):
+        from src.agent.brain import maybe_start_shop_item_job
+        state = defended()
+        state.round_no = 270
+        keeper = next(r for r in state.team_our.roles if r.id == 1)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])[:-2]):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        state.worker_item_jobs[keeper.id] = {
+            'item': 'WallUpgradeVoucher1', 'target': (13, 10), 'kind': 'wall'}
+        commands = self.decide(state)
+        self.assertIn(commands[keeper.id].get('action'), ('build', 'move', 'collect'))
+        self.assertNotEqual(commands[keeper.id].get('name'), 'WallUpgradeVoucher1')
+
+    def test_wall_upgrade_picks_center_front_before_wings(self):
+        from src.agent.brain import _pick_spawn_facing_wall_to_upgrade
+        state = defended()
+        state.round_no = 270
+        base = state.team_our.roles[0]
+        ring = primary_wall_plan(state, base)
+        for i, p in enumerate(ring):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        from src.agent.opening import defense_mid_y
+        mid_y = defense_mid_y(state, base)
+        wing = next(p for p in ring if p[0] != 13)
+        center = min((p for p in ring if p[0] == 13), key=lambda p: abs(p[1] - mid_y))
+        for wall in state.team_our.roles:
+            if wall.role_type == 'wall' and (wall.pos.x, wall.pos.y) == wing:
+                wall.level = 2
+        pick = _pick_spawn_facing_wall_to_upgrade(state, set())
+        self.assertEqual(pick.pos.x, 13)
+        self.assertLessEqual(abs(pick.pos.y - mid_y), 1)
+        self.assertLess(abs(pick.pos.y - mid_y), abs(wing[1] - mid_y))
+
+    def test_wall_upgrade_phase3_prefers_center_three_front(self):
+        from src.agent.brain import _pick_spawn_facing_wall_to_upgrade
+        from src.agent.opening import spawn_ring_wall_points, defense_mid_y
+        state = defended()
+        state.round_no = 270
+        base = state.team_our.roles[0]
+        ring = primary_wall_plan(state, base)
+        mid_y = defense_mid_y(state, base)
+        for i, p in enumerate(ring):
+            lvl = 2 if p in spawn_ring_wall_points(state, base) else 1
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=lvl))
+        pick = _pick_spawn_facing_wall_to_upgrade(state, set())
+        self.assertEqual(pick.level, 2)
+        self.assertEqual(pick.pos.x, 13)
+        self.assertLessEqual(abs(pick.pos.y - mid_y), 1)
+
+    def test_day5_keeper_wall_upgrade_precedes_station(self):
+        """第五天三面墙已齐：施工工买墙券升迎敌面，不把回合让给升基地而空转。"""
+        from src.agent.brain import maybe_start_shop_item_job
+        state = defended()
+        state.team_our.gold_num = 426
+        state.round_no = 530
+        for building in state.team_our.roles:
+            if building.role_type in ('gatling', 'railgun', 'rocket'):
+                building.level = 2
+        keeper = next(r for r in state.team_our.roles if r.id == 1)
+        for i, p in enumerate(primary_wall_plan(state, state.team_our.roles[0])):
+            state.team_our.roles.append(make_role(200 + i, p[0], p[1], 'wall', health=1000, level=1))
+        maybe_start_shop_item_job(keeper, state)
+        job = state.worker_item_jobs[keeper.id]
+        self.assertEqual(job['kind'], 'wall')
+        self.assertEqual(job['item'], 'WallUpgradeVoucher1')
+        self.assertEqual(job['target'][0], 13)
 
     def test_keeper_builds_new_walls_before_half_health_upgrades_early_day(self):
         """白天还早、侧翼没齐：施工工先补新墙，不跑商店升半血墙。"""
@@ -245,19 +332,22 @@ class DefensePriorityTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'vendor'))
         self.assertEqual(self.decide(state)[1], {'action': 'sell', 'name': 'iron', 'num': 1})
 
-    def test_weapon_layout_front_flanks_and_rear_rocket_pair(self):
+    def test_weapon_layout_rockets_behind_station_railgun_front(self):
+        from src.agent.opening import attack_direction, weapon_slot_plan
         state = opening_state()
         base = state.team_our.roles[0]
         for x, direction in ((10, 1), (30, -1)):
             base.pos = Pos(x, 10)
-            front_rocket = weapon_candidates(state, base, 'rocket')[0]
-            state.team_our.roles.append(make_role(50, front_rocket[0], front_rocket[1], 'rocket'))
-            rear_rocket = weapon_candidates(state, base, 'rocket')[0]
+            (_, rocket_a), (_, railgun_slot), (_, rocket_b) = weapon_slot_plan(state, base)
+            first = weapon_candidates(state, base, 'rocket')[0]
+            state.team_our.roles.append(make_role(50, first[0], first[1], 'rocket'))
+            second = weapon_candidates(state, base, 'rocket')[0]
             railgun = weapon_candidates(state, base, 'railgun')[0]
-            self.assertEqual(rear_rocket[0], front_rocket[0] - direction)
-            self.assertEqual(rear_rocket[1], front_rocket[1])
-            self.assertEqual(railgun[0], front_rocket[0])
-            self.assertNotEqual(railgun[1], front_rocket[1])
+            self.assertEqual({first, second}, {rocket_a, rocket_b})
+            self.assertEqual(first[0], second[0])
+            self.assertEqual(first[0], base.pos.x - 1 if direction == 1 else base.pos.x + 2)
+            self.assertEqual(railgun, railgun_slot)
+            self.assertGreater((railgun[0] - first[0]) * attack_direction(state, base), 0)
             state.team_our.roles.pop()
 
     def test_rebuild_missing_wall_beats_third_tier_upgrade(self):

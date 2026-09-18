@@ -7,6 +7,7 @@ from pathlib import Path
 from src.agent.news_memory import (
     NewsMemory, game_day, heuristic_ore_effect, heuristic_ore_effects, vendor_prices,
     legend_mentions_open_time, merge_ore_effect, is_resume_official,
+    parse_origin_relative_pos, parse_legend_open_window,
 )
 from src.agent.prompt_router import PromptRouter, parse_json_object, make_treasure_prompt
 from src.agent.protocol import MatchState, MapInfo, TeamOur, WorldNews, ShopItem, Zone, Pos, Role
@@ -402,6 +403,62 @@ class NewsMemoryTests(unittest.TestCase):
         hyp = self.memory.data["treasureHypothesis"]
         self.assertEqual(hyp["openFromRound"], 390)
         self.assertEqual(hyp["openToRound"], 519)
+
+    def test_origin_km_and_fifth_day_daytime_are_inferred(self):
+        self.assertEqual(
+            parse_origin_relative_pos("意外在原点之北三公里、之东三公里附近发现石门"),
+            {"x": 3, "y": 3},
+        )
+        self.assertIsNone(parse_origin_relative_pos("西部有一石门，门需三钥"))
+        self.assertTrue(legend_mentions_open_time("唯待第五日白昼方可松动"))
+        self.assertEqual(parse_legend_open_window("唯待第五日白昼方可松动"), (520, 589))
+        self.assertFalse(legend_mentions_open_time("西部有一石门，门需三钥"))
+
+        folk = (
+            "一个猎人在原点之北三公里、之东三公里附近发现石门。"
+            "老人叹道：这等三封石门，唯待第五日白昼方可松动。"
+        )
+        state = self._state(391, folk=folk)
+        self.memory.ingest(state)
+        self.memory.apply_treasure_llm({
+            "ready": False,
+            "altarPos": None,
+            "items": ["AcientTablet", "StarSand", "FlameBreath"],
+            "openFromRound": None,
+            "openToRound": None,
+            "confidence": 0.6,
+            "notes": "物品明确；坐标仅西部与模糊方位；第五日为推测",
+        })
+        hyp = self.memory.data["treasureHypothesis"]
+        self.assertEqual(hyp["altarPos"], {"x": 3, "y": 3})
+        self.assertEqual(hyp["openFromRound"], 520)
+        self.assertEqual(hyp["openToRound"], 589)
+        self.assertGreaterEqual(hyp["confidence"], 0.7)
+        self.assertTrue(hyp["ready"])
+        prompt = make_treasure_prompt(state, self.memory)
+        self.assertIn("1公里=1格", prompt)
+        self.assertIn("第五日白昼方可松动", prompt)
+        self.assertIn("松动", prompt)
+
+    def test_ingest_backfills_incomplete_hypothesis_without_new_legend(self):
+        folk = "原点之北三公里、之东三公里有石门。唯待第五日白昼方可松动。"
+        state = self._state(392, folk=folk)
+        self.memory.ingest(state)
+        self.memory.data["treasureHypothesis"] = {
+            "ready": False, "altarPos": None,
+            "items": ["AcientTablet", "StarSand", "FlameBreath"],
+            "openFromRound": None, "openToRound": None,
+            "confidence": 0.6, "notes": "llm left gaps", "source": "llm",
+        }
+        self.memory.data["needTreasureDecode"] = False
+        self.memory.store_folk_plan()
+        state.round_no = 393
+        self.memory.ingest(state)
+        hyp = self.memory.data["treasureHypothesis"]
+        self.assertEqual(hyp["altarPos"], {"x": 3, "y": 3})
+        self.assertEqual(hyp["openFromRound"], 520)
+        self.assertEqual(hyp["openToRound"], 589)
+        self.assertTrue(hyp["ready"])
 
     def test_treasure_prompt_strips_guessed_window_from_previous(self):
         state = self._state(262, folk="西部有一石门，门需三钥")

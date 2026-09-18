@@ -76,7 +76,7 @@
 | `official_ingested` | — | 新官方消息原文 |
 | **`official_plan`** | **`news_memory.officialPlan`** | **`plan` JSON**：`oreEffects`、今日 `bannedOres` / `stockpileOres` / `priceUpOres`。当前不指挥工人 |
 | `folk_ingested` | — | 新传闻原文、累计 `legends` |
-| **`folk_plan`** | **`news_memory.folkPlan`** | **`plan` JSON**：`ready`、`confidence`(0–1)、`altarPos`、`items`、开启窗口、`notes`。仅 LLM 写入；当前不指挥开拓者 |
+| **`folk_plan`** | **`news_memory.folkPlan`** | **`plan` JSON**：`ready`、`confidence`(0–1)、`altarPos`、`items`、开启窗口、`notes`。LLM 写入；原点公里/第N日松动可本地补全；当前不指挥开拓者 |
 | `prompt_sent` | LLM | `consumer` 为 `ore` 或 `treasure`（不再混合），完整 `promptText` |
 | `llm_output` | LLM | `parsedJson` + 落地后的 `plan` |
 | `llm_empty` | LLM | 等待中的响应为空 |

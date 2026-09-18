@@ -3,6 +3,8 @@
 数值来自任务书4.5.1/4.5.4/4.7.2；电磁炮/加特林弹道的直线判定是本地近似，
 官方未给出完整遮挡算法（见 docs/rules_verified.md）。
 一回合内所有武器共用一份 DamageLedger：先算火箭，再算电磁炮补刀，避免多门炮重复打死同一只。
+第五天起 BOSS 刷新后，火箭先在能打到 BOSS 的落点里选（中心或溅射），再比收益；
+射程够不着才退回打密集小怪。BOSS 远距离威胁系数不低于 BOSS_MIN_URGENCY。
 """
 from math import hypot
 from typing import Optional
@@ -25,6 +27,8 @@ KILL_BONUS = 0.5          # 打死时额外加 score × KILL_BONUS
 ATTACKING_RANGE = 3       # 机器人射程3：距我方建筑 ≤3 视为正在攻击
 ATTACKING_URGENCY = 3.0
 APPROACH_SPAN = 10        # 距离 3→13 时威胁系数从 1 线性降到 0
+BOSS_PRIORITY_DAY = 5     # 第五天起 BOSS 刷新：火箭优先打能溅到 BOSS 的落点
+BOSS_MIN_URGENCY = 1.0    # BOSS 会走到墙下，刷新边威胁不能按 0 算
 LATE_NIGHT_ROUNDS = 10    # 最后这么多回合不再投资天亮前打不死的目标
 NIGHT_ROUNDS = 60
 CYCLE_ROUNDS = 130
@@ -58,6 +62,8 @@ class TargetContext:
                      if b.role_type in _BUILDINGS and b.health > 0]
         rounds_left = _night_rounds_left(state)
         capacity = _kill_capacity(state, rounds_left)
+        from .news_memory import game_day
+        self.prioritize_boss = game_day(getattr(state, "round_no", None)) >= BOSS_PRIORITY_DAY
         self.value = {}
         for r in self.robots:
             hp_max, score, atk = ROBOT_STATS.get(r.role_type, (max(r.health, 1), 0, 0))
@@ -66,6 +72,10 @@ class TargetContext:
                 urgency = ATTACKING_URGENCY
             else:
                 urgency = max(0.0, 1.0 - (dist - ATTACKING_RANGE) / APPROACH_SPAN)
+            if r.role_type == "bossRobot":
+                # 800 血摊到积分上极低；刷新边距建筑 >13 时威胁原公式是 0，
+                # 火箭会去打近处小怪，BOSS 一路走到墙根都挨不到。
+                urgency = max(urgency, BOSS_MIN_URGENCY)
             if rounds_left <= LATE_NIGHT_ROUNDS and r.health > capacity and urgency < ATTACKING_URGENCY:
                 self.value[r.id] = (0.0, 0.0)  # 天亮会被清除，打不死的伤害白费
                 continue
@@ -140,6 +150,19 @@ def _rocket_damage(ctx: TargetContext, x: int, y: int) -> dict:
     return damage
 
 
+def _boss_lock_cells(ctx: TargetContext, cells, ledger: DamageLedger):
+    """第五天起：只保留能打到仍存活 BOSS 的落点（中心或溅射）。射程够不着则不锁。"""
+    if not getattr(ctx, "prioritize_boss", False):
+        return None
+    bosses = [r for r in ctx.robots
+              if r.role_type == "bossRobot" and ledger.remaining(r) > 0]
+    if not bosses:
+        return None
+    ids = {r.id for r in bosses}
+    locked = {cell for cell in cells if ids.intersection(_rocket_damage(ctx, *cell))}
+    return locked or None
+
+
 def _merge(a: dict, b: dict) -> dict:
     out = dict(a)
     for k, v in b.items():
@@ -158,12 +181,13 @@ def plan_rocket(weapon, ctx: TargetContext, ledger: DamageLedger):
                     cells.add((x, y))
     if not cells:
         return None
+    search = _boss_lock_cells(ctx, cells, ledger) or cells
     scratch = DamageLedger()
     scratch.pending = dict(ledger.pending)
     positions, damage = [], {}
     for _ in range(_level(weapon)):
         best, best_cell, best_dmg = 0.0, None, None
-        for cell in sorted(cells):
+        for cell in sorted(search):
             dmg = _rocket_damage(ctx, *cell)
             g = ctx.gain(dmg, scratch)
             if g > best:
@@ -179,7 +203,7 @@ def plan_rocket(weapon, ctx: TargetContext, ledger: DamageLedger):
     # 逐枚贪心看不到"几枚叠加才打死"的收益，再比较整轮叠在同一格的方案。
     level = _level(weapon)
     best_total = ctx.gain(damage, ledger)
-    for cell in sorted(cells):
+    for cell in sorted(search):
         stacked = {rid: dmg * level for rid, dmg in _rocket_damage(ctx, *cell).items()}
         g = ctx.gain(stacked, ledger)
         if g > best_total + 1e-9:
