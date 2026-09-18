@@ -1016,6 +1016,12 @@ class PioneerTaskSolver:
                     s['workspace'] = answer['workspace']
                 if answer['action'] == 'read':
                     path = answer['path']
+                    current_docs = extract_md_paths(state.phase_task)
+                    if current_docs and Path(path).name.startswith('task_') and Path(path).name != Path(current_docs[0]).name:
+                        s['history'].append({'blocked': '读取了其他任务文档', 'path': path})
+                        self._fact(s, '已拦截跨任务文档读取；请只读取 currentTaskDocument 或其明确引用的资料。')
+                        s['stage'] = 'ask'
+                        return
                     env = s.get('documentDir') or s.get('workspace')
                     if self._is_duplicate_failure(s, 'read', path, env, 'not_found'):
                         s.setdefault('metrics', {})['duplicateBlocked'] = s['metrics'].get('duplicateBlocked', 0) + 1
