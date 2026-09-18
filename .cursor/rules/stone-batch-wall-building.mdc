@@ -15,6 +15,6 @@ When changing worker, opening, mining, or wall-building logic, preserve the inva
   - reachable stone mines are exhausted or blocked,
   - the night/defense deadline is close enough that waiting for a full batch would miss the build window.
 - This applies to both the main opening path (`opening_wall_work`) and fallback paths such as
-  `opening_worker_survival_action` and `opening_worker_ensure_work`.
+  `opening_worker_survival_action`.
 - If adding a new fallback or emergency wall path, add or update tests proving that one carried stone
   continues mining early in the day and only builds once the batch/deadline condition is met.

@@ -85,6 +85,141 @@ class RocketTargetingTests(unittest.TestCase):
         state = night_state([rocket, wall], robots, round_no=128)
         self.assertIsNotNone(plan_attack(rocket, robots, state))
 
+    def test_day5_rocket_hits_front_boss_instead_of_rear_swarm(self):
+        """第五夜：BOSS 在刷新边时，不能因为近处小怪堆积分更高就全程不打 BOSS。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=30, level=2, cooldown=0)
+        robots = block(16, 16) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertTrue(any(abs(p["x"] - 28) <= 1 and abs(p["y"] - 10) <= 1 for p in positions), positions)
+        self.assertIn(1, damage)
+        self.assertGreaterEqual(damage[1], 10)
+
+    def test_day5_rocket_centers_on_boss_when_only_splash_also_hits(self):
+        """能打到 BOSS 的落点里仍选收益最高的：孤立 BOSS 应打中心 20，不打旁边溅射 10。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=30, level=1, cooldown=0)
+        robots = [robot(1, 26, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertEqual(positions, [{"x": 26, "y": 10}])
+        self.assertEqual(damage[1], 20)
+
+    def test_day5_out_of_range_boss_does_not_block_in_range_swarm(self):
+        """BOSS 还在 1 级火箭射程外时，仍打射程内的密集堆，不空放。"""
+        rocket = make_role(10040, 9, 10, "rocket", attack_range=10, level=1, cooldown=0)
+        robots = block(12, 12) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=590)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertEqual(positions, [{"x": 13, "y": 13}])
+
+    def test_day1_still_prefers_dense_block_over_front_boss(self):
+        """第三天前保持原策略：近处小怪堆优先于远处单独 BOSS。"""
+        rocket = make_role(10040, 10, 10, "rocket", attack_range=30, level=1, cooldown=0)
+        robots = block(16, 16) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([rocket], robots, round_no=80)
+        positions, damage = plan_attack(rocket, robots, state)
+        self.assertEqual(positions, [{"x": 17, "y": 17}])
+        self.assertNotIn(1, damage)
+
+
+DAY3_NIGHT = 2 * 130 + 80
+DAY5_NIGHT = 4 * 130 + 80
+
+
+class BigRobotSplitTests(unittest.TestCase):
+    """第三天起：id 最小的火箭锚定大型/BOSS（算溅射）；另一门清数量，修墙包用光且大型贴墙开打后也锁大型。电磁炮必须带上大型。"""
+
+    def _front(self):
+        # 两段墙前各有一堆怪：一堆是大型带三只小怪，另一堆是一整块 3×3 中型
+        walls = [make_role(10050, 18, 20, "wall", health=1000), make_role(10051, 28, 11, "wall", health=1000)]
+        robots = [robot(1, 20, 20, "largeRobot")]
+        robots += [robot(10 + i, 20 + dx, 20 + dy) for i, (dx, dy) in enumerate(
+            [(1, -1), (1, 0), (1, 1)])]
+        robots += block(30, 10, "middleRobot", start_id=200)
+        return walls, robots
+
+    def test_anchor_rocket_locks_large_with_splash(self):
+        wall, robots = self._front()
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        state = night_state([anchor, other] + wall, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(anchor, robots, state)
+        self.assertIn(1, damage)
+        self.assertTrue(any(rid in damage for rid in (10, 11, 12)), damage)
+        self.assertTrue(all(abs(p["x"] - 20) <= 1 and abs(p["y"] - 20) <= 1 for p in positions), positions)
+
+    def test_other_rocket_clears_swarm_while_large_approaches(self):
+        """大型还在路上、没贴建筑时，另一门火箭仍清中小堆，不提前两门都锁。"""
+        walls = [make_role(10050, 18, 20, "wall", health=1000)]
+        robots = [robot(1, 28, 10, "largeRobot")]
+        robots += block(16, 16, "middleRobot", start_id=200)
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        state = night_state([anchor, other] + walls, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(other, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertTrue(all(16 <= p["x"] <= 18 for p in positions), positions)
+
+    def test_other_rocket_keeps_clearing_swarm_while_fixers_on_hand(self):
+        """大型贴墙开打但全队还有修墙包：墙由修墙包保，另一门火箭照常清另一侧中型堆。"""
+        wall, robots = self._front()
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        keeper = make_role(10011, 5, 5, "worker", backpack=["WallFixer"], back_pack_capability=100)
+        state = night_state([anchor, other, keeper] + wall, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(other, robots, state)
+        self.assertNotIn(1, damage)
+        self.assertTrue(all(30 <= p["x"] <= 32 for p in positions), positions)
+
+    def test_other_rocket_locks_large_when_sieging_wall(self):
+        """大型已经贴墙开打、全队没有修墙包：另一门火箭也锁大型（周围小怪吃溅射），不再去打另一侧中型堆。"""
+        wall, robots = self._front()
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=99, level=3, cooldown=0)
+        state = night_state([anchor, other] + wall, robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(other, robots, state)
+        self.assertIn(1, damage)
+        self.assertTrue(any(rid in damage for rid in (10, 11, 12)), damage)
+        self.assertTrue(all(abs(p["x"] - 20) <= 1 and abs(p["y"] - 20) <= 1 for p in positions), positions)
+
+    def test_day2_anchor_rocket_not_locked(self):
+        wall, robots = self._front()
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=99, level=3, cooldown=0)
+        state = night_state([anchor] + wall, robots, round_no=130 + 80)
+        _, damage = plan_attack(anchor, robots, state)
+        self.assertNotIn(1, damage)
+
+    def test_day5_second_rocket_no_longer_locks_boss(self):
+        anchor = make_role(10040, 9, 10, "rocket", attack_range=30, level=2, cooldown=0)
+        other = make_role(10041, 9, 11, "rocket", attack_range=30, level=2, cooldown=0)
+        robots = block(16, 16) + [robot(1, 28, 10, "bossRobot")]
+        state = night_state([anchor, other], robots, round_no=DAY5_NIGHT)
+        _, damage = plan_attack(other, robots, state)
+        self.assertNotIn(1, damage)
+
+    def test_railgun_must_include_large(self):
+        railgun = make_role(10042, 10, 10, "railgun", attack_range=10, level=1)
+        robots = [robot(1, 14, 10, health=10), robot(2, 10, 14, "largeRobot")]
+        state = night_state([railgun], robots, round_no=DAY3_NIGHT)
+        positions, damage = plan_attack(railgun, robots, state)
+        self.assertEqual(positions, [{"x": 10, "y": 14}])
+        self.assertEqual(damage, {2: 10})
+
+    def test_railgun_before_day3_still_finishes_weak(self):
+        railgun = make_role(10042, 10, 10, "railgun", attack_range=10, level=1)
+        robots = [robot(1, 14, 10, health=10), robot(2, 10, 14, "largeRobot")]
+        state = night_state([railgun], robots, round_no=130 + 80)
+        positions, _ = plan_attack(railgun, robots, state)
+        self.assertEqual(positions, [{"x": 14, "y": 10}])
+
+    def test_railgun_falls_back_when_large_out_of_range(self):
+        railgun = make_role(10042, 10, 10, "railgun", attack_range=6, level=1)
+        robots = [robot(1, 14, 10, health=10), robot(2, 30, 30, "largeRobot")]
+        state = night_state([railgun], robots, round_no=DAY3_NIGHT)
+        positions, _ = plan_attack(railgun, robots, state)
+        self.assertEqual(positions, [{"x": 14, "y": 10}])
+
 
 class RailgunTargetingTests(unittest.TestCase):
     def test_railgun_finishes_robot_rocket_already_damaged(self):

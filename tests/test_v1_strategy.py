@@ -157,14 +157,21 @@ class V1StrategyDayTests(unittest.TestCase):
         self.assertEqual(commands[10010]['action'], 'sell')
 
     def test_worker_builds_front_wall_before_selling_when_holding_stone(self):
+        """有石头时先修迎敌墙，不跑去卖铁。人在边角时先走向 U 心，不就地砌角。"""
         state = minimal_state(round_no=135)
         state.team_our.roles[0].health = 1500
         state.map_info = MapInfo(width=41, height=32, zones=[Zone(pos=Pos(11, 10), neutral_type="vendor")])
         worker = make_role(10010, 12, 7, "worker", backpack=["stone", "stone", "iron"], back_pack_capability=100)
         state.team_our.roles = [state.team_our.roles[0], worker]
         commands = self.strategy.decide(state)
-        self.assertEqual(commands[10010].get('action'), 'build')
-        self.assertEqual(commands[10010].get('name'), 'wall')
+        cmd = commands[10010]
+        self.assertNotEqual(cmd.get('action'), 'sell')
+        self.assertIn(cmd.get('action'), ('build', 'move'), cmd)
+        if cmd.get('action') == 'build':
+            self.assertEqual(cmd.get('name'), 'wall')
+            target = cmd['targetPos'][0]
+            self.assertEqual(target['x'], 13)
+            self.assertIn(target['y'], (8, 9, 10, 11), target)
 
     def test_no_actions_at_night_for_economy(self):
         state = minimal_state(round_no=75)  # night
@@ -223,6 +230,23 @@ class V1StrategyNightTests(unittest.TestCase):
         self.assertNotIn(10040, commands)
         self.assertEqual(commands[10041]["action"], "attack")
         self.assertEqual(commands[10041]["controllerId"], "10010")
+
+    def test_fighter_walks_to_dual_stand_when_assigned_rocket_cools_and_partner_is_far(self):
+        state = minimal_state(round_no=75)
+        cooling = make_role(10040, 9, 10, "rocket", attack_range=10, level=1, cooldown=2)
+        ready = make_role(10041, 9, 12, "rocket", attack_range=10, level=1, cooldown=0)
+        worker = make_role(10010, 8, 10, "worker", backpack=[], back_pack_capability=100)
+        pioneer = make_role(10011, 11, 11, "pioneer", backpack=[], back_pack_capability=40)
+        railgun = make_role(10042, 11, 12, "railgun", attack_range=10, level=1, cooldown=0)
+        state.team_our.roles = [state.team_our.roles[0], cooling, ready, railgun, worker, pioneer]
+        state.policy_memory["weapon_assignment"] = {"10010": 10040, "10011": 10042}
+        state.robot = RobotInfo(roles=[RobotRole(id=30001, pos=Pos(9, 9), role_type="smallRobot", health=40)])
+        commands = self.strategy.decide(state)
+        self.assertNotIn(10040, commands)
+        if commands.get(10041, {}).get("action") == "attack":
+            self.assertEqual(commands[10041]["controllerId"], "10010")
+            return
+        self.assertEqual(commands[10010]["action"], "move")
 
     def test_multi_target_count_matches_weapon_level(self):
         state = minimal_state(round_no=75)

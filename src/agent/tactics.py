@@ -9,6 +9,12 @@ WAVE_LOCAL_STREAK = 3   # 连续空窗后允许院内就近施工，不是官方
 WAVE_CLEAR_STREAK = 8   # 连续空窗后才按清波外出；仍不能证明不会再刷。
 DAILY_SUMMON_LIMIT = 10
 DEFENSE_RESERVE = 100
+# 召唤令（离线夜战模拟 exp3/exp4）：召唤出来的机器人被对手打死，击杀分算对手的；小型/中型召唤令从不
+# 提高对手基地被拆率，只白送分。同等金币 BOSS 全面优于大型；对“基地2级+墙2级+会修墙”的对手怎么召唤都推不倒。
+# 所以只在对手基地等级低、天数够晚时一次买齐 BOSS（大型只在对手基地1级、墙1级的第七天起做便宜补刀）。
+SUMMON_FROM_DAY = 5
+SUMMON_LATE_DAY = 7
+ENEMY_BASE_HIT_RATIO = 0.1  # 敌方基地上一夜掉血超过满血这个比例，视为防守吃紧
 
 
 def begin_round(state):
@@ -37,8 +43,6 @@ def begin_round(state):
             state.policy_memory['night_empty_streak'] = int(state.policy_memory.get('night_empty_streak') or 0) + 1
         from .opening import update_wall_time_overrun
         update_wall_time_overrun(state)
-        from .economy import note_night_contact
-        note_night_contact(state)
     from .opening import primary_wall_plan, wall_priority
     base = own_station(state)
     if base:
@@ -48,6 +52,102 @@ def begin_round(state):
         state.policy_memory['front_wall_seen'] = [list(p) for p in sorted(known & front)]
         state.policy_memory['front_wall_breaches'] = [list(p) for p in sorted((known & front) - standing)]
     _note_respawns(state)
+    _track_enemy_base(state)
+
+
+def enemy_station(state):
+    for role in (state.team_enemy.roles if getattr(state, 'team_enemy', None) else []):
+        if role.role_type == 'station' and role.health > 0:
+            return role
+    return None
+
+
+def _track_enemy_base(state):
+    """记录敌方基地每夜最低血量；白天第一回合结算“上一夜掉了多少血”（升级回满会被当成没掉血，偏保守）。"""
+    base = enemy_station(state)
+    if base is None:
+        return
+    mem = state.policy_memory
+    cycle = (state.round_no or 0) % 130
+    if cycle >= 70:
+        if mem.get('enemy_night_round') != (state.round_no or 0) // 130:
+            mem['enemy_night_round'] = (state.round_no or 0) // 130
+            mem['enemy_night_start'] = base.health
+            mem['enemy_night_min'] = base.health
+        mem['enemy_night_min'] = min(mem.get('enemy_night_min', base.health), base.health)
+    elif 'enemy_night_start' in mem:
+        mem['enemy_last_night_loss'] = max(0, mem.pop('enemy_night_start') - mem.pop('enemy_night_min', base.health))
+        mem.pop('enemy_night_round', None)
+
+
+def enemy_front_weak(state):
+    """敌方墙数少或平均等级 1 级（墙全图可见）。"""
+    walls = [r for r in (state.team_enemy.roles if getattr(state, 'team_enemy', None) else [])
+             if r.role_type == 'wall' and r.health > 0]
+    if len(walls) < 6:
+        return True
+    return sum((w.level or 1) for w in walls) / len(walls) < 1.5
+
+
+def summon_plan(state):
+    """返回 (召唤令名, 张数) 或 None。只买 BOSS（对手很弱时第七天起可用大型补刀），一次买齐当天用掉。
+    模拟结论：对手基地1级 → 第七天 1 BOSS、第五/六天 2 BOSS 即可推倒；基地2级 → 第七天要 2 BOSS，
+    第五/六天要 3 BOSS 且对手上一夜基地已掉血才值得；基地3级不召唤。"""
+    from .brain import max_health
+    from .news_memory import game_day
+    base = enemy_station(state)
+    if base is None:
+        return None
+    day = game_day(state.round_no)
+    if day < SUMMON_FROM_DAY:
+        return None
+    level = base.level or 1
+    hurt = (state.policy_memory.get('enemy_last_night_loss') or 0) >= max_health(base) * ENEMY_BASE_HIT_RATIO
+    late = day >= SUMMON_LATE_DAY
+    if level <= 1:
+        if late:
+            return ('BossRobotSummonOrder', 1)
+        return ('BossRobotSummonOrder', 2) if (hurt or enemy_front_weak(state)) else None
+    if level == 2:
+        if late:
+            return ('BossRobotSummonOrder', 2)
+        return ('BossRobotSummonOrder', 3) if hurt else None
+    return None
+
+
+def summon_purchase(state, reserve):
+    """按 summon_plan 和可用金币决定这趟买什么、买几张；买不齐不买（买一半只会给对手送分）。"""
+    from .brain import item_cost
+    plan = summon_plan(state)
+    if plan is None:
+        return None
+    name, num = plan
+    attempts = len(state.policy_memory.get('summon_attempts') or [])
+    num = min(num, DAILY_SUMMON_LIMIT - attempts)
+    spare = state.team_our.gold_num - reserve
+    if num > 0 and spare >= item_cost(name, state) * num:
+        return name, num
+    base = enemy_station(state)
+    from .news_memory import game_day
+    if (base is not None and (base.level or 1) <= 1 and game_day(state.round_no) >= SUMMON_LATE_DAY
+            and enemy_front_weak(state) and spare >= item_cost('LargeRobotSummonOrder', state)):
+        return 'LargeRobotSummonOrder', 1
+    return None
+
+
+def _is_builder(role, state):
+    """施工工不专程去商店买召唤令（后期只在基地附近干活，保证入夜第一时间开炮）。"""
+    if role.role_type != 'worker':
+        return False
+    from .opening_schedule import opening_worker_mode
+    return opening_worker_mode(state, role) == 'builder'
+
+
+def _fixers_stocked(state):
+    """自家守墙优先：第五天起修墙包没囤够不买召唤令。"""
+    from .brain import FIXER_STOCK_TARGET
+    held = sum((r.backpack or []).count('WallFixer') for r in state.team_our.roles if r.health > 0)
+    return held >= FIXER_STOCK_TARGET
 
 
 def front_breached(state):
@@ -268,6 +368,7 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     weapons = [r for r in state.team_our.roles if r.role_type in ('gatling', 'railgun', 'rocket')]
     reserve = DEFENSE_RESERVE + max(0, 3-len(weapons))*25
     item = None
+    summon_num = 1
     all_backpacks = [i for r in state.team_our.roles for i in r.backpack]
     from .treasure import shop_buy_allowed
     if (urgent and target and 'Bomb' not in all_backpacks and 'Bomb' not in state.tactical_purchases
@@ -276,18 +377,19 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
     elif (urgent and stun and 'DizzyWeapon' not in all_backpacks and 'DizzyWeapon' not in state.tactical_purchases
             and shop_buy_allowed('DizzyWeapon', state, emergency=True)):
         item = 'DizzyWeapon'
-    elif (shop_buy_allowed('SmallRobotSummonOrder', state)
+    elif (shop_buy_allowed('BossRobotSummonOrder', state)
           and cycle_round < 70 and (state.round_no or 0) < 1240 and base and base.health >= max_health(base)*0.7
           and len(weapons) >= 3 and sum(r.role_type == 'wall' for r in state.team_our.roles) >= 6
           and all((r.level or 1) >= 2 for r in weapons)
           and not urgent and role.id not in state.worker_item_jobs
+          and not _is_builder(role, state)
+          and _fixers_stocked(state)
           and not any(i.endswith('SummonOrder') for i in all_backpacks)
           and not any(isinstance(i, str) and i.endswith('SummonOrder') for i in state.tactical_purchases)
           and len(attempts) < DAILY_SUMMON_LIMIT):
-        # 每次干扰最多花剩余金币25%，并给防守留下至少100金币。
-        cap = min(state.team_our.gold_num // 4, state.team_our.gold_num-reserve)
-        item = next((n for n in ('BossRobotSummonOrder', 'LargeRobotSummonOrder', 'MiddleRobotSummonOrder', 'SmallRobotSummonOrder')
-                     if item_cost(n, state) <= cap), None)
+        purchase = summon_purchase(state, reserve)
+        if purchase:
+            item, summon_num = purchase
     if (item is None or not shop_buy_allowed(item, state, emergency=urgent)
             or state.team_our.gold_num < item_cost(item, state) or len(role.backpack) >= role.back_pack_capability):
         return None
@@ -308,5 +410,8 @@ def tactical_action(role, state, blocked, reserved, allow_travel=True):
             return None
         return move_on_path(state, role, path, reserved, travel_reason)
     state.tactical_purchases.add(item)
-    trace(state, role.id, 'tactical_purchase', '战术消费', item=item, cost=item_cost(item, state), defense_reserve=reserve, pressure=urgent)
-    return selected(state, role.id, {'action': 'buy', 'name': item, 'num': 1}, buy_reason)
+    trace(state, role.id, 'tactical_purchase', '战术消费', item=item, num=summon_num,
+          cost=item_cost(item, state) * summon_num, defense_reserve=reserve, pressure=urgent,
+          enemy_base_level=(enemy_station(state).level if enemy_station(state) else None),
+          enemy_last_night_loss=state.policy_memory.get('enemy_last_night_loss'))
+    return selected(state, role.id, {'action': 'buy', 'name': item, 'num': summon_num}, buy_reason)

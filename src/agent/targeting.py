@@ -3,6 +3,15 @@
 数值来自任务书4.5.1/4.5.4/4.7.2；电磁炮/加特林弹道的直线判定是本地近似，
 官方未给出完整遮挡算法（见 docs/rules_verified.md）。
 一回合内所有武器共用一份 DamageLedger：先算火箭，再算电磁炮补刀，避免多门炮重复打死同一只。
+第三天起有大型/BOSS 时分工（离线夜战模拟得出，见 docs/strategy.md 9.3）：
+- 锚定火箭（存活火箭里 id 最小的一门）只在能打到大型/BOSS 的落点里选；大型按威胁高估价值，
+  溅射到的中小型照常计分，所以会选“大型 + 周围一圈中小”的落点；
+- 另一门火箭按原收益清数量；只有全队手里已没有修墙包、又有大型/BOSS 贴建筑开打
+  （距墙/炮/基地 ≤3）时，两门火箭才都锁这些攻城目标。离线夜战模拟：有修墙包兜底时
+  两门都锁守得住但漏掉大量中小怪（第六/七夜少 8/18 分）；没有修墙包时两门都锁更能保住
+  电磁炮和基地；
+- 电磁炮只在弹道能打到大型/BOSS 的落点里选收益最高的。
+射程够不着锁定目标时都退回原收益。BOSS 远距离威胁系数不低于 BOSS_MIN_URGENCY。
 """
 from math import hypot
 from typing import Optional
@@ -25,6 +34,11 @@ KILL_BONUS = 0.5          # 打死时额外加 score × KILL_BONUS
 ATTACKING_RANGE = 3       # 机器人射程3：距我方建筑 ≤3 视为正在攻击
 ATTACKING_URGENCY = 3.0
 APPROACH_SPAN = 10        # 距离 3→13 时威胁系数从 1 线性降到 0
+BIG_PRIORITY_DAY = 3      # 第三天起大型刷新：锚定火箭、电磁炮优先打大型/BOSS
+BIG_TYPES = ("largeRobot", "bossRobot")
+BIG_VALUE_SCALE = 50.0    # 锚定火箭眼里大型每点伤害价值 = (积分 + 攻击力×威胁) / 50
+BIG_KILL_BONUS = 2.0
+BOSS_MIN_URGENCY = 1.0    # BOSS 会走到墙下，刷新边威胁不能按 0 算
 LATE_NIGHT_ROUNDS = 10    # 最后这么多回合不再投资天亮前打不死的目标
 NIGHT_ROUNDS = 60
 CYCLE_ROUNDS = 130
@@ -58,7 +72,16 @@ class TargetContext:
                      if b.role_type in _BUILDINGS and b.health > 0]
         rounds_left = _night_rounds_left(state)
         capacity = _kill_capacity(state, rounds_left)
+        from .news_memory import game_day
+        self.prioritize_big = game_day(getattr(state, "round_no", None)) >= BIG_PRIORITY_DAY
+        self.anchor_rocket_id = min((b.id for b in buildings if b.role_type == "rocket"), default=None)
         self.value = {}
+        self.big_value = {}
+        self.siege_ids = set()
+        # 有修墙包就由墙边待命的人保墙，火箭照常分工；用光后贴墙大型才让两门火箭都锁。
+        self.fixers_on_hand = any('WallFixer' in (r.backpack or [])
+                                  for r in (state.team_our.roles if state and state.team_our else [])
+                                  if r.role_type in ('worker', 'pioneer') and r.health > 0)
         for r in self.robots:
             hp_max, score, atk = ROBOT_STATS.get(r.role_type, (max(r.health, 1), 0, 0))
             dist = _distance_to_buildings(r.pos, buildings)
@@ -66,12 +89,34 @@ class TargetContext:
                 urgency = ATTACKING_URGENCY
             else:
                 urgency = max(0.0, 1.0 - (dist - ATTACKING_RANGE) / APPROACH_SPAN)
+            if r.role_type == "bossRobot":
+                # 800 血摊到积分上极低；刷新边距建筑 >13 时威胁原公式是 0，
+                # 火箭会去打近处小怪，BOSS 一路走到墙根都挨不到。
+                urgency = max(urgency, BOSS_MIN_URGENCY)
             if rounds_left <= LATE_NIGHT_ROUNDS and r.health > capacity and urgency < ATTACKING_URGENCY:
                 self.value[r.id] = (0.0, 0.0)  # 天亮会被清除，打不死的伤害白费
                 continue
             self.value[r.id] = ((score + atk * urgency) / hp_max, score * KILL_BONUS)
+            if r.role_type in BIG_TYPES:
+                self.big_value[r.id] = ((score + atk * max(urgency, 1.0)) / BIG_VALUE_SCALE, BIG_KILL_BONUS)
+                if dist <= ATTACKING_RANGE:
+                    self.siege_ids.add(r.id)
 
-    def gain(self, damage: dict, ledger: DamageLedger) -> float:
+    def big_alive(self, ledger: DamageLedger):
+        """第三天起还有剩余血量、且天亮前值得打的大型/BOSS；第三天前返回空。"""
+        if not self.prioritize_big:
+            return []
+        return [r for r in self.robots if r.id in self.big_value and ledger.remaining(r) > 0]
+
+    def siege_big_alive(self, ledger: DamageLedger):
+        """正在打建筑的大型/BOSS；全队还有修墙包时返回空（墙由修墙包保，火箭照常分工）。
+        修墙包用光后破口比漏清中小堆更糟，两门火箭都改打它们。"""
+        if self.fixers_on_hand:
+            return []
+        return [r for r in self.big_alive(ledger) if r.id in self.siege_ids]
+
+    def gain(self, damage: dict, ledger: DamageLedger, big_focus: bool = False) -> float:
+        """big_focus=True（锚定火箭）时大型/BOSS 按 big_value 计价，其余照原值。"""
         total = 0.0
         for rid, dmg in damage.items():
             r = self.by_id.get(rid)
@@ -80,7 +125,8 @@ class TargetContext:
             left = ledger.remaining(r)
             if left <= 0:
                 continue
-            per_hp, kill = self.value[r.id]
+            per_hp, kill = (self.big_value[r.id] if big_focus and r.id in self.big_value
+                            else self.value[r.id])
             total += per_hp * min(dmg, left)
             if dmg >= left:
                 total += kill
@@ -140,6 +186,16 @@ def _rocket_damage(ctx: TargetContext, x: int, y: int) -> dict:
     return damage
 
 
+def _big_lock_cells(ctx: TargetContext, cells, ledger: DamageLedger, ids=None):
+    """只保留能打到指定大型/BOSS 的落点（中心或溅射）。射程够不着则不锁。"""
+    if ids is None:
+        ids = {r.id for r in ctx.big_alive(ledger)}
+    if not ids:
+        return None
+    locked = {cell for cell in cells if ids.intersection(_rocket_damage(ctx, *cell))}
+    return locked or None
+
+
 def _merge(a: dict, b: dict) -> dict:
     out = dict(a)
     for k, v in b.items():
@@ -158,14 +214,20 @@ def plan_rocket(weapon, ctx: TargetContext, ledger: DamageLedger):
                     cells.add((x, y))
     if not cells:
         return None
+    siege_ids = {r.id for r in ctx.siege_big_alive(ledger)}
+    locked = _big_lock_cells(ctx, cells, ledger, siege_ids) if siege_ids else None
+    if locked is None and weapon.id == ctx.anchor_rocket_id:
+        locked = _big_lock_cells(ctx, cells, ledger)
+    search = locked or cells
+    big_focus = locked is not None
     scratch = DamageLedger()
     scratch.pending = dict(ledger.pending)
     positions, damage = [], {}
     for _ in range(_level(weapon)):
         best, best_cell, best_dmg = 0.0, None, None
-        for cell in sorted(cells):
+        for cell in sorted(search):
             dmg = _rocket_damage(ctx, *cell)
-            g = ctx.gain(dmg, scratch)
+            g = ctx.gain(dmg, scratch, big_focus)
             if g > best:
                 best, best_cell, best_dmg = g, cell, dmg
         if best_cell is None:
@@ -178,10 +240,10 @@ def plan_rocket(weapon, ctx: TargetContext, ledger: DamageLedger):
         damage = _merge(damage, best_dmg)
     # 逐枚贪心看不到"几枚叠加才打死"的收益，再比较整轮叠在同一格的方案。
     level = _level(weapon)
-    best_total = ctx.gain(damage, ledger)
-    for cell in sorted(cells):
+    best_total = ctx.gain(damage, ledger, big_focus)
+    for cell in sorted(search):
         stacked = {rid: dmg * level for rid, dmg in _rocket_damage(ctx, *cell).items()}
-        g = ctx.gain(stacked, ledger)
+        g = ctx.gain(stacked, ledger, big_focus)
         if g > best_total + 1e-9:
             best_total, damage = g, stacked
             positions = [{"x": cell[0], "y": cell[1]}] * level
@@ -210,6 +272,17 @@ def _robots_on_segment(ctx: TargetContext, start: Pos, end_x: int, end_y: int):
 def plan_railgun(weapon, ctx: TargetContext, ledger: DamageLedger):
     """电磁能量沿弹道按实际伤害扣减，到达落点即止；返回 ([落点], 伤害表) 或 None。"""
     energy_max = RAILGUN_ENERGY_PER_LEVEL * _level(weapon)
+    big_ids = {r.id for r in ctx.big_alive(ledger)}
+    best = _railgun_best(weapon, ctx, ledger, energy_max, big_ids) if big_ids else (0.0, None, None)
+    if best[1] is None:
+        best = _railgun_best(weapon, ctx, ledger, energy_max, None)
+    if best[1] is None:
+        return None
+    return [{"x": best[1].pos.x, "y": best[1].pos.y}], best[2]
+
+
+def _railgun_best(weapon, ctx: TargetContext, ledger: DamageLedger, energy_max: int, must_hit):
+    """must_hit 非空时只考虑弹道伤害包含其中某只的落点（第三天起必须带上大型/BOSS）。"""
     best = (0.0, None, None)
     for r in sorted(ctx.robots, key=lambda r: r.id):
         if not _in_range(weapon, r.pos.x, r.pos.y):
@@ -224,12 +297,12 @@ def plan_railgun(weapon, ctx: TargetContext, ledger: DamageLedger):
             energy -= dmg
             if energy <= 0:
                 break
+        if must_hit and not must_hit.intersection(damage):
+            continue
         g = ctx.gain(damage, ledger)
         if g > best[0]:
             best = (g, r, damage)
-    if best[1] is None:
-        return None
-    return [{"x": best[1].pos.x, "y": best[1].pos.y}], best[2]
+    return best
 
 
 def _same_cone(weapon, points) -> bool:

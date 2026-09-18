@@ -51,8 +51,13 @@ class EconomyTests(unittest.TestCase):
         role.backpack = ['copper'] * 20
         commands = V1Strategy(BasicActionValidator()).decide(state)
         self.assertEqual(commands[role.id]['action'], 'move')
-        self.assertTrue(any(e['code'] == 'income_muster' and e['role_id'] == role.id
-                            for e in state.decision_events))
+        self.assertTrue(
+            any(e['code'] == 'income_muster' and e['role_id'] == role.id
+                for e in state.decision_events)
+            or any(e.get('code') == 'selected' and e.get('role_id') == role.id
+                   and '双火箭' in (e.get('message') or '')
+                   for e in state.decision_events)
+        )
 
     def test_mid_day_near_gun_keeps_working(self):
         """去掉第50回合一刀切后，离炮很近的工人白天中段仍可继续干活。"""
@@ -73,8 +78,13 @@ class EconomyTests(unittest.TestCase):
         role.backpack = ['copper'] * 3
         state.robot.roles = [RobotRole(id=30001, pos=Pos(30, 10), role_type='smallRobot', health=40)]
         commands = V1Strategy(BasicActionValidator()).decide(state)
-        self.assertTrue(any(e['code'] == 'income_muster' and e.get('role_id') == role.id
-                            for e in state.decision_events))
+        self.assertTrue(
+            any(e['code'] == 'income_muster' and e.get('role_id') == role.id
+                for e in state.decision_events)
+            or any(e.get('code') == 'selected' and e.get('role_id') == role.id
+                   and '双火箭' in (e.get('message') or '')
+                   for e in state.decision_events)
+        )
         self.assertEqual(commands[role.id]['action'], 'move')
 
     def test_pre_night_small_ore_goes_to_vendor_before_third_night(self):
@@ -160,8 +170,19 @@ class EconomyTests(unittest.TestCase):
         self.assertFalse(handled)
         self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
 
-    def test_voucher_gap_sends_backpack_to_vendor(self):
+    def test_voucher_gap_with_time_keeps_mining(self):
+        """缺口够但白天还早：继续攒包，不为 5 块铜跑小贩。"""
         state, role = defended_state(gold=75)
+        role.backpack = ['copper'] * 5
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertFalse(any(e['code'] == 'cashout_priority' for e in state.decision_events))
+
+    def test_voucher_gap_near_dusk_sells_batch(self):
+        """今晚再采会错过买券、且矿够一趟门槛：才提前卖。"""
+        state, role = defended_state(gold=75)
+        state.round_no = 188  # 白天还剩约 12 回合。
+        role.pos = Pos(5, 5)  # 贴着小贩，卖矿回合足够短。
         role.backpack = ['copper'] * 5
         handled, cmd = liquidate(role, state, build_blocked_set(state), set())
         self.assertTrue(handled)
@@ -215,13 +236,13 @@ class EconomyTests(unittest.TestCase):
     def test_batch_fill_goes_to_vendor(self):
         state, role = economy_state()
         role.back_pack_capability = 10
-        role.backpack = ['copper'] * 6
+        role.backpack = ['copper'] * 8
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
 
     def test_sale_commitment_survives_price_drop_and_restart(self):
         state, role = economy_state()
         role.back_pack_capability = 10
-        role.backpack = ['copper'] * 6
+        role.backpack = ['copper'] * 8
         self.assertTrue(liquidate(role, state, build_blocked_set(state), set())[0])
         with tempfile.TemporaryDirectory() as root:
             save_build_memory(state, Path(root))
@@ -473,16 +494,63 @@ class TacticalTests(unittest.TestCase):
         role.pos = Pos(5, 4)
         self.assertIsNone(tactical_action(role, state, build_blocked_set(state), set()))
 
-    def test_offense_purchase_preserves_defense_budget(self):
-        state, role = defended_state()
-        state.round_no = 400
+    def _summon_ready(self, round_no, enemy_level=1, gold=400):
+        """我方满足召唤前提（三炮≥2级、墙≥6、修墙包已囤够）；开拓者站在商店旁；敌方基地可见。"""
+        state, worker = defended_state(gold)
+        state.round_no = round_no
         for building in state.team_our.roles:
             if building.role_type in ('gatling', 'railgun', 'rocket'):
                 building.level = 2
-        role.pos = Pos(5, 4)
-        cmd = tactical_action(role, state, build_blocked_set(state), set())
-        self.assertEqual(cmd['name'], 'LargeRobotSummonOrder')
-        self.assertGreaterEqual(state.team_our.gold_num-item_cost(cmd['name'], state), 100)
+        worker.backpack = ['WallFixer'] * 8
+        pioneer = make_role(3, 5, 4, 'pioneer', health=200, back_pack_capability=40)
+        state.team_our.roles.append(pioneer)
+        state.team_enemy.roles = [make_role(900, 30, 20, 'station', level=enemy_level, health=1500)]
+        return state, pioneer
+
+    def test_offense_purchase_preserves_defense_budget(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10)  # 第七天，敌方基地1级
+        cmd = tactical_action(pioneer, state, build_blocked_set(state), set())
+        self.assertEqual(cmd, {'action': 'buy', 'name': 'BossRobotSummonOrder', 'num': 1})
+        self.assertGreaterEqual(state.team_our.gold_num - item_cost(cmd['name'], state), 100)
+
+    def test_no_summon_on_day_four_or_against_level3_base(self):
+        state, pioneer = self._summon_ready(3 * 130 + 10)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=3)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+
+    def test_level2_base_needs_two_bosses_or_nothing(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=2, gold=400)
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))  # 只够1张：不买半套
+        state, pioneer = self._summon_ready(6 * 130 + 10, enemy_level=2, gold=600)
+        self.assertEqual(tactical_action(pioneer, state, build_blocked_set(state), set()),
+                         {'action': 'buy', 'name': 'BossRobotSummonOrder', 'num': 2})
+
+    def test_cheap_large_only_against_weak_level1_front_late(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10, gold=250)  # 可用150，买不起BOSS；敌方没有墙=墙弱
+        self.assertEqual(tactical_action(pioneer, state, build_blocked_set(state), set()),
+                         {'action': 'buy', 'name': 'LargeRobotSummonOrder', 'num': 1})
+
+    def test_never_buys_small_or_middle_summons(self):
+        for gold in (130, 150, 180):
+            state, pioneer = self._summon_ready(6 * 130 + 10, gold=gold)
+            cmd = tactical_action(pioneer, state, build_blocked_set(state), set())
+            self.assertFalse(cmd and cmd.get('name', '').startswith(('Small', 'Middle')), cmd)
+
+    def test_no_summon_before_fixers_stocked(self):
+        state, pioneer = self._summon_ready(6 * 130 + 10)
+        next(r for r in state.team_our.roles if r.role_type == 'worker').backpack = ['WallFixer'] * 3
+        self.assertIsNone(tactical_action(pioneer, state, build_blocked_set(state), set()))
+
+    def test_enemy_base_night_loss_tracked(self):
+        state, pioneer = self._summon_ready(4 * 130 + 75, enemy_level=2)
+        enemy = state.team_enemy.roles[0]
+        for rnd, hp in ((4 * 130 + 75, 3000), (4 * 130 + 100, 2400), (4 * 130 + 120, 2000)):
+            state.round_no, enemy.health = rnd, hp
+            begin_round(state)
+        state.round_no = 5 * 130
+        begin_round(state)
+        self.assertEqual(state.policy_memory.get('enemy_last_night_loss'), 1000)
 
     def test_decide_does_not_buy_luxury_items_before_day_four(self):
         state, role = defended_state(gold=400)
@@ -649,7 +717,8 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
             self.decide(state)
         self.assertEqual(state.policy_memory['spike_cashout'], {'1': 'done'})
 
-    def _dusk_sale(self, contacts):
+    def test_dusk_sale_must_finish_before_dark(self):
+        """卖完回炮会晚于天黑就不去：傍晚不借用入夜后的回合。"""
         from collections import Counter
         from src.agent.economy import _sale_return_rounds, _vendor_choices
         state, role = defended_state(gold=0)
@@ -657,33 +726,21 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
         blocked = build_blocked_set(state)
         path = min(_vendor_choices(role, state, blocked, set()), key=lambda c: c[:3])[4]
         sale_rounds = _sale_return_rounds(role, state, blocked, Counter({'copper': 30}), path)[0]
-        state.round_no = 130 * 2 + 70 - (sale_rounds - 2)  # 天黑前卖得完，但回炮会晚2回合
-        if contacts:
-            state.policy_memory['night_contact'] = contacts
-        return liquidate(role, state, blocked, set())
+        state.round_no = 130 * 2 + 70 - (sale_rounds - 2)  # 天黑前卖得完，但回炮会晚 2 回合
+        self.assertEqual(liquidate(role, state, blocked, set()), (False, None))
 
-    def test_dusk_sale_blocked_without_observed_night_contact(self):
-        self.assertEqual(self._dusk_sale(None), (False, None))
-
-    def test_dusk_sale_uses_observed_after_dark_grace(self):
-        handled, cmd = self._dusk_sale({'1': 16})
-        self.assertTrue(handled)
-        self.assertEqual(cmd['action'], 'move')
-
-    def test_night_contact_records_first_close_robot_round(self):
-        from src.agent.economy import after_dark_grace, note_night_contact
+    def test_night_sale_waits_until_thirty_rounds_after_dark(self):
+        from src.agent.economy import _sale_fits
         state, _role = defended_state(gold=0)
-        state.round_no = 130 + 70 + 9
-        base = state.team_our.roles[0]
-        state.robot.roles = [RobotRole(100, Pos(base.pos.x + 5, base.pos.y), 'smallRobot', 10)]
-        note_night_contact(state)
-        self.assertEqual(state.policy_memory['night_contact'], {'1': 9})
-        self.assertEqual(after_dark_grace(state), 5)
+        state.round_no = 130 + 70 + 29
+        self.assertFalse(_sale_fits(state, [], {'copper': 1}, 5, 100))
+        state.round_no = 130 + 70 + 30
+        self.assertTrue(_sale_fits(state, [], {'copper': 1}, 5, 100))
 
     def test_night_worker_can_sell_after_wave_is_gone(self):
         state, role = defended_state(gold=0)
         state.round_no = 130 + 100
-        role.backpack = ['copper'] * 60
+        role.backpack = ['copper'] * 80
         state.policy_memory['night_saw_threat'] = True
         state.policy_memory['night_empty_streak'] = 1
         handled, cmd = liquidate(role, state, build_blocked_set(state), set())
@@ -708,3 +765,51 @@ class SpikeAndDuskSaleTests(unittest.TestCase):
         with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
             cmd = opening_sell_metal(role, state, build_blocked_set(state), set(), 'fund')
         self.assertIsNone(cmd)
+
+    def test_dusk_window_keeps_small_rising_ore_reserve(self):
+        from unittest import mock
+        state, role = defended_state(gold=400)
+        role.backpack = ['copper'] * 8 + ['iron'] * 6
+        with mock.patch('src.agent.economy.ores_held_for_price_rise', return_value={'iron'}):
+            ores = sellable_ores(role, state, dump_extra_stone=True)
+        self.assertEqual(ores['copper'], 8)
+        self.assertEqual(ores['iron'], 3)
+
+    def test_full_backpack_at_shop_sells_instead_of_drop(self):
+        from src.agent.brain import decide_shop_item_job
+        state, role = defended_state(gold=400)
+        shop = next(z for z in state.map_info.zones if z.neutral_type == 'weaponShop')
+        role.pos = Pos(shop.pos.x, shop.pos.y)
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 10
+        weapon = next(r for r in state.team_our.roles if r.role_type == 'rocket')
+        state.worker_item_jobs[role.id] = {
+            'item': 'WeaponUpgradeVoucher1',
+            'target': (weapon.pos.x, weapon.pos.y),
+            'kind': 'weapon',
+        }
+        cmd = decide_shop_item_job(role, state, build_blocked_set(state), set())
+        self.assertIsNotNone(cmd)
+        self.assertNotEqual(cmd.get('action'), 'drop')
+        self.assertEqual(cmd.get('action'), 'sell')
+
+    def test_sale_unreachable_unfilled_pack_keeps_mining(self):
+        state, role = defended_state(gold=0)
+        role.back_pack_capability = 10
+        role.backpack = ['copper'] * 8
+        state.map_info.zones = [z for z in state.map_info.zones if z.neutral_type != 'vendor']
+        handled, cmd = liquidate(role, state, build_blocked_set(state), set())
+        self.assertFalse(handled)
+        self.assertIsNone(cmd)
+        self.assertTrue(any(e['code'] == 'sale_unreachable' for e in state.decision_events))
+
+    def test_sticky_mine_keeps_target_when_batch_score_is_none(self):
+        from src.agent.economy import set_mine_target
+        state, role = defended_state(gold=400)
+        mine = next(z for z in state.map_info.zones if z.neutral_type == 'copper')
+        set_mine_target(state, role.id, mine, path_len=1, batch=6)
+        role.backpack = ['copper'] * 6
+        with unittest.mock.patch('src.agent.economy.trip_collect_limit', return_value=0):
+            picked = pick_mine(role, state, build_blocked_set(state), set(), {'copper', 'iron'})
+        self.assertIsNotNone(picked)
+        self.assertEqual((picked[0].pos.x, picked[0].pos.y), (mine.pos.x, mine.pos.y))

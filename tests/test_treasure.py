@@ -191,6 +191,7 @@ class TreasureHttpTests(unittest.TestCase):
         self.assertIn("treasure_decoded", event_codes)
 
     def test_heuristic_appears_in_http_decision_log(self):
+        """官方矿价新闻入库；关键词启发式 ore_heuristic 已下线，只保留官方 ingest 轨迹。"""
         self.payload["roundNo"] = 5
         self.payload["worldNews"] = {
             "officialNews": (
@@ -205,9 +206,8 @@ class TreasureHttpTests(unittest.TestCase):
         self.assertTrue(reports)
         report = json.loads(reports[-1].read_text(encoding="utf-8"))
         codes = [e.get("code") for e in report.get("events", [])]
-        self.assertIn("ore_heuristic", codes)
-        effects = self.server.news_memory.banned_ores(2)
-        self.assertIn("iron", effects)
+        self.assertNotIn("ore_heuristic", codes)
+        self.assertIn("official_news_ingested", codes)
 
     def test_news_diagnostics_via_execute_cmd_when_idle(self):
         """无自进化任务时，新闻诊断应像 PIONEER_TASK 一样经 executeCmd 回传。"""
