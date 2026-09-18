@@ -1998,9 +1998,19 @@ class PioneerTaskSolver:
             'failedActions': self.session.get('failedActions') or [],
             'recentResults': self.session.get('history')[-8:],
             'lastCommand': self.session.get('lastTool'),
+            'lastToolOutput': self._last_tool_output(),
             'documents': self.session.get('documents') or [],
             'promptVersion': PROMPT_VERSION,
             'promptHash': PROMPT_HASH,
             'experienceHit': self.session.get('experienceHit', False),
         }
         return ''.join(parts) + json.dumps(payload, ensure_ascii=False)
+
+    def _last_tool_output(self):
+        """Expose the latest concrete evidence without requiring history search."""
+        for item in reversed(self.session.get('history') or []):
+            if item.get('event') in ('execute_tool', 'read_document', 'api_curl'):
+                value = item.get('outputTail') or item.get('output') or item.get('content') or item.get('error')
+                if value:
+                    return str(value)[-5000:]
+        return ''
