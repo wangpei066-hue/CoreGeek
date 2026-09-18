@@ -711,8 +711,10 @@ class PioneerTaskSolver:
         prior_skill = any(x.get('taskKind') == ctx.get('taskKind')
                           for x in (self.experience.get('skills') or []))
         metrics['budgetRounds'] = 9 if prior_skill else 14
+        effective_rounds = min(timeout, metrics['budgetRounds']) if timeout else metrics['budgetRounds']
+        metrics['effectiveRounds'] = effective_rounds
         if state.round_no is not None:
-            metrics['deadlineRound'] = state.round_no + metrics['budgetRounds']
+            metrics['deadlineRound'] = state.round_no + effective_rounds
             metrics['deadlineEstimated'] = True
         s = dict(
             key=key, stage='read', paths=relevant_md_paths(state.phase_task),
@@ -1452,6 +1454,7 @@ class PioneerTaskSolver:
                 'timeoutRounds': metrics.get('timeoutRounds'),
                 'timeoutNote': 'timeoutRounds是平台超时时长，不是实时剩余回合；截止回合为估计值',
                 'budgetRounds': metrics.get('budgetRounds'),
+                'effectiveRounds': metrics.get('effectiveRounds'),
             },
             'facts': self.session.get('facts') or [],
             'failedActions': self.session.get('failedActions') or [],
