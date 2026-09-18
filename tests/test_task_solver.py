@@ -14,27 +14,45 @@ import unittest
 
 from src.agent import GameServer
 from src.agent.task_solver import (
-    MARKER, clean_url, extract_md_paths, parse_llm, sandbox_command, task_context,
-    task_fingerprint, READ_SCRIPT, EXEC_SCRIPT, PioneerTaskSolver,
+    MARKER, extract_md_paths, parse_llm, sandbox_command, task_context,
+    task_fingerprint, normalize_skill, READ_SCRIPT, EXEC_SCRIPT, PROMPT_BYTE_LIMIT,
+    PioneerTaskSolver,
 )
 
 
+def skill(name='generic-operation'):
+    return {
+        'name': name,
+        'applicability': {
+            'summary': '目标、环境机制与验收契约相同的后续任务',
+            'requiredSignals': ['存在明确的验收结果'],
+            'incompatibleSignals': ['验收契约变更'],
+        },
+        'invariants': ['先依据当前材料再执行'],
+        'parameters': [{'name': 'target', 'source': '当前题面', 'validation': '非空'}],
+        'procedure': ['提取{{target}}', '执行并验证'],
+        'verification': ['核对当前任务的成功条件'],
+        'failureRecovery': ['依据真实错误修正'],
+        'answerContract': '以当前题面为准',
+    }
+
+
 class TaskSolverHelperTests(unittest.TestCase):
-    def test_clean_url_removes_markdown_and_chinese_trailing_punctuation(self):
-        self.assertEqual(clean_url('http://localhost:8899`）'), 'http://localhost:8899')
-        self.assertEqual(clean_url('http://localhost:8899/api/v1/search。'),
-                         'http://localhost:8899/api/v1/search')
 
     def test_extract_paths(self):
         self.assertEqual(extract_md_paths('阅读`/app/API Guide.md`，再查看 docs/query.md 和「天气说明.md」。'),
                          ['/app/API Guide.md', 'docs/query.md', '天气说明.md'])
         self.assertEqual(extract_md_paths('请阅读说明.md文件，参考说明.md'), ['说明.md'])
 
-    def test_task_context_classifies_workspace_api_unknown(self):
-        self.assertEqual(task_context('工作区为 /srv/app/，请修复配置')['taskKind'], 'workspace')
+    def test_task_context_only_extracts_explicit_workspace(self):
         self.assertEqual(task_context('工作区为 /srv/app/，请修复配置')['workspace'], '/srv/app/')
-        self.assertEqual(task_context('请调用天气 API 查询北京')['taskKind'], 'api')
-        self.assertEqual(task_context('计算1+1')['taskKind'], 'unknown')
+        self.assertEqual(task_context('请调用天气 API 查询北京'), {'workspace': None})
+        self.assertEqual(task_context('计算1+1'), {'workspace': None})
+
+    def test_structured_skill_schema_is_content_agnostic(self):
+        normalized = normalize_skill(skill(), 'source')
+        self.assertTrue(normalized['skillId'].startswith('skill-'))
+        self.assertEqual(normalized['sourceFingerprint'], 'source')
 
     def test_task_fingerprint_stable_for_same_text(self):
         self.assertEqual(task_fingerprint('同一段文本'), task_fingerprint('同一段文本'))
@@ -126,14 +144,15 @@ class TaskSolverStepTests(unittest.TestCase):
         # 沙盒脚本本身的字节级内容提取以 Linux/gawk 为准，这台机器的 sh/awk 只用来验证
         # 状态机流转不出错、返回的是合法 JSON，不断言逐字节内容（环境相关，非求解器逻辑）。
         read_back = self.sandbox(execute)
-        self.assertIn('"event":"read_document"', read_back)
+        self.assertIn('"event": "read_document"', read_back)
         state = self._state(state.phase_task, round_no=11, last_cmd_result=read_back)
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
 
         state = self._state(state.phase_task, round_no=12,
-                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42',
+                                                 'skill': skill()}))
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_submit')
         self.assertEqual(commands[1]['action'], 'submitAnswer')
@@ -143,6 +162,117 @@ class TaskSolverStepTests(unittest.TestCase):
                             last_round_role_action_results={1: True})
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session.get('answer'), '42')
+        self.assertEqual(len(self.solver.experience['skills']), 1)
+        self.assertEqual(self.solver.experience['skills'][0]['evidenceLevel'], 'confirmed')
+
+    def test_submit_without_structured_skill_does_not_sacrifice_answer(self):
+        state = self._state('直接提交一个答案')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42'}))
+        commands = {}
+        self.solver.step(state, commands)
+        self.assertEqual(self.solver.session['stage'], 'wait_submit')
+        self.assertEqual(commands[1]['taskAnswer'], '42')
+        self.assertTrue(any('skillRejected' in item for item in self.solver.session['history']))
+
+    def test_skill_normalizer_coerces_common_model_shapes(self):
+        candidate = skill('coerced')
+        candidate['parameters'] = {
+            'target': {'source': '当前题面', 'validation': '非空'},
+        }
+        candidate['verification'] = '验收结果必须成功'
+        candidate['failureRecovery'] = '根据错误修正'
+        normalized = normalize_skill(candidate)
+        self.assertEqual(normalized['parameters'][0]['name'], 'target')
+        self.assertEqual(normalized['verification'], ['验收结果必须成功'])
+
+    def test_multiple_unrelated_skills_coexist(self):
+        first = normalize_skill(skill('first'), 'one')
+        second = normalize_skill(skill('second'), 'two')
+        self.solver.session = {'skillCandidate': first, 'metrics': {'acceptedRound': 1},
+                               'round': 2, 'history': []}
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        self.solver.session = {'skillCandidate': second, 'metrics': {'acceptedRound': 2},
+                               'round': 3, 'history': []}
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        self.assertEqual({x['name'] for x in self.solver.experience['skills']}, {'first', 'second'})
+
+    def test_phase_clear_after_submit_promotes_confirmed_skill(self):
+        state = self._state('直接提交一个答案')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '42',
+                                                 'skill': skill('phase-clear')}))
+        self.solver.step(state, {})
+        self.assertEqual(self.solver.session['submitStatus'], 'sent')
+        self.solver.step(self._state('', round_no=12), {})
+        self.assertEqual(len(self.solver.experience['skills']), 1)
+        self.assertEqual(self.solver.experience['skills'][0]['evidenceLevel'], 'confirmed')
+
+    def test_confirmed_skill_keeps_bounded_verified_command_evidence(self):
+        candidate = normalize_skill(skill('with-evidence'), 'one')
+        self.solver.session = {
+            'skillCandidate': candidate,
+            'answer': 'SECRET-ANSWER',
+            'workspace': '/tmp/task-one',
+            'metrics': {'acceptedRound': 1},
+            'round': 3,
+            'history': [
+                {'event': 'execute_tool', 'exitCode': 1, 'command': 'bad command'},
+                {'event': 'execute_tool', 'exitCode': 0,
+                 'command': 'run /tmp/task-one --expect SECRET-ANSWER'},
+            ],
+        }
+        self.solver._remember_skill(None, self.solver.session, 'confirmed')
+        evidence = self.solver.experience['skills'][0]['verifiedCommands']
+        self.assertEqual(len(evidence), 1)
+        self.assertIn('<WORKSPACE>', evidence[0])
+        self.assertIn('<TASK_ANSWER>', evidence[0])
+        self.assertNotIn('bad command', evidence[0])
+
+    def test_prompt_uses_base_prompt_without_task_taxonomy(self):
+        state = self._state('计算1+1')
+        prompt, _ = self.solver.step(state, {})
+        self.assertIn('任务类型和内容不可预知', prompt)
+        self.assertNotIn('taskKind', prompt)
+
+    def test_prompt_is_bounded_by_utf8_bytes(self):
+        state = self._state('超长任务' + '甲' * 30000)
+        self.solver.step(state, {})
+        self.solver.session['documents'] = [
+            {'path': '/tmp/large.md', 'content': '文档' * 30000},
+        ]
+        self.solver.session['history'] = [
+            {'event': 'execute_tool', 'output': '结果' * 20000},
+        ]
+        prompt = self.solver.make_prompt(state)
+        self.assertLessEqual(len(prompt.encode('utf-8')), PROMPT_BYTE_LIMIT)
+        self.assertIn('prompt compacted', prompt)
+        json.loads(prompt.split('当前任务上下文：', 1)[1])
+
+    def test_explicit_skill_reuse_records_real_hit_and_bindings(self):
+        candidate = normalize_skill(skill('reusable'), 'one')
+        candidate['evidenceLevel'] = 'confirmed'
+        self.solver.experience['skills'] = [candidate]
+        state = self._state('相同机制的新实例')
+        prompt, _ = self.solver.step(state, {})
+        self.assertIn(candidate['skillId'], prompt)
+        response = {
+            'action': 'execute',
+            'command': 'printf done',
+            'skillDecision': {
+                'decision': 'reuse',
+                'skillId': candidate['skillId'],
+                'bindings': {'target': '新实例'},
+                'reason': '机制与验收契约一致',
+            },
+        }
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps(response, ensure_ascii=False))
+        self.solver.step(state, {})
+        self.assertTrue(self.solver.session['experienceHit'])
+        self.assertEqual(self.solver.session['skillDecision']['bindings']['target'], '新实例')
 
     def test_execute_tool_then_submit(self):
         state = self._state('执行 echo ready，再提交结果')
@@ -152,22 +282,10 @@ class TaskSolverStepTests(unittest.TestCase):
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
 
-    def test_sandbox_command_falls_back_when_python3_missing(self):
-        doc = Path(self.temp.name) / 'fallback.md'
-        doc.write_text('fallback-ok', encoding='utf-8')
-        read_cmd = sandbox_command(READ_SCRIPT, dict(requestId='fallback-read', path=str(doc),
-                                                     offset=0, documentDir='', workspace=''))
-        read_back = self.sandbox_without_python(read_cmd)
-        self.assertIn('"event":"read_document"', read_back)
-        self.assertIn('fallback-ok', read_back)
-
-        exec_cmd = sandbox_command(EXEC_SCRIPT, dict(requestId='fallback-exec',
-                                                     command='printf tool-ok', workspace=''))
-        exec_back = self.sandbox_without_python(exec_cmd)
-        self.assertIn('"event":"execute_tool"', exec_back)
-        self.assertIn('tool-ok', exec_back)
-        self.assertIn('"exitCode":0', exec_back)
-
+    def test_execute_after_llm_response(self):
+        state = self._state('执行一条有依据的命令')
+        commands = {}
+        self.solver.step(state, commands)
         state = self._state(state.phase_task, round_no=11,
                             llm_resp=json.dumps({'action': 'execute', 'command': 'echo ready'}))
         prompt, execute = self.solver.step(state, commands)
@@ -176,12 +294,48 @@ class TaskSolverStepTests(unittest.TestCase):
 
         # 同上：这台机器的 sh/awk 组合不保证逐字节回显，只验证流程不出错、返回合法 JSON。
         tool_result = self.sandbox(execute)
-        self.assertIn('"event":"execute_tool"', tool_result)
-        self.assertIn('"exitCode":0', tool_result)
+        self.assertIn('"event": "execute_tool"', tool_result)
+        self.assertIn('"exitCode": 0', tool_result)
         state = self._state(state.phase_task, round_no=12, last_cmd_result=tool_result)
         prompt, execute = self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         self.assertTrue(prompt)
+
+    def test_complete_shaped_tool_json_is_evidence_not_automatic_answer(self):
+        state = self._state('取得结果并提交')
+        self.solver.step(state, {})
+        state = self._state(state.phase_task, round_no=11,
+                            llm_resp=json.dumps({'action': 'execute', 'command': 'echo result'}))
+        self.solver.step(state, {})
+        rid = self.solver.session['requestId']
+        result = json.dumps({
+            'marker': MARKER, 'requestId': rid, 'event': 'execute_tool', 'exitCode': 0,
+            'output': json.dumps({'items': [], 'total': 0, 'answer': '0'}),
+        })
+        commands = {}
+        prompt, execute = self.solver.step(
+            self._state(state.phase_task, round_no=12, last_cmd_result=result), commands)
+        self.assertTrue(prompt)
+        self.assertFalse(execute)
+        self.assertEqual(self.solver.session['stage'], 'wait_llm')
+        self.assertNotIn(1, commands)
+
+    def test_relative_document_tries_workspace_after_document_directory(self):
+        doc_dir = Path(self.temp.name) / 'task-docs'
+        workspace = Path(self.temp.name) / 'workspace'
+        doc_dir.mkdir()
+        workspace.mkdir()
+        (workspace / 'spec.md').write_text('workspace specification')
+        command = sandbox_command(READ_SCRIPT, {
+            'requestId': 'r-workspace', 'path': 'spec.md', 'offset': 0,
+            'documentDir': str(doc_dir), 'workspace': str(workspace),
+        })
+        result = subprocess.run(['sh', '-c', command], cwd=self.temp.name,
+                                capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout.strip())
+        self.assertEqual(payload.get('content'), 'workspace specification')
+        self.assertNotIn('error', payload)
 
     def test_rejected_submission_goes_back_to_ask(self):
         state = self._state('直接提交一个答案')
@@ -189,7 +343,8 @@ class TaskSolverStepTests(unittest.TestCase):
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_llm')
         state = self._state(state.phase_task, round_no=11,
-                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '错误答案'}))
+                            llm_resp=json.dumps({'action': 'submit', 'taskAnswer': '错误答案',
+                                                 'skill': skill()}))
         self.solver.step(state, commands)
         self.assertEqual(self.solver.session['stage'], 'wait_submit')
 
