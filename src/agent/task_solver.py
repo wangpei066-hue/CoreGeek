@@ -1483,7 +1483,8 @@ class PioneerTaskSolver:
         prefix = ''
         if remaining is not None and remaining <= 5:
             prefix = ('URGENT DEADLINE: only %s rounds remain. Do not perform a standalone read, probe, or verification. '
-                      'If the latest evidence shows the requested state is already valid, return submit now; otherwise combine the final fix, check, and answer evidence in this one execute.\n' % remaining)
+                      'If the latest tool output contains a complete JSON object with the fields requested by the current task, you MUST return submit now using that object verbatim. '
+                      'Only when no complete answer object exists may you perform one minimal fix execute, then submit immediately.\n' % remaining)
         return prefix + ''.join(parts) + json.dumps(payload, ensure_ascii=False)
 
     def _last_tool_output(self):
