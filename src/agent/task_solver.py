@@ -228,7 +228,7 @@ def match_key(state):
 
 def empty_experience(key=None):
     return dict(matchKey=key, promptVersion=PROMPT_VERSION, promptHash=PROMPT_HASH,
-                api=[], deploy=[], durations={'workspace': [], 'api': [], 'unknown': []})
+                api=[], deploy=[], skills=[], durations={'workspace': [], 'api': [], 'unknown': []})
 
 
 def record_duration_sample(experience, session, reason, round_no):
@@ -1318,74 +1318,28 @@ class PioneerTaskSolver:
         kept.append(item)
         self.experience['deploy'] = kept[-8:]
 
+    def _remember_skill(self, state, s):
+        """Store bounded, answer-free evidence for later same-family tasks.
+
+        This is memory of an explored procedure, not an answer generator: the
+        next model still has to read the new task and validate every parameter.
+        """
+        record = {
+            'taskKind': s.get('taskKind', 'unknown'),
+            'documentNames': [path_basename(x.get('path')) for x in s.get('documents') or [] if x.get('path')],
+            'workspace': bool(s.get('workspace')),
+            'toolCount': len([x for x in s.get('history') or [] if x.get('event') in ('execute_tool', 'read_document')]),
+            'successfulRoundSpan': max(0, int(s.get('round') or 0) - int((s.get('metrics') or {}).get('acceptedRound') or 0)),
+            'learnedAt': s.get('round'),
+        }
+        items = [x for x in self.experience.get('skills') or [] if x.get('taskKind') != record['taskKind']]
+        items.append(record)
+        self.experience['skills'] = items[-6:]
+
     def _harvest(self, result, command, task, workspace=None):
-        output = (result or {}).get('output') or ''
-        tail = (result or {}).get('outputTail') or output[-1200:]
-        blob = output + '\n' + tail
-        if result.get('event') == 'api_fetch':
-            hit = matching_api_experience(self.experience, task)
-            updated = dict(hit) if hit else {}
-            if result.get('path'):
-                updated['path'] = result.get('path') or updated.get('path')
-            if result.get('callVerified'):
-                updated['callVerified'] = True
-                updated['recordsComplete'] = bool(result.get('recordsComplete'))
-                updated['pagination'] = result.get('completenessEvidence')
-                updated['serviceHint'] = updated.get('serviceHint') or service_hint(
-                    result.get('path'), '', task)
-                updated['sourceTask'] = updated.get('sourceTask') or task_fingerprint(task)
-                updated['evidence'] = result.get('completenessEvidence') or 'code=200'
-                if result.get('baseUrl'):
-                    updated['baseUrl'] = result.get('baseUrl')
-                if result.get('authStyle'):
-                    updated['authStyle'] = result.get('authStyle')
-                if result.get('cityParam'):
-                    updated['cityParam'] = result.get('cityParam')
-                if result.get('pagination'):
-                    updated['paginationShape'] = sorted(result['pagination'])[:12]
-                self._remember_api(updated)
-                metrics = self.session.setdefault('metrics', {}) if isinstance(self.session, dict) else {}
-                metrics['recordsCollected'] = result.get('recordsCollected')
-                metrics['expectedTotal'] = result.get('expectedTotal')
-                metrics['dataComplete'] = bool(result.get('recordsComplete'))
-                metrics['httpRequests'] = metrics.get('httpRequests', 0) + int(result.get('httpRequestCount') or 0)
-            elif result.get('error') in ('auth_failed', 'records_not_list') or str(result.get('error') or '').startswith('business_code_'):
-                if hit:
-                    hit = dict(hit)
-                    hit['invalidReason'] = result.get('error')
-                    self._remember_api(hit)
-            return result
-        if result.get('event') == 'deploy_probe':
-            crlf_files = [item['path'] for item in result.get('files') or [] if item.get('crlf') or item.get('convertedCrlf')]
-            if crlf_files or result.get('convertedCrlf'):
-                self._remember_deploy(dict(
-                    kind='crlf', method='python_newline', paths=result.get('convertedCrlf') or crlf_files,
-                    sourceTask=task_fingerprint(task), environment=workspace or result.get('workspace'),
-                    evidence='probe_crlf', callVerified=True,
-                ))
-        token_blob = blob + '\n' + str(result.get('checkTail') or '')
-        command_ok = result.get('exitCode') == 0 or result.get('checkExitCode') == 0
-        if command_ok and extract_token(token_blob):
-            self._remember_deploy(dict(
-                kind='check_success', method='token_from_check',
-                sourceTask=task_fingerprint(task), environment=workspace,
-                evidence='TOKEN', callVerified=True,
-            ))
-        api_item = harvest_api_call(command or '', blob, task)
-        if api_item:
-            api_item['environment'] = workspace
-            self._remember_api(api_item)
-        stats = None
-        for item in extract_json_objects(blob):
-            if item.get('marker') == MARKER:
-                continue
-            if item.get('code') in (200, '200') and isinstance(dotted_get(item, 'data.records'), list):
-                stats = item
-                break
-            if item.get('ok') and ('totalCount' in item or 'recordsComplete' in item):
-                stats = item
-                break
-        return stats
+        # Task-specific contract harvesting was removed.  Neutral successful
+        # task evidence is recorded only when the platform confirms submit.
+        return None
 
     def _apply_api_tool_result(self, s, result, command, task):
         if result.get('event') == 'execute_tool':
@@ -1530,38 +1484,11 @@ class PioneerTaskSolver:
         return 'ask'
 
     def _finish_from_tool(self, s, result, task, stats=None):
-        output = (result.get('output') or '') + '\n' + (result.get('outputTail') or '')
-        check_tail = result.get('checkTail') or ''
-        if s.get('taskKind') == 'workspace':
-            exit_ok = result.get('exitCode') == 0 or result.get('checkExitCode') == 0
-            token = extract_token(output + '\n' + check_tail)
-            if exit_ok and token:
-                s['answer'] = json.dumps({'token': token}, ensure_ascii=False)
-                s['stage'] = 'submit'
-                s['metrics']['answerReadyRound'] = s.get('round')
-                s['metrics']['dataComplete'] = True
-                self._fact(s, '验收TOKEN已提取')
-                return True
-        if s.get('taskKind') == 'api':
-            stats = s.get('_apiStats') or stats or {}
-            if result.get('event') == 'api_fetch' and result.get('recordsComplete'):
-                stats = result
-            elif result.get('event') not in ('api_curl', 'api_fetch'):
-                for item in extract_json_objects(output):
-                    if item.get('marker') == MARKER:
-                        continue
-                    if 'totalCount' in item or 'recordsComplete' in item or item.get('code') in (200, '200'):
-                        stats = item
-                        break
-            if stats_ready_for_answer(stats):
-                answer = build_api_answer(task, stats)
-                if answer:
-                    s['answer'] = answer
-                    s['stage'] = 'submit'
-                    s['metrics']['answerReadyRound'] = s.get('round')
-                    s['metrics']['dataComplete'] = True
-                    self._fact(s, 'API统计完成并校验字段')
-                    return True
+        # Completion is a model decision.  The solver must not extract a
+        # TOKEN or synthesize an API answer from a task-specific schema: doing
+        # so bypasses the exploration and skill formation required by the
+        # competition.  The complete tool result is included in the next
+        # prompt, where the model can verify it and choose submit.
         return False
 
     def _consume_waiting(self, state, s):
@@ -1778,6 +1705,7 @@ class PioneerTaskSolver:
                 s['stage'] = 'ask'
                 return
             s['submitStatus'] = 'accepted'
+            self._remember_skill(state, s)
             return
         if pioneer_result is False:
             if command_wrong:
@@ -2045,7 +1973,10 @@ class PioneerTaskSolver:
             'workspace': self.session.get('workspace'),
             'documentDir': self.session.get('documentDir'),
             'documentPaths': self.session.get('paths') or [],
-            'experience': self._relevant_experience(self.session, state.phase_task),
+            'experience': {
+                **self._relevant_experience(self.session, state.phase_task),
+                'skills': (self.experience.get('skills') or [])[-3:],
+            },
             'skillGuidance': (
                 '本题是同类任务时，先检查已验证经验并把稳定流程参数化；把可复用脚本/SOP保存到当前任务明确允许的工作区，'
                 '不要把本题答案、凭据或绝对路径写死。任务1应探索并记录契约，任务2/3只替换题面参数。'
