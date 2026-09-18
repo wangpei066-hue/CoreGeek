@@ -297,19 +297,32 @@ def _pick_damaged_wall(state: "MatchState", pending_targets: set):
 
 
 def _pick_spawn_facing_wall_to_upgrade(state: "MatchState", pending_targets: set, *, damaged_only=False):
-    """优先升迎敌正面墙，再升两翼。damaged_only 时仍只看半血以下。"""
+    """迎敌面中心向外升墙；生存墙圈全 L2 后先升正面中间三段，再向外。"""
     base = own_station(state)
     if base is None:
         return None
-    from .opening import primary_wall_plan, wall_priority
+    from .opening import (
+        primary_wall_plan, spawn_ring_all_at_least_level, spawn_ring_wall_points,
+        wall_upgrade_sort_key,
+    )
     plan = set(primary_wall_plan(state, base))
-    front = {p for p in plan if wall_priority(state, base, p) == 0}
+    ring = set(spawn_ring_wall_points(state, base))
+    phase_l3 = spawn_ring_all_at_least_level(state, level=2)
+    target_level = 2 if not phase_l3 else 3
     candidates = []
     for role in state.team_our.roles:
         if role.role_type != "wall" or role.health <= 0:
             continue
         pos = (role.pos.x, role.pos.y)
-        if pos not in plan or pos in pending_targets or (role.level or 1) >= 3:
+        if pos not in plan or pos in pending_targets:
+            continue
+        level = role.level or 1
+        if level >= 3:
+            continue
+        if not phase_l3:
+            if pos not in ring or level >= 2:
+                continue
+        elif level >= target_level:
             continue
         if damaged_only and role.health >= max_health(role) * WALL_UPGRADE_HEALTH_RATIO:
             continue
@@ -317,19 +330,23 @@ def _pick_spawn_facing_wall_to_upgrade(state: "MatchState", pending_targets: set
     if not candidates:
         return None
     return min(candidates, key=lambda r: (
-        0 if (r.pos.x, r.pos.y) in front else 1,
+        wall_upgrade_sort_key(state, base, r, phase_l3=phase_l3),
         r.level or 1,
         r.health / max(1, max_health(r)),
         r.id,
     ))
 
 
+def _has_buildable_wall_gaps(state: "MatchState", role=None) -> bool:
+    from .opening import due_wall_gaps
+    return bool(due_wall_gaps(state, role))
+
+
 def _u_walls_ready_to_upgrade(state: "MatchState") -> bool:
-    """第三天起、三面墙没有可建缺口：施工工转去买墙券升迎敌面。"""
+    """第三天起、没有任何可建墙缺口：施工工转去买墙券升迎敌面。"""
     if not structure_priority_day(state):
         return False
-    from .opening import three_sided_buildable_gaps
-    return not three_sided_buildable_gaps(state)
+    return not _has_buildable_wall_gaps(state)
 
 
 def _pick_front_wall_below_floor(state: "MatchState", pending_targets: set, floor: float = 0.5):
@@ -685,8 +702,8 @@ def should_spend_surplus_on_upgrades(state: "MatchState") -> bool:
 
 def walls_still_to_build(state: "MatchState") -> bool:
     """还有能建的新墙，且离入夜还早：此时修墙工的主线是建墙，不去升级。"""
-    from .opening import day_rounds_remaining, three_sided_buildable_gaps
-    return bool(three_sided_buildable_gaps(state)
+    from .opening import day_rounds_remaining
+    return bool(_has_buildable_wall_gaps(state)
                 and day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW)
 
 
@@ -712,7 +729,9 @@ def maybe_start_shop_item_job(role: Role, state: "MatchState", allow_weapon: boo
     allow_wall_jobs = wall_upgrade_jobs_allowed(state, role)
     from .opening_schedule import opening_worker_mode
     keeper_upgrading = (
-        opening_worker_mode(state, role) == 'builder' and _u_walls_ready_to_upgrade(state)
+        opening_worker_mode(state, role) == 'builder'
+        and _u_walls_ready_to_upgrade(state)
+        and not _has_buildable_wall_gaps(state, role)
     )
     # 未购入任务按 升级武器 > 升墙/基地 > 紧急修墙 让位。施工工在三面墙齐后升迎敌墙不被基地/武器挤掉。
     old_job = state.worker_item_jobs.get(role.id)
@@ -944,25 +963,39 @@ def _batch_buy_quantity(role: Role, state: "MatchState", job: dict) -> int:
         station = own_station(state)
         desired = 1 if station and (station.level or 1) == 2 else 0
     elif item in ("WallUpgradeVoucher1", "WallUpgradeVoucher2"):
-        # 三面齐后按迎敌面同级墙批量买券；否则只给半血墙囤。
+        # 无墙缺口时按迎敌面中心向外批量买券；否则只给半血墙囤。
         level = 1 if item == "WallUpgradeVoucher1" else 2
         others = pending - {tuple(job.get("target") or ())}
         u_ready = _u_walls_ready_to_upgrade(state)
-        front = set()
+        desired = 0
         if u_ready:
-            from .opening import primary_wall_plan, wall_priority
+            from .opening import (
+                primary_wall_plan, spawn_ring_all_at_least_level, spawn_ring_wall_points,
+            )
             base = own_station(state)
             if base is not None:
-                front = {p for p in primary_wall_plan(state, base) if wall_priority(state, base, p) == 0}
-        desired = sum(
-            1 for w in state.team_our.roles
-            if w.role_type == "wall" and w.health > 0 and (w.level or 1) == level
-            and (w.pos.x, w.pos.y) not in others
-            and (
-                (u_ready and (w.pos.x, w.pos.y) in front)
-                or (not u_ready and w.health < max_health(w) * WALL_UPGRADE_HEALTH_RATIO)
+                plan = set(primary_wall_plan(state, base))
+                ring = set(spawn_ring_wall_points(state, base))
+                phase_l3 = spawn_ring_all_at_least_level(state, level=2)
+                for w in state.team_our.roles:
+                    if w.role_type != "wall" or w.health <= 0:
+                        continue
+                    pos = (w.pos.x, w.pos.y)
+                    if pos not in plan or pos in others:
+                        continue
+                    wl = w.level or 1
+                    if not phase_l3:
+                        if pos in ring and wl == 1 and item == "WallUpgradeVoucher1":
+                            desired += 1
+                    elif wl == 2 and item == "WallUpgradeVoucher2":
+                        desired += 1
+        else:
+            desired = sum(
+                1 for w in state.team_our.roles
+                if w.role_type == "wall" and w.health > 0 and (w.level or 1) == level
+                and (w.pos.x, w.pos.y) not in others
+                and w.health < max_health(w) * WALL_UPGRADE_HEALTH_RATIO
             )
-        )
     desired = max(1, desired - held)
     return max(1, min(desired, affordable, free))
 
@@ -1127,11 +1160,13 @@ def maintain_front_wall_health(role: Role, state: "MatchState", blocked: set, re
     if any(isinstance(item, str) and item.startswith("WeaponUpgradeVoucher") for item in (role.backpack or [])):
         return None
     pending = _pending_item_job_targets(state)
-    from .opening import critical_wall_missing, day_rounds_remaining, three_sided_buildable_gaps
-    new_walls_due = bool(three_sided_buildable_gaps(state) or critical_wall_missing(state))
+    from .opening import day_rounds_remaining
+    gaps = _has_buildable_wall_gaps(state, role)
     early_day = is_day_round(state.round_no) and day_rounds_remaining(state.round_no) > WALL_UPGRADE_DUSK_WINDOW
-    if new_walls_due and early_day:
-        # 白天还早且新墙没齐：不跑商店升半血墙，只修即将倒塌的。
+    if gaps:
+        # 任何可建缺口优先补墙：白天不跑商店升墙，夜里只修濒毁。
+        if is_day_round(state.round_no):
+            return None
         wall = _pick_damaged_wall(state, pending)
         if wall is None:
             return None
@@ -1564,6 +1599,13 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
     if seal:
         return seal
     release_stale_repair_job(worker, state)
+    if due_wall_gaps(state, worker):
+        job = state.worker_item_jobs.get(worker.id)
+        if (job and job.get('kind') == 'wall' and job.get('item') not in (worker.backpack or [])
+                and 'Upgrade' in job.get('item', '')):
+            trace(state, worker.id, 'wall_gap_preempts_upgrade',
+                  '有可建墙缺口，取消未购入的墙券任务，优先补墙')
+            del state.worker_item_jobs[worker.id]
     spike = spike_day_cashout(worker, state, blocked, reserved)
     if spike:
         return spike
@@ -1578,7 +1620,9 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
         at_shop = bool(shop and chebyshev(worker.pos, shop.pos) <= 1)
         holds_voucher = any(isinstance(i, str) and i.startswith('WeaponUpgradeVoucher')
                             for i in (worker.backpack or []))
-        if not (at_shop or holds_voucher):
+        if due_wall_gaps(state, worker):
+            allow_weapon = bool(holds_voucher)  # 有墙缺口时只用手里的武器券，不专程买券
+        elif not (at_shop or holds_voucher):
             allow_weapon = False  # 施工工防线没修完不专程去买券；人在商店边顺手买、手里有券照常用
     from .opening_schedule import opening_worker_mode
     eco_mode = opening_worker_mode(state, worker) == 'economist'
@@ -1612,8 +1656,10 @@ def decide_worker_day(worker: Role, state: "MatchState", blocked: set, reserved:
                   '白天回防前优先推进武器升级券，避免券带进夜里不用',
                   heldVoucher=held_weapon_voucher, jobKind=(job or {}).get('kind'))
             return cmd
-    # 施工工墙没砌完且还来得及建：白天不提前回炮，只在入夜窗口才去双火箭。
-    if not (builder_focus and allow_build):
+    # 施工工墙没砌完且白天还早：不提前回炮；入夜窗口必须回双火箭。
+    from .opening import dusk_must_return
+    must_muster = not (builder_focus and allow_build and not dusk_must_return(state, worker))
+    if must_muster:
         handled, cmd = muster_for_night(worker, state, blocked, reserved)
         if handled:
             return cmd
@@ -2230,6 +2276,30 @@ def night_voucher_use(fighter: Role, state: "MatchState", target):
     return None
 
 
+def _is_night_opening_round(round_no) -> bool:
+    if round_no is None:
+        return False
+    return round_no % DAY_NIGHT_CYCLE == DAY_ROUNDS
+
+
+def _on_shared_rocket_stand(role, state, blocked):
+    from .opening import shared_rocket_stand_cells
+    return (role.pos.x, role.pos.y) in shared_rocket_stand_cells(state, blocked)
+
+
+def _cmd_to_dual_rocket_stand(fighter, weapon, state, blocked, reserved, exit_hold, reason):
+    """施工工守双火箭：优先 corner 共用位，走不通再试 station_path。"""
+    from .opening import control_stand_path, station_path, move_on_path
+    for walkable in (blocked | reserved | exit_hold, blocked | exit_hold, blocked):
+        stand_path = control_stand_path(fighter, weapon, walkable, set(), state)
+        if stand_path:
+            return move_on_path(state, fighter, stand_path, reserved, reason)
+        stand_path = station_path(fighter, weapon, walkable, state)
+        if stand_path is not None:
+            return move_on_path(state, fighter, stand_path, reserved, reason)
+    return None
+
+
 def plan_night(state: "MatchState") -> dict:
     from .opening import assign_weapons, move_on_path, weapon_approach_path, _fighter_layer
     from .tactics import (
@@ -2309,8 +2379,12 @@ def plan_night(state: "MatchState") -> dict:
     assignments = assign_weapons(state, excluded_ids=excluded, persist=True)
     fighters = [r for r in state.team_our.roles
                 if r.role_type in ("worker", "pioneer") and r.health > 0 and r.id not in excluded]
-    # 已在炮位的先决策；其中火箭先算，电磁炮读同一份伤害表补刀。
+    from .opening_schedule import opening_worker_mode
+    night_open = _is_night_opening_round(state.round_no)
+    # 首夜施工工还没站上双火箭共用位时最先决策，确保第一回合就回炮。
     fighters.sort(key=lambda r: (
+        0 if (night_open and opening_worker_mode(state, r) == 'builder'
+              and not _on_shared_rocket_stand(r, state, blocked)) else 1,
         0 if (assignments.get(r.id) and chebyshev(r.pos, assignments[r.id].pos) <= 1) else 1,
         0 if (assignments.get(r.id) and assignments[r.id].role_type == "rocket") else 1,
         _fighter_layer(state, r),
@@ -2374,6 +2448,18 @@ def plan_night(state: "MatchState") -> dict:
                     else:
                         trace(state, fighter.id, "no_target_in_range", "共用位上射程内无目标，原地等敌人", weapon_id=weapon.id)
                     continue
+            if (at_gun and weapon.role_type == "rocket"
+                    and opening_worker_mode(state, fighter) == 'builder'
+                    and not _on_shared_rocket_stand(fighter, state, blocked)
+                    and plan is None):
+                cmd = _cmd_to_dual_rocket_stand(
+                    fighter, weapon, state, blocked, reserved, exit_hold,
+                    '施工工本回合打不了，站到双火箭共用位')
+                if cmd:
+                    trace(state, fighter.id, "weapon_assignment",
+                          "本回合目标：走到双火箭共用操控位，轮流开两门", weapon_id=weapon.id)
+                    commands[fighter.id] = cmd
+                    continue
             if at_gun:
                 if plan:
                     trace(state, fighter.id, "weapon_assignment",
@@ -2434,8 +2520,22 @@ def plan_night(state: "MatchState") -> dict:
             if path is not None:
                 break
         if path and (path[0].x, path[0].y) in (reserved | exit_hold):
+            if night_open and opening_worker_mode(state, fighter) == 'builder':
+                cmd = _cmd_to_dual_rocket_stand(
+                    fighter, weapon, state, blocked, reserved, exit_hold,
+                    '首夜施工工直奔双火箭共用位')
+                if cmd:
+                    commands[fighter.id] = cmd
+                    continue
             trace(state, fighter.id, "night_wait_for_teammate", "回炮第一步被队友本回合的落脚格占着，先让一回合")
             continue
+        if path is None and opening_worker_mode(state, fighter) == 'builder' and weapon.role_type == 'rocket':
+            cmd = _cmd_to_dual_rocket_stand(
+                fighter, weapon, state, blocked, reserved, exit_hold,
+                '施工工回双火箭共用操控位')
+            if cmd:
+                commands[fighter.id] = cmd
+                continue
         cmd = move_on_path(state, fighter, path, reserved, "前往独立分配的武器（绕开机器人进攻路线）")
         if cmd:
             commands[fighter.id] = cmd

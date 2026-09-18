@@ -194,6 +194,26 @@ class WorkerPioneerMergeTests(unittest.TestCase):
                 walking = commands.get(builder.id, {}).get('action') == 'move'
                 self.assertTrue(firing or walking)
 
+    def test_first_night_builder_moves_on_opening_round(self):
+        """首夜第一回合（cycle 70）施工工必须发出回双火箭位的移动，不能空转。"""
+        state = self._dual_rocket_night()
+        state.round_no = 70
+        builder = next(r for r in state.team_our.roles if r.id == 1)
+        economist = next(r for r in state.team_our.roles if r.id == 2)
+        pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
+        builder.pos = Pos(6, 9)
+        economist.pos = Pos(4, 11)
+        pioneer.pos = Pos(10, 12)
+        for rocket in (r for r in state.team_our.roles if r.role_type == 'rocket'):
+            rocket.cooldown = 0
+        state.robot.roles = [RobotRole(100, Pos(26, 10), 'smallRobot', 40)]
+        state.map_info.zones = [Zone(Pos(6, 9), 'iron')]
+        commands = self.decide(state)
+        builder_cmd = commands.get(builder.id, {})
+        firing = any(c.get('controllerId') == str(builder.id) for c in commands.values()
+                     if c.get('action') == 'attack')
+        self.assertTrue(firing or builder_cmd.get('action') == 'move', builder_cmd)
+
     def test_builder_moves_to_shared_stand_when_assigned_rocket_has_no_target(self):
         """分配火箭就绪但打不了时，也要去共用位，不能贴着一门空转。"""
         state = self._dual_rocket_night()
@@ -542,10 +562,10 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
         pioneer = next(r for r in state.team_our.roles if r.role_type == 'pioneer')
         pioneer.pos = Pos(11, 13)
-        state.team_our.roles[1].pos = Pos(8, 9)
+        state.team_our.roles[2].pos = Pos(8, 9)  # 经济工买券；施工工有墙缺口时不买武器券
         commands = self.decide(state)
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(commands[2]['action'], 'buy')
+        self.assertEqual(commands[2]['name'], 'WeaponUpgradeVoucher1')
         self.assertIn(commands[pioneer.id]['action'], ('move', 'acceptTask'))
         self.assertNotEqual(commands.get(pioneer.id, {}).get('action'), 'buy')
 
@@ -561,11 +581,11 @@ class WorkerPioneerMergeTests(unittest.TestCase):
         ]
         from src.agent.protocol import Zone
         state.map_info.zones.append(Zone(Pos(8, 9), 'weaponShop'))
-        state.team_our.roles[1].pos = Pos(8, 9)
+        state.team_our.roles[2].pos = Pos(8, 9)  # 经济工买券；施工工有墙缺口时不买武器券
         commands = self.decide(state)
         self.assertNotEqual(commands.get(3, {}).get('action'), 'buy')
-        self.assertEqual(commands[1]['action'], 'buy')
-        self.assertEqual(commands[1]['name'], 'WeaponUpgradeVoucher1')
+        self.assertEqual(commands[2]['action'], 'buy')
+        self.assertEqual(commands[2]['name'], 'WeaponUpgradeVoucher1')
 
     def test_workers_build_front_walls_early_day(self):
         state = opening_state()

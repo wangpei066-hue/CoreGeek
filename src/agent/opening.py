@@ -1196,6 +1196,66 @@ def three_sided_buildable_gaps(state):
         state, [p for p in primary_wall_plan(state, base) if p not in existing])
 
 
+def spawn_ring_wall_points(state, base):
+    """迎敌正面 + 两翼拐角（生存墙 8 段）：墙券二阶段前的 L2 目标圈。"""
+    return list(survival_wall_plan(state, base))
+
+
+def _wall_at_point(state, point):
+    return next((r for r in state.team_our.roles
+                 if r.role_type == 'wall' and r.health > 0
+                 and (r.pos.x, r.pos.y) == tuple(point)), None)
+
+
+def spawn_ring_all_at_least_level(state, level=2):
+    """生存墙圈（正面+拐角翼）是否都已达到指定等级。"""
+    from .brain import own_station
+    base = own_station(state)
+    if base is None:
+        return False
+    for point in spawn_ring_wall_points(state, base):
+        wall = _wall_at_point(state, point)
+        if wall is None or (wall.level or 1) < level:
+            return False
+    return True
+
+
+def spawn_facing_upgrade_rank(state, base, point):
+    """墙升级排序：迎敌面先于翼，同一面从竖直中心向外扩散。"""
+    left, right, _bottom, _top = defense_bounds(state, base)
+    direction = attack_direction(state, base)
+    front = right if direction == 1 else left
+    mid_y = defense_mid_y(state, base)
+    x, y = point
+    zone = 0 if wall_priority(state, base, point) == 0 else 1
+    if x == front:
+        depth = abs(y - mid_y)
+    else:
+        depth = 10 + abs(x - front)
+    return (zone, depth, abs(y - mid_y), y, x)
+
+
+def center_front_wall_points(state, base):
+    """正面最中间三段（含中心）。"""
+    mid_y = defense_mid_y(state, base)
+    left, right, bottom, top = defense_bounds(state, base)
+    direction = attack_direction(state, base)
+    front = right if direction == 1 else left
+    ys = sorted({y for x, y in primary_wall_plan(state, base) if x == front}, key=lambda y: abs(y - mid_y))
+    return [(front, y) for y in ys[:3]]
+
+
+def wall_upgrade_sort_key(state, base, wall_role, *, phase_l3=False):
+    """phase_l3：生存墙圈已全 L2 后，先升正面中间三段，再向外。"""
+    pos = (wall_role.pos.x, wall_role.pos.y)
+    rank = spawn_facing_upgrade_rank(state, base, pos)
+    if phase_l3 and wall_priority(state, base, pos) == 0:
+        center = set(center_front_wall_points(state, base))
+        tier = 0 if pos in center else 1
+        return (tier,) + rank
+    return (0,) + rank
+
+
 def worker_wall_muster_rounds(state, role, missing):
     """该工人补完分摊缺口并回到炮位的估计：到施工区 + 取石施工 + 回炮 + 历史余量。"""
     blocked = build_blocked_set(state)

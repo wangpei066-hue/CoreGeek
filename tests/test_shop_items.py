@@ -447,7 +447,7 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
             maybe_start_shop_item_job(worker, state)
         self.assertNotIn(10010, state.worker_item_jobs)
 
-    def test_day3_keeper_repairs_front_wall_in_dusk_window(self):
+    def test_day3_keeper_skips_half_health_upgrade_when_wall_gaps_exist(self):
         from src.agent.grid import build_blocked_set
         state = minimal_state(round_no=312, gold_num=1000)
         state.team_our.roles[0] = make_role(10013, 10, 10, "station", health=1500, level=1)
@@ -458,9 +458,8 @@ class MaybeStartJobPriorityTests(unittest.TestCase):
 
         cmd = maintain_front_wall_health(keeper, state, build_blocked_set(state), set())
 
-        self.assertIsNotNone(cmd)
-        self.assertEqual(state.worker_item_jobs[keeper.id]["kind"], "wall")
-        self.assertEqual(state.worker_item_jobs[keeper.id]["target"], (13, 10))
+        self.assertIsNone(cmd)
+        self.assertNotIn(keeper.id, state.worker_item_jobs)
 
     def test_no_job_started_without_enough_gold(self):
         state = minimal_state(gold_num=5)
