@@ -1384,7 +1384,11 @@ class PioneerTaskSolver:
             'promptHash': PROMPT_HASH,
             'experienceHit': self.session.get('experienceHit', False),
         }
-        return ''.join(parts) + json.dumps(payload, ensure_ascii=False)
+        prefix = ''
+        if remaining is not None and remaining <= 3:
+            prefix = ('URGENT DEADLINE: only %s rounds remain. Do not perform a standalone read, probe, or verification. '
+                      'If the latest evidence shows the requested state is already valid, return submit now; otherwise combine the final fix, check, and answer evidence in this one execute.\n' % remaining)
+        return prefix + ''.join(parts) + json.dumps(payload, ensure_ascii=False)
 
     def _last_tool_output(self):
         """Expose the latest concrete evidence without requiring history search."""
