@@ -724,7 +724,13 @@ print(json.dumps(out, ensure_ascii=False))
 '''
 
 def sandbox_command(script, query):
-    return 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(json.dumps(query, ensure_ascii=False))
+    payload = shlex.quote(json.dumps(query, ensure_ascii=False))
+    code = shlex.quote(script)
+    # The competition image normally has python3, while a few replay
+    # sandboxes expose only `python`.  Keep the wrapper portable without
+    # changing the model-facing command protocol.
+    return ("if command -v python3 >/dev/null 2>&1; then python3 -c %s %s; "
+            "else python -c %s %s; fi" % (code, payload, code, payload))
 
 
 def parse_curl_output(text):
