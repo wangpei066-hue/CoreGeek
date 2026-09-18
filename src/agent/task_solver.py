@@ -346,8 +346,8 @@ try:
         if offset == 0:
             import re
             related = []
-            for ref in re.findall(r'[`"“「']([^`"”」'\n]+\.md)[`"”」']|(?<![\w/])([A-Za-z0-9_.-]+\.md)', content):
-                rel = (ref[0] or ref[1]).strip()
+            for rel in re.findall(r'(?<![\w/])([A-Za-z0-9_.-]+\.md)', content):
+                rel = rel.strip()
                 candidate = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(paths[0]), rel)
                 if candidate == paths[0] or not os.path.isfile(candidate):
                     continue
