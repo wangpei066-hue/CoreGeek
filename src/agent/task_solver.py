@@ -1077,8 +1077,12 @@ class PioneerTaskSolver:
                     same_target = sum(self._command_target(old) == target for old in recent_commands[-4:])
                     if target and same_target >= 2:
                         self._fact(s, '同一工具目标已连续尝试多次；请在一次脚本中完成剩余步骤或直接提交，不要逐页/逐次重复调用')
+                    # A shell-local TOKEN produced by the documented login
+                    # request is valid and must be reusable across pagination.
+                    # Only reject external secret-file/environment shortcuts
+                    # for which the current task provides no evidence.
                     if (s.get('taskKind') == 'api'
-                            and re.search(r'\$(?:API_TOKEN|TOKEN)\b|(?:^|[\s/])\.env(?:$|[\s/])', command)):
+                            and re.search(r'(?:^|[\s/])\.env(?:$|[\s/])|\$\{?API_SECRET\}?\b', command)):
                         s['history'].append({'blocked': 'API命令含未定义凭据引用', 'command': command})
                         self._fact(s, '拦截未定义凭据引用，要求LLM使用有依据的认证值')
                         s['stage'] = 'ask'
